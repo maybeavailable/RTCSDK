@@ -1,0 +1,9 @@
+build/
+build-*/
+.cache/
+compile_commands.json
+third_party/libsrtp/
+*.o
+*.a
+*.so
+*.so.*

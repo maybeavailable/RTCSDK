@@ -1,0 +1,98 @@
+#ifndef SRC_MODULES_RTP_RTCP_FLEXFEC_CODEC_H_
+#define SRC_MODULES_RTP_RTCP_FLEXFEC_CODEC_H_
+
+// 对标 libwebrtc/modules/rtp_rtcp/source/flexfec_sender.h、
+// flexfec_receiver.h 以及 video/fec_controller_default.h（基于 RFC 8627 FlexFEC 标准）。
+
+#include <cstddef>
+#include <cstdint>
+#include <deque>
+#include <map>
+#include <optional>
+#include <string>
+#include <vector>
+
+#include "api/units.h"
+#include "modules/rtp_rtcp/rtp_packet.h"
+
+namespace rtc {
+
+struct FecProtectionParams {
+  uint8_t fec_rate = 0;  // 0..255（以 255 为基数的冗余比例）
+  int max_fec_frames = 1;
+  bool use_burst_interleaving = false;
+};
+
+class FecControllerDefault {
+ public:
+  void UpdateNetworkMetrics(DataRate estimated_bitrate,
+                            TimeDelta rtt,
+                            double loss_rate_ratio);
+
+  FecProtectionParams keyframe_params() const { return keyframe_params_; }
+  FecProtectionParams delta_params() const { return delta_params_; }
+
+ private:
+  FecProtectionParams keyframe_params_{};
+  FecProtectionParams delta_params_{};
+};
+
+class FlexfecSender {
+ public:
+  FlexfecSender(uint8_t flexfec_payload_type,
+                uint32_t flexfec_ssrc,
+                uint32_t protected_media_ssrc,
+                std::string mid = "");
+
+  FlexfecSender(const FlexfecSender&) = delete;
+  FlexfecSender& operator=(const FlexfecSender&) = delete;
+
+  void SetProtectionParameters(const FecProtectionParams& params);
+  void AddRtpPacketAndGenerateFec(const RtpPacket& media_packet);
+  std::vector<RtpPacket> GetFecPackets();
+
+  uint32_t ssrc() const { return flexfec_ssrc_; }
+  uint8_t payload_type() const { return flexfec_pt_; }
+
+ private:
+  RtpPacket BuildParityPacket(const std::vector<const RtpPacket*>& group);
+
+  const uint8_t flexfec_pt_;
+  const uint32_t flexfec_ssrc_;
+  const uint32_t protected_media_ssrc_;
+  const std::string mid_;
+  uint16_t seq_num_ = 1000;
+
+  FecProtectionParams params_{};
+  std::vector<RtpPacket> pending_media_;
+  std::vector<RtpPacket> ready_fec_packets_;
+};
+
+class FlexfecReceiver {
+ public:
+  FlexfecReceiver(uint32_t flexfec_ssrc, uint32_t protected_media_ssrc);
+
+  FlexfecReceiver(const FlexfecReceiver&) = delete;
+  FlexfecReceiver& operator=(const FlexfecReceiver&) = delete;
+
+  std::vector<RtpPacket> OnRtpPacket(const RtpPacket& packet);
+
+ private:
+  struct ParityRecord {
+    uint16_t base_seq = 0;
+    uint16_t bitmask = 0;
+    std::vector<uint8_t> xor_header_recovery;
+    std::vector<uint8_t> xor_wire_bytes;
+  };
+
+  std::optional<RtpPacket> TryRecover(const ParityRecord& fec);
+
+  const uint32_t flexfec_ssrc_;
+  const uint32_t protected_media_ssrc_;
+  std::map<uint16_t, std::vector<uint8_t>> received_media_wire_;
+  std::deque<ParityRecord> pending_fecs_;
+};
+
+}  // namespace rtc
+
+#endif  // SRC_MODULES_RTP_RTCP_FLEXFEC_CODEC_H_
