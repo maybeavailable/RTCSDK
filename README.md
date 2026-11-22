@@ -35,6 +35,7 @@
   - **[tests/rtc_e2e_integration_tests.cc](tests/rtc_e2e_integration_tests.cc)**：端到端集成与纯 C99 ABI 验证测试。
   - **[tests/rtc_real_cc_benchmark_test.cc](tests/rtc_real_cc_benchmark_test.cc)**：真实操作系统 UDP 瓶颈链路三阶段拥塞控制与可插拔 QUIC 拥塞控制实测。
   - **[tests/rtc_industry_weaknet_suite_test.cc](tests/rtc_industry_weaknet_suite_test.cc)**：遵循 IETF RFC 8868 / ITU-T G.1050 / RFC 3550 / W3C WebRTC 标准的 12 大常规与极限弱网场景 × 18 项全维度指标评测套件。
+  - **[docs/TEST_REPORT.md](docs/TEST_REPORT.md)** 与 **[docs/test_logs/](docs/test_logs/)**：完整实测报告、亚秒级阶跃追踪曲线、常规与极限弱网 18 项指标对比矩阵及原始控制台日志归档。
 
 ## 编译与测试
 

@@ -1,0 +1,133 @@
+Running main() from ./googletest/src/gtest_main.cc
+[==========] Running 4 tests from 1 test suite.
+[----------] Global test environment set-up.
+[----------] 4 tests from RtcRealCongestionControlTest
+[ RUN      ] RtcRealCongestionControlTest.Twcc24BitWraparoundMultiWeekUptimeSafety
+[       OK ] RtcRealCongestionControlTest.Twcc24BitWraparoundMultiWeekUptimeSafety (0 ms)
+[ RUN      ] RtcRealCongestionControlTest.WebRtcP2pGoogCcDynamicBottleneckAdaptation
+
+--- [WebRTC P2P (GoogCC) 0.5s 粒度实时追踪轨迹] ---
+  t= 0.5s [爬升预热 限速=2400k] -> SDK编码分配=2150 kbps | 累计解码帧=14
+  t= 1.0s [爬升预热 限速=2400k] -> SDK编码分配=2150 kbps | 累计解码帧=29
+  t= 1.5s [阶段1稳态 限速=2400k] -> SDK编码分配=2150 kbps | 累计解码帧=44
+  t= 2.0s [阶段1稳态 限速=2400k] -> SDK编码分配=2150 kbps | 累计解码帧=59
+  t= 2.5s [阶段1稳态 限速=2400k] -> SDK编码分配=2150 kbps | 累计解码帧=74
+  t= 3.0s [阶段1稳态 限速=2400k] -> SDK编码分配=1891 kbps | 累计解码帧=89
+  t= 3.5s [阶段1稳态 限速=2400k] -> SDK编码分配=1891 kbps | 累计解码帧=104
+[2026-11-22 22:43:56.638] [WARNING] [rtc-work] [goog_cc_controller.cc:625] SendSideBWE high packet loss (46%), reducing target to 1344 kbps
+  t= 4.1s [骤降过渡 限速= 650k] -> SDK编码分配= 654 kbps | 累计解码帧=109
+[2026-11-22 22:43:56.992] [WARNING] [rtc-work] [goog_cc_controller.cc:625] SendSideBWE high packet loss (16%), reducing target to 1193 kbps
+[2026-11-22 22:43:57.277] [WARNING] [rtc-work] [video_coding_module.cc:347] Packet seq=1844 exceeded kMaxNackRetries=10, escalating to PLI keyframe request
+[2026-11-22 22:43:57.277] [WARNING] [rtc-work] [video_coding_module.cc:347] Packet seq=1846 exceeded kMaxNackRetries=10, escalating to PLI keyframe request
+[2026-11-22 22:43:57.277] [WARNING] [rtc-work] [video_coding_module.cc:347] Packet seq=1847 exceeded kMaxNackRetries=10, escalating to PLI keyframe request
+[2026-11-22 22:43:57.302] [WARNING] [rtc-work] [video_coding_module.cc:347] Packet seq=1850 exceeded kMaxNackRetries=10, escalating to PLI keyframe request
+[2026-11-22 22:43:57.302] [WARNING] [rtc-work] [video_coding_module.cc:347] Packet seq=1851 exceeded kMaxNackRetries=10, escalating to PLI keyframe request
+[2026-11-22 22:43:57.302] [WARNING] [rtc-work] [video_coding_module.cc:347] Packet seq=1853 exceeded kMaxNackRetries=10, escalating to PLI keyframe request
+[2026-11-22 22:43:57.348] [WARNING] [rtc-work] [goog_cc_controller.cc:625] SendSideBWE high packet loss (19%), reducing target to 649 kbps
+[2026-11-22 22:43:57.353] [WARNING] [rtc-work] [video_coding_module.cc:347] Packet seq=1855 exceeded kMaxNackRetries=10, escalating to PLI keyframe request
+[2026-11-22 22:43:57.353] [WARNING] [rtc-work] [video_coding_module.cc:347] Packet seq=1856 exceeded kMaxNackRetries=10, escalating to PLI keyframe request
+[2026-11-22 22:43:57.353] [WARNING] [rtc-work] [video_coding_module.cc:347] Packet seq=1857 exceeded kMaxNackRetries=10, escalating to PLI keyframe request
+[2026-11-22 22:43:57.378] [WARNING] [rtc-work] [video_coding_module.cc:347] Packet seq=1860 exceeded kMaxNackRetries=10, escalating to PLI keyframe request
+[2026-11-22 22:43:57.378] [WARNING] [rtc-work] [video_coding_module.cc:347] Packet seq=1862 exceeded kMaxNackRetries=10, escalating to PLI keyframe request
+  t= 4.7s [骤降过渡 限速= 650k] -> SDK编码分配= 524 kbps | 累计解码帧=111
+[2026-11-22 22:43:57.785] [WARNING] [rtc-work] [video_coding_module.cc:347] Packet seq=1870 exceeded kMaxNackRetries=10, escalating to PLI keyframe request
+[2026-11-22 22:43:57.810] [WARNING] [rtc-work] [video_coding_module.cc:347] Packet seq=1874 exceeded kMaxNackRetries=10, escalating to PLI keyframe request
+[2026-11-22 22:43:57.810] [WARNING] [rtc-work] [video_coding_module.cc:347] Packet seq=1875 exceeded kMaxNackRetries=10, escalating to PLI keyframe request
+[2026-11-22 22:43:57.810] [WARNING] [rtc-work] [video_coding_module.cc:347] Packet seq=1876 exceeded kMaxNackRetries=10, escalating to PLI keyframe request
+[2026-11-22 22:43:57.810] [WARNING] [rtc-work] [video_coding_module.cc:347] Packet seq=1877 exceeded kMaxNackRetries=10, escalating to PLI keyframe request
+[2026-11-22 22:43:57.810] [WARNING] [rtc-work] [video_coding_module.cc:347] Packet seq=1878 exceeded kMaxNackRetries=10, escalating to PLI keyframe request
+[2026-11-22 22:43:57.810] [WARNING] [rtc-work] [video_coding_module.cc:347] Packet seq=1879 exceeded kMaxNackRetries=10, escalating to PLI keyframe request
+[2026-11-22 22:43:57.810] [WARNING] [rtc-work] [video_coding_module.cc:347] Packet seq=1880 exceeded kMaxNackRetries=10, escalating to PLI keyframe request
+[2026-11-22 22:43:57.810] [WARNING] [rtc-work] [video_coding_module.cc:347] Packet seq=1881 exceeded kMaxNackRetries=10, escalating to PLI keyframe request
+[2026-11-22 22:43:57.810] [WARNING] [rtc-work] [video_coding_module.cc:347] Packet seq=1882 exceeded kMaxNackRetries=10, escalating to PLI keyframe request
+[2026-11-22 22:43:57.810] [WARNING] [rtc-work] [video_coding_module.cc:347] Packet seq=1883 exceeded kMaxNackRetries=10, escalating to PLI keyframe request
+[2026-11-22 22:43:57.810] [WARNING] [rtc-work] [video_coding_module.cc:347] Packet seq=1884 exceeded kMaxNackRetries=10, escalating to PLI keyframe request
+[2026-11-22 22:43:57.810] [WARNING] [rtc-work] [video_coding_module.cc:347] Packet seq=1885 exceeded kMaxNackRetries=10, escalating to PLI keyframe request
+[2026-11-22 22:43:57.810] [WARNING] [rtc-work] [video_coding_module.cc:347] Packet seq=1886 exceeded kMaxNackRetries=10, escalating to PLI keyframe request
+[2026-11-22 22:43:57.810] [WARNING] [rtc-work] [video_coding_module.cc:347] Packet seq=1887 exceeded kMaxNackRetries=10, escalating to PLI keyframe request
+[2026-11-22 22:43:57.810] [WARNING] [rtc-work] [video_coding_module.cc:347] Packet seq=1888 exceeded kMaxNackRetries=10, escalating to PLI keyframe request
+[2026-11-22 22:43:57.810] [WARNING] [rtc-work] [video_coding_module.cc:347] Packet seq=1889 exceeded kMaxNackRetries=10, escalating to PLI keyframe request
+[2026-11-22 22:43:57.810] [WARNING] [rtc-work] [video_coding_module.cc:347] Packet seq=1890 exceeded kMaxNackRetries=10, escalating to PLI keyframe request
+[2026-11-22 22:43:57.887] [WARNING] [rtc-work] [video_coding_module.cc:347] Packet seq=1893 exceeded kMaxNackRetries=10, escalating to PLI keyframe request
+[2026-11-22 22:43:57.887] [WARNING] [rtc-work] [video_coding_module.cc:347] Packet seq=1894 exceeded kMaxNackRetries=10, escalating to PLI keyframe request
+[2026-11-22 22:43:57.887] [WARNING] [rtc-work] [video_coding_module.cc:347] Packet seq=1895 exceeded kMaxNackRetries=10, escalating to PLI keyframe request
+  t= 5.2s [阶段2限速 限速= 650k] -> SDK编码分配= 545 kbps | 累计解码帧=125
+[2026-11-22 22:43:58.111] [WARNING] [rtc-work] [goog_cc_controller.cc:625] SendSideBWE high packet loss (25%), reducing target to 543 kbps
+[2026-11-22 22:43:58.396] [WARNING] [rtc-work] [video_coding_module.cc:347] Packet seq=1921 exceeded kMaxNackRetries=10, escalating to PLI keyframe request
+[2026-11-22 22:43:58.396] [WARNING] [rtc-work] [video_coding_module.cc:347] Packet seq=1922 exceeded kMaxNackRetries=10, escalating to PLI keyframe request
+[2026-11-22 22:43:58.396] [WARNING] [rtc-work] [video_coding_module.cc:347] Packet seq=1923 exceeded kMaxNackRetries=10, escalating to PLI keyframe request
+[2026-11-22 22:43:58.396] [WARNING] [rtc-work] [video_coding_module.cc:347] Packet seq=1924 exceeded kMaxNackRetries=10, escalating to PLI keyframe request
+[2026-11-22 22:43:58.396] [WARNING] [rtc-work] [video_coding_module.cc:347] Packet seq=1925 exceeded kMaxNackRetries=10, escalating to PLI keyframe request
+[2026-11-22 22:43:58.396] [WARNING] [rtc-work] [video_coding_module.cc:347] Packet seq=1926 exceeded kMaxNackRetries=10, escalating to PLI keyframe request
+[2026-11-22 22:43:58.396] [WARNING] [rtc-work] [video_coding_module.cc:347] Packet seq=1927 exceeded kMaxNackRetries=10, escalating to PLI keyframe request
+[2026-11-22 22:43:58.396] [WARNING] [rtc-work] [video_coding_module.cc:347] Packet seq=1928 exceeded kMaxNackRetries=10, escalating to PLI keyframe request
+  t= 5.7s [阶段2限速 限速= 650k] -> SDK编码分配= 534 kbps | 累计解码帧=144
+  t= 6.2s [阶段2限速 限速= 650k] -> SDK编码分配= 534 kbps | 累计解码帧=161
+  t= 6.7s [阶段2限速 限速= 650k] -> SDK编码分配= 534 kbps | 累计解码帧=176
+  t= 7.3s [恢复探测 限速=2200k] -> SDK编码分配=1284 kbps | 累计解码帧=203
+  t= 7.9s [恢复探测 限速=2200k] -> SDK编码分配=1896 kbps | 累计解码帧=221
+  t= 8.4s [阶段3恢复 限速=2200k] -> SDK编码分配=1896 kbps | 累计解码帧=236
+  t= 8.9s [阶段3恢复 限速=2200k] -> SDK编码分配=1896 kbps | 累计解码帧=251
+  t= 9.4s [阶段3恢复 限速=2200k] -> SDK编码分配=1896 kbps | 累计解码帧=266
+  t= 9.9s [阶段3恢复 限速=2200k] -> SDK编码分配=1848 kbps | 累计解码帧=280
+  t=10.4s [阶段3恢复 限速=2200k] -> SDK编码分配=1707 kbps | 累计解码帧=296
+
+==================== [WebRTC P2P (GoogCC) 真实瓶颈拥塞控制实测报告] ====================
+  阶段 1 (2400 kbps 爬升稳态): 编码分配峰值=2150 kbps (末值=1891 kbps) | 真实网卡入站=2192.4 kbps | 瓶颈出站=2188.5 kbps | 排队P50/P95=9.4/19.0 ms | 丢包率=0.0% | 解码帧=75
+  阶段 2 (650 kbps 拥塞骤降):  编码分配均值=528 kbps (最低=355 kbps) | 真实网卡入站=600.7 kbps | 瓶颈出站=613.7 kbps | 排队P50/P95=41.4/115.4 ms | 丢包率=1.7% | 解码帧=74
+  阶段 3 (2200 kbps 容量恢复): 编码分配峰值=1896 kbps | 真实网卡入站=1950.5 kbps | 瓶颈出站=1952.3 kbps | 排队P50/P95=8.9/15.2 ms | 丢包率=0.0% | 解码帧=84
+=======================================================================================
+[       OK ] RtcRealCongestionControlTest.WebRtcP2pGoogCcDynamicBottleneckAdaptation (11187 ms)
+[ RUN      ] RtcRealCongestionControlTest.MoqSimulcastAndAllFiveQuicCongestionControllersRealBottleneck
+
+--- [IETF MoQ (QUIC v1 + Simulcast) 0.6s 粒度实时追踪轨迹] ---
+  t= 0.6s [双层预热 限速=2800k] -> SDK总分配=2654 kbps | 高清层激活=是 | 累计高清/低清解码=16/1
+  t= 1.2s [阶段1双层 限速=2800k] -> SDK总分配=2751 kbps | 高清层激活=是 | 累计高清/低清解码=34/2
+  t= 1.8s [阶段1双层 限速=2800k] -> SDK总分配=2751 kbps | 高清层激活=是 | 累计高清/低清解码=51/3
+  t= 2.4s [阶段1双层 限速=2800k] -> SDK总分配=2751 kbps | 高清层激活=是 | 累计高清/低清解码=70/4
+[2026-11-22 22:44:06.831] [WARNING] [rtc-work] [moq_transport.cc:607] MoQ GOP group_id=6 exceeded delivery_timeout_ms=300, issuing RESET_STREAM and requesting IDR
+  t= 3.2s [骤降挂起 限速= 580k] -> SDK总分配= 310 kbps | 高清层激活=否 | 累计高清/低清解码=72/5
+  t= 3.8s [阶段2降级 限速= 580k] -> SDK总分配= 310 kbps | 高清层激活=否 | 累计高清/低清解码=72/21
+  t= 4.4s [阶段2降级 限速= 580k] -> SDK总分配= 293 kbps | 高清层激活=否 | 累计高清/低清解码=72/52
+  t= 5.0s [阶段2降级 限速= 580k] -> SDK总分配= 386 kbps | 高清层激活=否 | 累计高清/低清解码=72/70
+  t= 5.9s [切至BBR2 限速=2800k] -> SDK总分配= 450 kbps | 高清层激活=否 | 累计高清/低清解码=72/97
+  t= 6.4s [切CUBIC稳 限速=2800k] -> SDK总分配=1451 kbps | 高清层激活=是 | 累计高清/低清解码=82/100
+  t= 6.9s [切CUBIC稳 限速=2800k] -> SDK总分配=2721 kbps | 高清层激活=是 | 累计高清/低清解码=98/101
+  t= 7.4s [切CUBIC稳 限速=2800k] -> SDK总分配=2721 kbps | 高清层激活=是 | 累计高清/低清解码=112/102
+  t= 7.9s [切CUBIC稳 限速=2800k] -> SDK总分配=2721 kbps | 高清层激活=是 | 累计高清/低清解码=127/103
+
+================ [IETF MoQ (QUIC v1 + Simulcast) 真实瓶颈拥塞控制实测报告] ================
+  阶段 1 (2800 kbps BBRv1 双层): 编码分配均值=2702 kbps | 网卡入站=2823.3 kbps | 瓶颈出站=2798.8 kbps | 排队P50/P95=16.8/30.8 ms | 高清解码帧=54
+  阶段 2 (580 kbps 拥塞骤降):    编码分配均值=280 kbps | 网卡入站=581.8 kbps | 瓶颈出站=452.2 kbps | 高清层暂停占比=18/18 | 自动降级低清解码帧=65
+  阶段 3 (2800 kbps 恢复+热切):  编码分配峰值=3816 kbps | 网卡入站=2463.3 kbps | 瓶颈出站=2412.8 kbps | 高清恢复解码帧=55
+==========================================================================================
+
+---------------- [全部 5 种可插拔 QUIC 拥塞控制真实 UDP 瓶颈对比 (1600 -> 600 kbps)] ----------------
+[2026-11-22 22:44:13.671] [WARNING] [rtc-work] [moq_transport.cc:607] MoQ GOP group_id=3 exceeded delivery_timeout_ms=250, issuing RESET_STREAM and requesting IDR
+  [BBRv1   ] 1600k阶段: 分配=1500 kbps, 出站=1595.7 kbps | 600k限速阶段: 分配= 526 kbps, 出站= 546.6 kbps, P50排队=43.2 ms
+  [BBRv2   ] 1600k阶段: 分配=1183 kbps, 出站=1300.6 kbps | 600k限速阶段: 分配= 463 kbps, 出站= 522.3 kbps, P50排队=25.3 ms
+[2026-11-22 22:44:19.485] [WARNING] [rtc-work] [moq_transport.cc:607] MoQ GOP group_id=3 exceeded delivery_timeout_ms=250, issuing RESET_STREAM and requesting IDR
+  [CUBIC   ] 1600k阶段: 分配=1485 kbps, 出站=1586.2 kbps | 600k限速阶段: 分配= 334 kbps, 出站= 499.5 kbps, P50排队=30.2 ms
+[2026-11-22 22:44:22.293] [WARNING] [rtc-work] [moq_transport.cc:607] MoQ GOP group_id=3 exceeded delivery_timeout_ms=250, issuing RESET_STREAM and requesting IDR
+  [Copa    ] 1600k阶段: 分配=1414 kbps, 出站=1561.5 kbps | 600k限速阶段: 分配= 556 kbps, 出站= 593.8 kbps, P50排队=29.7 ms
+  [NewReno ] 1600k阶段: 分配=1323 kbps, 出站=1434.3 kbps | 600k限速阶段: 分配= 377 kbps, 出站= 530.0 kbps, P50排队=24.3 ms
+-----------------------------------------------------------------------------------------------------
+[       OK ] RtcRealCongestionControlTest.MoqSimulcastAndAllFiveQuicCongestionControllersRealBottleneck (22424 ms)
+[ RUN      ] RtcRealCongestionControlTest.WirelessRandomLossResilienceWebRtcAndMoq
+[2026-11-22 22:44:27.044] [WARNING] [rtc-work] [goog_cc_controller.cc:625] SendSideBWE high packet loss (13%), reducing target to 1482 kbps
+[2026-11-22 22:44:27.502] [WARNING] [rtc-work] [goog_cc_controller.cc:625] SendSideBWE high packet loss (14%), reducing target to 1398 kbps
+[2026-11-22 22:44:28.214] [WARNING] [rtc-work] [goog_cc_controller.cc:625] SendSideBWE high packet loss (14%), reducing target to 1290 kbps
+[2026-11-22 22:44:28.721] [WARNING] [rtc-work] [goog_cc_controller.cc:625] SendSideBWE high packet loss (16%), reducing target to 1258 kbps
+[2026-11-22 22:44:29.076] [WARNING] [rtc-work] [goog_cc_controller.cc:625] SendSideBWE high packet loss (25%), reducing target to 1001 kbps
+[2026-11-22 22:44:29.533] [WARNING] [rtc-work] [goog_cc_controller.cc:625] SendSideBWE high packet loss (19%), reducing target to 978 kbps
+
+========== [无线弱网 8% 随机丢包 + 1800 kbps 限速 + 40ms RTT 抗丢包实测对比] ==========
+  [WebRTC P2P GoogCC+FlexFEC+RTX] 编码分配均值=1047 kbps | 网卡入站=1436.4 kbps | 瓶颈出站=1283.6 kbps | 实测丢包=10.8% | 排队P50=4.8 ms | 恢复解码帧=71
+  [IETF MoQ   BBRv2+QUIC-STREAM ] 编码分配均值=1424 kbps | 网卡入站=1686.5 kbps | 瓶颈出站=1536.0 kbps | 实测丢包=10.2% | 排队P50=19.9 ms | 恢复解码帧=73
+========================================================================================
+[       OK ] RtcRealCongestionControlTest.WirelessRandomLossResilienceWebRtcAndMoq (6722 ms)
+[----------] 4 tests from RtcRealCongestionControlTest (40334 ms total)
+
+[----------] Global test environment tear-down
+[==========] 4 tests from 1 test suite ran. (40334 ms total)
+[  PASSED  ] 4 tests.

@@ -1,0 +1,562 @@
+Internal ctest changing into directory: /home/leo/RTCSDK/build
+UpdateCTestConfiguration  from :/home/leo/RTCSDK/build/DartConfiguration.tcl
+UpdateCTestConfiguration  from :/home/leo/RTCSDK/build/DartConfiguration.tcl
+Test project /home/leo/RTCSDK/build
+Constructing a list of tests
+Done constructing a list of tests
+Updating test list for fixtures
+Added 0 tests to meet fixture requirements
+Checking test dependency graph...
+Checking test dependency graph end
+test 1
+    Start 1: RtcCoreUnitTests
+
+1: Test command: /home/leo/RTCSDK/build/rtc_core_unit_tests
+1: Test timeout computed to be: 10000000
+1: Running main() from ./googletest/src/gtest_main.cc
+1: [==========] Running 16 tests from 10 test suites.
+1: [----------] Global test environment set-up.
+1: [----------] 1 test from LoggingTest
+1: [ RUN      ] LoggingTest.UnifiedLoggerTaskQueueTagAndSinks
+1: [       OK ] LoggingTest.UnifiedLoggerTaskQueueTagAndSinks (0 ms)
+1: [----------] 1 test from LoggingTest (0 ms total)
+1: 
+1: [----------] 2 tests from RtcBaseTest
+1: [ RUN      ] RtcBaseTest.TaskQueueIsolationAndSafetyFlag
+1: [       OK ] RtcBaseTest.TaskQueueIsolationAndSafetyFlag (61 ms)
+1: [ RUN      ] RtcBaseTest.PacketSlabPoolAndJsonUtilsZeroException
+1: [       OK ] RtcBaseTest.PacketSlabPoolAndJsonUtilsZeroException (0 ms)
+1: [----------] 2 tests from RtcBaseTest (61 ms total)
+1: 
+1: [----------] 3 tests from RtpRtcpTest
+1: [ RUN      ] RtpRtcpTest.H264AndH265PacketizerAndExtensionsRoundTrip
+1: [       OK ] RtpRtcpTest.H264AndH265PacketizerAndExtensionsRoundTrip (0 ms)
+1: [ RUN      ] RtpRtcpTest.FlexfecAndRtxRecovery
+1: [       OK ] RtpRtcpTest.FlexfecAndRtxRecovery (0 ms)
+1: [ RUN      ] RtpRtcpTest.TwccFeedbackAndNackCodec
+1: [       OK ] RtpRtcpTest.TwccFeedbackAndNackCodec (0 ms)
+1: [----------] 3 tests from RtpRtcpTest (0 ms total)
+1: 
+1: [----------] 3 tests from GoogCcTest
+1: [ RUN      ] GoogCcTest.DetectsBottleneckQueueingAndReducesBitrate
+1: [2026-11-22 23:26:48.012] [INFO] [tid:79743] [goog_cc_controller.cc:474] GoogCC AIMD delay-overuse backoff: 2043 kbps -> 598 kbps (acked=704 kbps)
+1: [2026-11-22 23:26:48.012] [INFO] [tid:79743] [goog_cc_controller.cc:474] GoogCC AIMD delay-overuse backoff: 598 kbps -> 598 kbps (acked=704 kbps)
+1: [       OK ] GoogCcTest.DetectsBottleneckQueueingAndReducesBitrate (0 ms)
+1: [ RUN      ] GoogCcTest.SubMillisecondPacerPrecisionAndZeroBudgetStarvation
+1: [2026-11-22 23:26:48.012] [INFO] [tid:79743] [rtc_core_unit_tests.cc:713] Sub-ms Pacer benchmark: sent=500 pkts (4000 kbps, utilization=100%)
+1: [       OK ] GoogCcTest.SubMillisecondPacerPrecisionAndZeroBudgetStarvation (0 ms)
+1: [ RUN      ] GoogCcTest.ClosedLoopProbeConvergenceBackoffAndWireUtilization
+1: [2026-11-22 23:26:48.013] [INFO] [tid:79743] [rtc_core_unit_tests.cc:888] [BWE Phase 1] 3000 kbps link -> est=3019 kbps, wire=2884.82 kbps (utilization=96.1608%)
+1: [2026-11-22 23:26:48.013] [INFO] [tid:79743] [goog_cc_controller.cc:474] GoogCC AIMD delay-overuse backoff: 3043 kbps -> 2275 kbps (acked=2677 kbps)
+1: [2026-11-22 23:26:48.013] [INFO] [tid:79743] [goog_cc_controller.cc:474] GoogCC AIMD delay-overuse backoff: 2275 kbps -> 1685 kbps (acked=1983 kbps)
+1: [2026-11-22 23:26:48.013] [INFO] [tid:79743] [goog_cc_controller.cc:474] GoogCC AIMD delay-overuse backoff: 1685 kbps -> 938 kbps (acked=1104 kbps)
+1: [2026-11-22 23:26:48.013] [INFO] [tid:79743] [rtc_core_unit_tests.cc:908] [BWE Phase 2] 1000 kbps link -> est=984 kbps, wire=984.865 kbps (utilization=98.4865%)
+1: [       OK ] GoogCcTest.ClosedLoopProbeConvergenceBackoffAndWireUtilization (0 ms)
+1: [----------] 3 tests from GoogCcTest (1 ms total)
+1: 
+1: [----------] 1 test from VideoCodingTest
+1: [ RUN      ] VideoCodingTest.FrameBuffer3BlocksBrokenReferencesAndRecoversOnIdr
+1: [2026-11-22 23:26:48.013] [INFO] [tid:79743] [video_coding_module.cc:572] FrameBuffer3 skipped 2 broken-reference P-frames to clean IDR frame_id=5
+1: [       OK ] VideoCodingTest.FrameBuffer3BlocksBrokenReferencesAndRecoversOnIdr (0 ms)
+1: [----------] 1 test from VideoCodingTest (0 ms total)
+1: 
+1: [----------] 1 test from TransportCryptoTest
+1: [ RUN      ] TransportCryptoTest.StunIntegrityAndLibsrtpGcmRoundTrip
+1: [2026-11-22 23:26:48.016] [INFO] [tid:79743] [dtls_srtp_transport.cc:23] libsrtp2 initialized (status=0)
+1: [       OK ] TransportCryptoTest.StunIntegrityAndLibsrtpGcmRoundTrip (2 ms)
+1: [----------] 1 test from TransportCryptoTest (2 ms total)
+1: 
+1: [----------] 1 test from MoqTransportTest
+1: [ RUN      ] MoqTransportTest.VarIntControlAndLocPackagerRoundTrip
+1: [       OK ] MoqTransportTest.VarIntControlAndLocPackagerRoundTrip (0 ms)
+1: [----------] 1 test from MoqTransportTest (0 ms total)
+1: 
+1: [----------] 1 test from QuicTransportTest
+1: [ RUN      ] QuicTransportTest.Rfc9001InitialVectorAndPacketProtectionAndReassembly
+1: [       OK ] QuicTransportTest.Rfc9001InitialVectorAndPacketProtectionAndReassembly (0 ms)
+1: [----------] 1 test from QuicTransportTest (0 ms total)
+1: 
+1: [----------] 1 test from BrowserCompatibilityTest
+1: [ RUN      ] BrowserCompatibilityTest.ChromeOfferSdpNegotiationAndTwoByteRtpExtensions
+1: [       OK ] BrowserCompatibilityTest.ChromeOfferSdpNegotiationAndTwoByteRtpExtensions (0 ms)
+1: [----------] 1 test from BrowserCompatibilityTest (0 ms total)
+1: 
+1: [----------] 2 tests from MoqQuicTest
+1: [ RUN      ] MoqQuicTest.MoqBweBdpAndSlidingLossAccuracy
+1: [       OK ] MoqQuicTest.MoqBweBdpAndSlidingLossAccuracy (0 ms)
+1: [ RUN      ] MoqQuicTest.PluggableCongestionControlAllFiveAlgorithmsAndHotSwap
+1: [2026-11-22 23:26:48.016] [INFO] [tid:79743] [rtc_core_unit_tests.cc:1025] [QUIC-CC Benchmark] algo=BBRv1 cwnd=16080B, est_kbps=1560, pacing_kbps=1560
+1: [2026-11-22 23:26:48.016] [INFO] [tid:79743] [rtc_core_unit_tests.cc:1025] [QUIC-CC Benchmark] algo=BBRv2 cwnd=14921B, est_kbps=1565, pacing_kbps=1565
+1: [2026-11-22 23:26:48.016] [INFO] [tid:79743] [rtc_core_unit_tests.cc:1025] [QUIC-CC Benchmark] algo=CUBIC cwnd=76800B, est_kbps=8000, pacing_kbps=40960
+1: [2026-11-22 23:26:48.016] [INFO] [tid:79743] [rtc_core_unit_tests.cc:1025] [QUIC-CC Benchmark] algo=Copa cwnd=14756B, est_kbps=3689, pacing_kbps=4242
+1: [2026-11-22 23:26:48.016] [INFO] [tid:79743] [rtc_core_unit_tests.cc:1025] [QUIC-CC Benchmark] algo=NewReno cwnd=76800B, est_kbps=8000, pacing_kbps=40960
+1: [       OK ] MoqQuicTest.PluggableCongestionControlAllFiveAlgorithmsAndHotSwap (0 ms)
+1: [----------] 2 tests from MoqQuicTest (0 ms total)
+1: 
+1: [----------] Global test environment tear-down
+1: [==========] 16 tests from 10 test suites ran. (66 ms total)
+1: [  PASSED  ] 16 tests.
+1/7 Test #1: RtcCoreUnitTests ..................   Passed    0.07 sec
+test 2
+    Start 2: RtcE2EIntegrationTests
+
+2: Test command: /home/leo/RTCSDK/build/rtc_e2e_integration_tests
+2: Test timeout computed to be: 10000000
+2: Running main() from ./googletest/src/gtest_main.cc
+2: [==========] Running 4 tests from 1 test suite.
+2: [----------] Global test environment set-up.
+2: [----------] 4 tests from RtcE2ETest
+2: [ RUN      ] RtcE2ETest.WebRtcPureP2pDirectBrowserSdpBidirectionalStreaming
+2: [2026-11-22 23:26:48.021] [INFO] [tid:79754] [rtc_video_engine_impl.cc:53] RtcVideoEngine created (mode=WebRTC_P2P, codec=H264, simulcast=off)
+2: [2026-11-22 23:26:48.024] [INFO] [tid:79754] [dtls_srtp_transport.cc:23] libsrtp2 initialized (status=0)
+2: [2026-11-22 23:26:48.025] [INFO] [tid:79754] [dtls_srtp_transport.cc:96] Generated ephemeral ECDSA P-256 DTLS certificate (sha-256=49:99:D7:45:CD:0E:02:50...)
+2: [2026-11-22 23:26:48.026] [INFO] [tid:79754] [rtc_video_engine_impl.cc:53] RtcVideoEngine created (mode=WebRTC_P2P, codec=H264, simulcast=off)
+2: [2026-11-22 23:26:48.026] [INFO] [tid:79754] [dtls_srtp_transport.cc:96] Generated ephemeral ECDSA P-256 DTLS certificate (sha-256=5C:B1:78:0D:DA:5B:15:F5...)
+2: [2026-11-22 23:26:48.027] [INFO] [rtc-net] [stun_turn_ice.cc:631] ICE socket bound on UDP port=54353 gathered_host_candidates=2
+2: [2026-11-22 23:26:48.027] [INFO] [rtc-net] [stun_turn_ice.cc:631] ICE socket bound on UDP port=44869 gathered_host_candidates=2
+2: [2026-11-22 23:26:48.028] [INFO] [rtc-net] [stun_turn_ice.cc:1098] ICE state transition: kNew -> kChecking
+2: [2026-11-22 23:26:48.028] [INFO] [rtc-net] [stun_turn_ice.cc:1098] ICE state transition: kNew -> kConnected
+2: [2026-11-22 23:26:48.028] [INFO] [rtc-net] [stun_turn_ice.cc:1043] ICE candidate pair nominated: 127.0.0.1:44869 <-> 127.0.0.1:54353 (rtt_ms=24)
+2: [2026-11-22 23:26:48.028] [INFO] [rtc-net] [stun_turn_ice.cc:1098] ICE state transition: kChecking -> kConnected
+2: [2026-11-22 23:26:48.028] [INFO] [rtc-net] [dtls_srtp_transport.cc:367] Starting DTLS 1.2 handshake (role=kClient)
+2: [2026-11-22 23:26:48.028] [INFO] [rtc-net] [dtls_srtp_transport.cc:367] Starting DTLS 1.2 handshake (role=kServer)
+2: [2026-11-22 23:26:48.028] [INFO] [rtc-net] [stun_turn_ice.cc:1043] ICE candidate pair nominated: 127.0.0.1:54353 <-> 127.0.0.1:44869 (rtt_ms=24)
+2: [2026-11-22 23:26:49.029] [INFO] [rtc-net] [dtls_srtp_transport.cc:498] Negotiated DTLS-SRTP profile=SRTP_AEAD_AES_128_GCM
+2: [2026-11-22 23:26:49.029] [INFO] [rtc-net] [dtls_srtp_transport.cc:420] DTLS-SRTP handshake verified and SRTP keys installed
+2: [2026-11-22 23:26:49.029] [INFO] [rtc-net] [dtls_srtp_transport.cc:498] Negotiated DTLS-SRTP profile=SRTP_AEAD_AES_128_GCM
+2: [2026-11-22 23:26:49.030] [INFO] [rtc-net] [dtls_srtp_transport.cc:420] DTLS-SRTP handshake verified and SRTP keys installed
+2: [2026-11-22 23:26:49.307] [INFO] [tid:79754] [rtc_video_engine_impl.cc:100] Leaving session
+2: [2026-11-22 23:26:49.308] [INFO] [tid:79754] [rtc_video_engine_impl.cc:100] Leaving session
+2: [2026-11-22 23:26:49.311] [INFO] [tid:79754] [rtc_video_engine_impl.cc:78] RtcVideoEngine destroyed cleanly
+2: [2026-11-22 23:26:49.313] [INFO] [tid:79754] [rtc_video_engine_impl.cc:78] RtcVideoEngine destroyed cleanly
+2: [       OK ] RtcE2ETest.WebRtcPureP2pDirectBrowserSdpBidirectionalStreaming (1293 ms)
+2: [ RUN      ] RtcE2ETest.WebRtcPureP2pViaWsSignalingUnderWeakNetworkLoss
+2: [2026-11-22 23:26:49.315] [INFO] [tid:79754] [rtc_video_engine_impl.cc:53] RtcVideoEngine created (mode=WebRTC_P2P, codec=H265, simulcast=off)
+2: [2026-11-22 23:26:49.315] [INFO] [tid:79754] [dtls_srtp_transport.cc:96] Generated ephemeral ECDSA P-256 DTLS certificate (sha-256=A6:3B:D1:4C:80:D9:1A:E1...)
+2: [2026-11-22 23:26:49.316] [INFO] [tid:79754] [dtls_srtp_transport.cc:96] Generated ephemeral ECDSA P-256 DTLS certificate (sha-256=E8:C5:6D:A1:5B:22:2E:7F...)
+2: [2026-11-22 23:26:49.316] [INFO] [rtc-net] [stun_turn_ice.cc:631] ICE socket bound on UDP port=44036 gathered_host_candidates=2
+2: [2026-11-22 23:26:49.316] [INFO] [rtc-net] [stun_turn_ice.cc:631] ICE socket bound on UDP port=53653 gathered_host_candidates=2
+2: [2026-11-22 23:26:49.316] [INFO] [rtc-sig] [wss_signaling_client.cc:71] Connecting signaling WebSocket to ws://127.0.0.1:36985
+2: [2026-11-22 23:26:49.316] [INFO] [rtc-sig] [wss_signaling_client.cc:71] Connecting signaling WebSocket to ws://127.0.0.1:36985
+2: [2026-11-22 23:26:49.317] [INFO] [rtc-sig] [wss_signaling_client.cc:176] WS signaling connected
+2: [2026-11-22 23:26:49.317] [INFO] [rtc-sig] [wss_signaling_client.cc:176] WS signaling connected
+2: [2026-11-22 23:26:49.317] [INFO] [rtc-sig] [webrtc_p2p_backend.cc:543] Sent WebRTC P2P SDP Offer to peer=uav_sender
+2: [2026-11-22 23:26:49.358] [INFO] [rtc-net] [stun_turn_ice.cc:1098] ICE state transition: kNew -> kChecking
+2: [2026-11-22 23:26:49.358] [INFO] [rtc-sig] [webrtc_p2p_backend.cc:565] Sent WebRTC P2P SDP Answer to peer=ground_receiver
+2: [2026-11-22 23:26:49.358] [INFO] [rtc-net] [stun_turn_ice.cc:1098] ICE state transition: kNew -> kConnected
+2: [2026-11-22 23:26:49.358] [INFO] [rtc-net] [stun_turn_ice.cc:1043] ICE candidate pair nominated: 127.0.0.1:53653 <-> 127.0.0.1:44036 (rtt_ms=24)
+2: [2026-11-22 23:26:49.358] [INFO] [rtc-net] [stun_turn_ice.cc:1098] ICE state transition: kChecking -> kConnected
+2: [2026-11-22 23:26:49.358] [INFO] [rtc-net] [dtls_srtp_transport.cc:367] Starting DTLS 1.2 handshake (role=kClient)
+2: [2026-11-22 23:26:49.358] [INFO] [rtc-sig] [webrtc_p2p_backend.cc:576] Applied WebRTC P2P SDP Answer from peer=uav_sender
+2: [2026-11-22 23:26:49.359] [INFO] [rtc-net] [dtls_srtp_transport.cc:367] Starting DTLS 1.2 handshake (role=kServer)
+2: [2026-11-22 23:26:49.359] [INFO] [rtc-net] [stun_turn_ice.cc:1043] ICE candidate pair nominated: 127.0.0.1:44036 <-> 127.0.0.1:53653 (rtt_ms=24)
+2: [2026-11-22 23:26:50.360] [INFO] [rtc-net] [dtls_srtp_transport.cc:498] Negotiated DTLS-SRTP profile=SRTP_AEAD_AES_128_GCM
+2: [2026-11-22 23:26:50.360] [INFO] [rtc-net] [dtls_srtp_transport.cc:420] DTLS-SRTP handshake verified and SRTP keys installed
+2: [2026-11-22 23:26:50.360] [INFO] [rtc-net] [dtls_srtp_transport.cc:498] Negotiated DTLS-SRTP profile=SRTP_AEAD_AES_128_GCM
+2: [2026-11-22 23:26:50.360] [INFO] [rtc-net] [dtls_srtp_transport.cc:420] DTLS-SRTP handshake verified and SRTP keys installed
+2: [2026-11-22 23:26:50.436] [WARNING] [rtc-work] [goog_cc_controller.cc:625] SendSideBWE high packet loss (15%), reducing target to 3738 kbps
+2: [2026-11-22 23:26:50.843] [WARNING] [rtc-work] [goog_cc_controller.cc:625] SendSideBWE high packet loss (28%), reducing target to 3205 kbps
+2: [2026-11-22 23:26:50.851] [INFO] [tid:79754] [rtc_e2e_integration_tests.cc:481] Pure WebRTC P2P (10% loss) summary: decoded=24 pub_bwe_cbs=7
+2: [2026-11-22 23:26:50.851] [WARNING] [rtc-sig] [wss_signaling_client.cc:276] Signaling WebSocket closed (WS closed, code=125)
+2: [2026-11-22 23:26:50.852] [INFO] [tid:79754] [rtc_video_engine_impl.cc:100] Leaving session
+2: [2026-11-22 23:26:50.852] [WARNING] [rtc-sig] [wss_signaling_client.cc:276] Signaling WebSocket closed (WS closed, code=125)
+2: [2026-11-22 23:26:50.853] [INFO] [tid:79754] [rtc_video_engine_impl.cc:78] RtcVideoEngine destroyed cleanly
+2: [       OK ] RtcE2ETest.WebRtcPureP2pViaWsSignalingUnderWeakNetworkLoss (1540 ms)
+2: [ RUN      ] RtcE2ETest.MoqAsioQuicOneToManyRelayUnderWeakNetworkLoss
+2: [2026-11-22 23:26:50.854] [INFO] [tid:79754] [embedded_moq_relay.cc:29] EmbeddedMoqRelayServer started on moq://127.0.0.1:60088
+2: [2026-11-22 23:26:50.854] [INFO] [tid:79754] [rtc_video_engine_impl.cc:53] RtcVideoEngine created (mode=IETF_MoQ, codec=H265, simulcast=on)
+2: [2026-11-22 23:26:50.855] [INFO] [tid:79754] [rtc_video_engine_impl.cc:53] RtcVideoEngine created (mode=IETF_MoQ, codec=H265, simulcast=on)
+2: [2026-11-22 23:26:50.857] [INFO] [tid:79754] [rtc_video_engine_impl.cc:53] RtcVideoEngine created (mode=IETF_MoQ, codec=H265, simulcast=on)
+2: [2026-11-22 23:26:50.857] [INFO] [rtc-work] [moq_transport.cc:447] Connecting MoQ QUIC session to 127.0.0.1:60088 (room=drone_moq, peer=ground_hd)
+2: [2026-11-22 23:26:50.857] [INFO] [rtc-work] [moq_transport.cc:447] Connecting MoQ QUIC session to 127.0.0.1:60088 (room=drone_moq, peer=mobile_ld)
+2: [2026-11-22 23:26:50.858] [INFO] [rtc-net] [asio_quic_transport.cc:2702] AsioQuicClientEngine QUIC v1 1-RTT handshake established with 127.0.0.1:60088
+2: [2026-11-22 23:26:50.858] [INFO] [rtc-work] [moq_transport.cc:511] MoQ session connected, announced namespace=drone_moq/mobile_ld track_name=video/h265
+2: [2026-11-22 23:26:50.859] [INFO] [moq-relay] [asio_quic_transport.cc:3109] AsioQuicServer session=1 QUIC v1 handshake established from 127.0.0.1:42786
+2: [2026-11-22 23:26:50.859] [INFO] [moq-relay] [embedded_moq_relay.cc:262] MoQ Relay peer=mobile_ld announced namespace=drone_moq/mobile_ld (video/h265)
+2: [2026-11-22 23:26:50.859] [INFO] [rtc-net] [asio_quic_transport.cc:2702] AsioQuicClientEngine QUIC v1 1-RTT handshake established with 127.0.0.1:60088
+2: [2026-11-22 23:26:50.859] [INFO] [rtc-work] [moq_transport.cc:511] MoQ session connected, announced namespace=drone_moq/ground_hd track_name=video/h265
+2: [2026-11-22 23:26:50.859] [INFO] [rtc-work] [moq_transport.cc:447] Connecting MoQ QUIC session to 127.0.0.1:60088 (room=drone_moq, peer=uav_01)
+2: [2026-11-22 23:26:50.859] [INFO] [moq-relay] [asio_quic_transport.cc:3109] AsioQuicServer session=2 QUIC v1 handshake established from 127.0.0.1:42122
+2: [2026-11-22 23:26:50.859] [INFO] [moq-relay] [embedded_moq_relay.cc:262] MoQ Relay peer=ground_hd announced namespace=drone_moq/ground_hd (video/h265)
+2: [2026-11-22 23:26:50.860] [INFO] [rtc-net] [asio_quic_transport.cc:2702] AsioQuicClientEngine QUIC v1 1-RTT handshake established with 127.0.0.1:60088
+2: [2026-11-22 23:26:50.860] [INFO] [rtc-work] [moq_transport.cc:511] MoQ session connected, announced namespace=drone_moq/uav_01 track_name=video/h265
+2: [2026-11-22 23:26:50.860] [INFO] [moq-relay] [asio_quic_transport.cc:3109] AsioQuicServer session=3 QUIC v1 handshake established from 127.0.0.1:59625
+2: [2026-11-22 23:26:50.860] [INFO] [moq-relay] [embedded_moq_relay.cc:262] MoQ Relay peer=uav_01 announced namespace=drone_moq/uav_01 (video/h265)
+2: [2026-11-22 23:26:50.861] [INFO] [rtc-work] [moq_transport.cc:702] MoQ subscribed track=uav_01 namespace=drone_moq/uav_01 alias=101 layer=video/high
+2: [2026-11-22 23:26:50.861] [INFO] [rtc-work] [moq_transport.cc:702] MoQ subscribed track=uav_01 namespace=drone_moq/uav_01 alias=101 layer=video/low
+2: [2026-11-22 23:26:50.861] [INFO] [moq-relay] [embedded_moq_relay.cc:298] MoQ Relay subscriber=ground_hd subscribed to drone_moq/uav_01 alias=101 layer=HIGH
+2: [2026-11-22 23:26:50.861] [INFO] [moq-relay] [embedded_moq_relay.cc:298] MoQ Relay subscriber=mobile_ld subscribed to drone_moq/uav_01 alias=101 layer=LOW
+2: [2026-11-22 23:26:50.908] [INFO] [rtc-work] [video_coding_module.cc:793] Simulcast HIGH spatial layer ACTIVATED (media_budget=5853 kbps)
+2: [2026-11-22 23:26:50.908] [INFO] [rtc-work] [video_coding_module.cc:793] Simulcast HIGH spatial layer ACTIVATED (media_budget=5853 kbps)
+2: [2026-11-22 23:26:50.909] [INFO] [rtc-work] [video_coding_module.cc:793] Simulcast HIGH spatial layer ACTIVATED (media_budget=5853 kbps)
+2: [2026-11-22 23:26:51.095] [INFO] [rtc-work] [moq_transport.cc:730] MoQ requested layer switch on track=uav_01 -> video/low
+2: [2026-11-22 23:26:51.238] [INFO] [moq-relay] [embedded_moq_relay.cc:416] MoQ Relay completed GOP-aligned Simulcast switch for subscriber=ground_hd -> LOW
+2: [2026-11-22 23:26:51.401] [INFO] [tid:79754] [rtc_e2e_integration_tests.cc:566] MoQ Asio QUIC E2E summary: sub1_decoded=24 sub2_decoded=24 pub_bwe_cbs=5
+2: [2026-11-22 23:26:51.401] [INFO] [tid:79754] [rtc_video_engine_impl.cc:100] Leaving session
+2: [2026-11-22 23:26:51.402] [INFO] [tid:79754] [rtc_video_engine_impl.cc:100] Leaving session
+2: [2026-11-22 23:26:51.402] [INFO] [tid:79754] [rtc_video_engine_impl.cc:100] Leaving session
+2: [2026-11-22 23:26:51.402] [INFO] [tid:79754] [embedded_moq_relay.cc:49] EmbeddedMoqRelayServer stopped
+2: [2026-11-22 23:26:51.402] [INFO] [tid:79754] [rtc_video_engine_impl.cc:78] RtcVideoEngine destroyed cleanly
+2: [2026-11-22 23:26:51.403] [INFO] [tid:79754] [rtc_video_engine_impl.cc:78] RtcVideoEngine destroyed cleanly
+2: [2026-11-22 23:26:51.404] [INFO] [tid:79754] [rtc_video_engine_impl.cc:78] RtcVideoEngine destroyed cleanly
+2: [       OK ] RtcE2ETest.MoqAsioQuicOneToManyRelayUnderWeakNetworkLoss (550 ms)
+2: [ RUN      ] RtcE2ETest.PureC99AbiWebRtcP2pAndMoqConnect
+2: [2026-11-22 23:26:51.404] [INFO] [tid:79754] [rtc_video_engine_impl.cc:53] RtcVideoEngine created (mode=WebRTC_P2P, codec=H264, simulcast=off)
+2: [2026-11-22 23:26:51.404] [INFO] [tid:79754] [dtls_srtp_transport.cc:96] Generated ephemeral ECDSA P-256 DTLS certificate (sha-256=B2:14:30:E3:0D:E3:AF:42...)
+2: [2026-11-22 23:26:51.405] [INFO] [tid:79754] [rtc_video_engine_impl.cc:53] RtcVideoEngine created (mode=WebRTC_P2P, codec=H264, simulcast=off)
+2: [2026-11-22 23:26:51.406] [INFO] [tid:79754] [dtls_srtp_transport.cc:96] Generated ephemeral ECDSA P-256 DTLS certificate (sha-256=4B:6F:A9:ED:6D:12:A4:D1...)
+2: [2026-11-22 23:26:51.406] [INFO] [rtc-net] [stun_turn_ice.cc:631] ICE socket bound on UDP port=37523 gathered_host_candidates=2
+2: [2026-11-22 23:26:51.406] [INFO] [rtc-net] [stun_turn_ice.cc:631] ICE socket bound on UDP port=48928 gathered_host_candidates=2
+2: [2026-11-22 23:26:51.407] [INFO] [rtc-net] [stun_turn_ice.cc:1098] ICE state transition: kNew -> kChecking
+2: [2026-11-22 23:26:51.407] [INFO] [rtc-net] [stun_turn_ice.cc:1098] ICE state transition: kNew -> kConnected
+2: [2026-11-22 23:26:51.407] [INFO] [rtc-net] [stun_turn_ice.cc:1043] ICE candidate pair nominated: 127.0.0.1:48928 <-> 127.0.0.1:37523 (rtt_ms=24)
+2: [2026-11-22 23:26:51.407] [INFO] [rtc-net] [stun_turn_ice.cc:1098] ICE state transition: kChecking -> kConnected
+2: [2026-11-22 23:26:51.407] [INFO] [rtc-net] [dtls_srtp_transport.cc:367] Starting DTLS 1.2 handshake (role=kClient)
+2: [2026-11-22 23:26:51.407] [INFO] [rtc-net] [stun_turn_ice.cc:1043] ICE candidate pair nominated: 127.0.0.1:37523 <-> 127.0.0.1:48928 (rtt_ms=24)
+2: [2026-11-22 23:26:51.407] [INFO] [rtc-net] [dtls_srtp_transport.cc:367] Starting DTLS 1.2 handshake (role=kServer)
+2: [2026-11-22 23:26:51.407] [INFO] [tid:79754] [rtc_video_engine_impl.cc:100] Leaving session
+2: [2026-11-22 23:26:51.408] [INFO] [rtc-net] [dtls_srtp_transport.cc:498] Negotiated DTLS-SRTP profile=SRTP_AEAD_AES_128_GCM
+2: [2026-11-22 23:26:51.408] [INFO] [rtc-net] [dtls_srtp_transport.cc:420] DTLS-SRTP handshake verified and SRTP keys installed
+2: [2026-11-22 23:26:51.408] [INFO] [rtc-net] [dtls_srtp_transport.cc:498] Negotiated DTLS-SRTP profile=SRTP_AEAD_AES_128_GCM
+2: [2026-11-22 23:26:51.408] [INFO] [rtc-net] [dtls_srtp_transport.cc:420] DTLS-SRTP handshake verified and SRTP keys installed
+2: [2026-11-22 23:26:51.409] [INFO] [tid:79754] [rtc_video_engine_impl.cc:78] RtcVideoEngine destroyed cleanly
+2: [2026-11-22 23:26:51.409] [INFO] [tid:79754] [rtc_video_engine_impl.cc:100] Leaving session
+2: [2026-11-22 23:26:51.410] [INFO] [tid:79754] [rtc_video_engine_impl.cc:78] RtcVideoEngine destroyed cleanly
+2: [2026-11-22 23:26:51.410] [INFO] [tid:79754] [embedded_moq_relay.cc:29] EmbeddedMoqRelayServer started on moq://127.0.0.1:45484
+2: [2026-11-22 23:26:51.411] [INFO] [tid:79754] [rtc_video_engine_impl.cc:53] RtcVideoEngine created (mode=IETF_MoQ, codec=H264, simulcast=on)
+2: [2026-11-22 23:26:51.411] [INFO] [rtc-work] [moq_transport.cc:447] Connecting MoQ QUIC session to 127.0.0.1:45484 (room=c_abi_room, peer=c_peer)
+2: [2026-11-22 23:26:51.411] [INFO] [rtc-net] [asio_quic_transport.cc:2702] AsioQuicClientEngine QUIC v1 1-RTT handshake established with 127.0.0.1:45484
+2: [2026-11-22 23:26:51.411] [INFO] [moq-relay] [asio_quic_transport.cc:3109] AsioQuicServer session=1 QUIC v1 handshake established from 127.0.0.1:55629
+2: [2026-11-22 23:26:51.411] [INFO] [rtc-work] [moq_transport.cc:511] MoQ session connected, announced namespace=c_abi_room/c_peer track_name=video/h264
+2: [2026-11-22 23:26:51.412] [INFO] [tid:79754] [rtc_video_engine_impl.cc:100] Leaving session
+2: [2026-11-22 23:26:51.412] [INFO] [moq-relay] [embedded_moq_relay.cc:262] MoQ Relay peer=c_peer announced namespace=c_abi_room/c_peer (video/h264)
+2: [2026-11-22 23:26:51.412] [INFO] [tid:79754] [rtc_video_engine_impl.cc:78] RtcVideoEngine destroyed cleanly
+2: [2026-11-22 23:26:51.412] [INFO] [tid:79754] [embedded_moq_relay.cc:49] EmbeddedMoqRelayServer stopped
+2: [       OK ] RtcE2ETest.PureC99AbiWebRtcP2pAndMoqConnect (8 ms)
+2: [----------] 4 tests from RtcE2ETest (3392 ms total)
+2: 
+2: [----------] Global test environment tear-down
+2: [==========] 4 tests from 1 test suite ran. (3392 ms total)
+2: [  PASSED  ] 4 tests.
+2/7 Test #2: RtcE2EIntegrationTests ............   Passed    3.40 sec
+test 3
+    Start 3: SdkExampleC99WebRtcP2pFull
+
+3: Test command: /home/leo/RTCSDK/build/rtc_example_c99_p2p "--sig-bin" "/home/leo/RTCSDK/build/rtc_p2p_ws_signaling_server"
+3: Test timeout computed to be: 10000000
+3: [2026-11-22 23:26:52.995] [INFO] [tid:79903] [p2p_ws_signaling_server.cc:108] P2pWsSignalingServer listening on ws://127.0.0.1:39215
+3: [C99-P2P-LOG][INFO][tid:79884][rtc_video_engine_impl.cc:53] RtcVideoEngine created (mode=WebRTC_P2P, codec=H264, simulcast=off)
+3: [C99-P2P-LOG][INFO][tid:79884][dtls_srtp_transport.cc:23] libsrtp2 initialized (status=0)
+3: [C99-P2P-LOG][INFO][tid:79884][dtls_srtp_transport.cc:96] Generated ephemeral ECDSA P-256 DTLS certificate (sha-256=D2:C9:2A:A9:DF:7D:82:B6...)
+3: [C99-P2P-LOG][INFO][rtc-net][stun_turn_ice.cc:631] ICE socket bound on UDP port=46332 gathered_host_candidates=2
+3: [C99-P2P-LOG][INFO][tid:79884][rtc_video_engine_impl.cc:100] Leaving session
+3: [C99-P2P-LOG][INFO][tid:79884][rtc_video_engine_impl.cc:78] RtcVideoEngine destroyed cleanly
+3: 
+3: --- [C99 Part 1] Serverless Direct W3C SDP Bidirectional P2P ---
+3: [C99-P2P-LOG][INFO][tid:79884][rtc_video_engine_impl.cc:53] RtcVideoEngine created (mode=WebRTC_P2P, codec=H264, simulcast=off)
+3: [C99-P2P-LOG][INFO][tid:79884][dtls_srtp_transport.cc:96] Generated ephemeral ECDSA P-256 DTLS certificate (sha-256=A9:CE:0E:06:FA:79:9F:91...)
+3: [C99-P2P-LOG][INFO][tid:79884][rtc_video_engine_impl.cc:53] RtcVideoEngine created (mode=WebRTC_P2P, codec=H264, simulcast=off)
+3: [C99-P2P-LOG][INFO][tid:79884][dtls_srtp_transport.cc:96] Generated ephemeral ECDSA P-256 DTLS certificate (sha-256=E8:E2:43:64:4F:C8:F9:57...)
+3: [C99-P2P-LOG][INFO][rtc-net][stun_turn_ice.cc:631] ICE socket bound on UDP port=50998 gathered_host_candidates=2
+3: [C99-P2P-LOG][INFO][rtc-net][stun_turn_ice.cc:631] ICE socket bound on UDP port=32960 gathered_host_candidates=2
+3: [C99-P2P-LOG][INFO][rtc-net][stun_turn_ice.cc:1098] ICE state transition: kNew -> kChecking
+3: [C99-P2P-LOG][INFO][rtc-net][stun_turn_ice.cc:1098] ICE state transition: kNew -> kChecking
+3: [C99-CamA] Remote track published: peer=viewer_b track=viewer_b_video0 codec=H264
+3: [C99-P2P-LOG][INFO][rtc-net][stun_turn_ice.cc:1098] ICE state transition: kChecking -> kConnected
+3: [C99-P2P-LOG][INFO][rtc-net][stun_turn_ice.cc:1043] ICE candidate pair nominated: 127.0.0.1:50998 <-> 127.0.0.1:32960 (rtt_ms=24)
+3: [C99-P2P-LOG][INFO][rtc-net][stun_turn_ice.cc:1098] ICE state transition: kChecking -> kConnected
+3: [C99-P2P-LOG][INFO][rtc-net][dtls_srtp_transport.cc:367] Starting DTLS 1.2 handshake (role=kClient)
+3: [C99-ViewerB] Remote track published: peer=cam_a track=cam_a_video0 codec=H264
+3: [C99-P2P-LOG][INFO][rtc-net][dtls_srtp_transport.cc:367] Starting DTLS 1.2 handshake (role=kServer)
+3: [C99-P2P-LOG][INFO][rtc-net][stun_turn_ice.cc:1043] ICE candidate pair nominated: 127.0.0.1:32960 <-> 127.0.0.1:50998 (rtt_ms=24)
+3: [C99-P2P-LOG][INFO][rtc-net][dtls_srtp_transport.cc:498] Negotiated DTLS-SRTP profile=SRTP_AEAD_AES_128_GCM
+3: [C99-P2P-LOG][INFO][rtc-net][dtls_srtp_transport.cc:420] DTLS-SRTP handshake verified and SRTP keys installed
+3: [C99-P2P-LOG][INFO][rtc-net][dtls_srtp_transport.cc:498] Negotiated DTLS-SRTP profile=SRTP_AEAD_AES_128_GCM
+3: [C99-P2P-LOG][INFO][rtc-net][dtls_srtp_transport.cc:420] DTLS-SRTP handshake verified and SRTP keys installed
+3: [C99 Part 1 Result] a_pulled=20, b_pulled=20, stats_cbs=1, bwe=4
+3: [C99-P2P-LOG][INFO][tid:79884][rtc_video_engine_impl.cc:100] Leaving session
+3: [C99-P2P-LOG][INFO][tid:79884][rtc_video_engine_impl.cc:100] Leaving session
+3: [C99-P2P-LOG][INFO][tid:79884][rtc_video_engine_impl.cc:78] RtcVideoEngine destroyed cleanly
+3: [C99-P2P-LOG][INFO][tid:79884][rtc_video_engine_impl.cc:78] RtcVideoEngine destroyed cleanly
+3: 
+3: --- [C99 Part 2] WebSocket Auto-Signaling H.265 P2P ---
+3: [C99-P2P-LOG][INFO][tid:79884][rtc_video_engine_impl.cc:53] RtcVideoEngine created (mode=WebRTC_P2P, codec=H265, simulcast=off)
+3: [C99-P2P-LOG][INFO][tid:79884][dtls_srtp_transport.cc:96] Generated ephemeral ECDSA P-256 DTLS certificate (sha-256=60:1A:7F:30:E9:AC:4D:F6...)
+3: [C99-P2P-LOG][INFO][tid:79884][rtc_video_engine_impl.cc:53] RtcVideoEngine created (mode=WebRTC_P2P, codec=H265, simulcast=off)
+3: [C99-P2P-LOG][INFO][tid:79884][dtls_srtp_transport.cc:96] Generated ephemeral ECDSA P-256 DTLS certificate (sha-256=FD:04:0E:32:D6:BC:19:1C...)
+3: [C99-P2P-LOG][INFO][rtc-net][stun_turn_ice.cc:631] ICE socket bound on UDP port=32802 gathered_host_candidates=2
+3: [C99-P2P-LOG][INFO][rtc-net][stun_turn_ice.cc:631] ICE sock[2026-11-22 23:26:53.019] [INFO] [p2p-ws-sig] [p2p_ws_signaling_server.cc:163] P2P WS peer=ground_ctrl joined room=c99_ws_room
+3: [2026-11-22 23:26:53.019] [INFO] [p2p-ws-sig] [p2p_ws_signaling_server.cc:163] P2P WS peer=uav_h265 joined room=c99_ws_room
+3: et bound on UDP port=59380 gathered_host_candidates=2
+3: [C99-P2P-LOG][INFO][rtc-sig][wss_signaling_client.cc:71] Connecting signaling WebSocket to ws://127.0.0.1:39215
+3: [C99-P2P-LOG][INFO][rtc-sig][wss_signaling_client.cc:71] Connecting signaling WebSocket to ws://127.0.0.1:39215
+3: [C99-P2P-LOG][INFO][rtc-sig][wss_signaling_client.cc:176] WS signaling connected
+3: [C99-P2P-LOG][INFO][rtc-sig][wss_signaling_client.cc:176] WS signaling connected
+3: [C99-P2P-LOG][INFO][rtc-sig][webrtc_p2p_backend.cc:543] Sent WebRTC P2P SDP Offer to peer=uav_h265
+3: [C99-P2P-LOG][INFO][rtc-net][stun_turn_ice.cc:1098] ICE state transition: kNew -> kChecking
+3: [C99-WS-PubH265] Remote track published: peer=ground_ctrl track=ground_ctrl_video0 codec=H265
+3: [C99-P2P-LOG][INFO][rtc-net][stun_turn_ice.cc:1098] ICE state transition: kNew -> kConnected
+3: [C99-P2P-LOG][INFO][rtc-net][stun_turn_ice.cc:1043] ICE candidate pair nominated: 127.0.0.1:32802 <-> 127.0.0.1:59380 (rtt_ms=24)
+3: [C99-P2P-LOG][INFO][rtc-net][stun_turn_ice.cc:1098] ICE state transition: kChecking -> kConnected
+3: [C99-P2P-LOG][INFO][rtc-net][dtls_srtp_transport.cc:367] Starting DTLS 1.2 handshake (role=kClient)
+3: [C99-P2P-LOG][INFO][rtc-sig][webrtc_p2p_backend.cc:565] Sent WebRTC P2P SDP Answer to peer=ground_ctrl
+3: [C99-P2P-LOG][INFO][rtc-sig][webrtc_p2p_backend.cc:576] Applied WebRTC P2P SDP Answer from peer=uav_h265
+3: [C99-P2P-LOG][INFO][rtc-net][dtls_srtp_transport.cc:367] Starting DTLS 1.2 handshake (role=kServer)
+3: [C99-P2P-LOG][INFO][rtc-net][stun_turn_ice.cc:1043] ICE candidate pair nominated: 127.0.0.1:59380 <-> 127.0.0.1:32802 (rtt_ms=24)
+3: [C99-WS-SubH265] Remote track published: peer=uav_h265 track=uav_h265_video0 codec=H265
+3: [C99-P2P-LOG][INFO][rtc-net][dtls_srtp_transport.cc:498] Negotiated DTLS-SRTP profile=SRTP_AEAD_AES_128_GCM
+3: [C99-P2P-LOG][INFO][rtc-net][dtls_srtp_transport.cc:420] DTLS-SRTP handshake verified and SRTP keys installed
+3: [C99-P2P-LOG][INFO][rtc-net][dtls_srtp_transport.cc:498] Negotiated DTLS-SRTP profile=SRTP_AEAD_AES_128_GCM
+3: [C99-P2P-LOG][INFO][rtc-net][dtls_srtp_transport.cc:420] DTLS-SRTP handshake verified and SRTP keys installed
+3: [C99-P2P-LOG][INFO][tid:79884][rtc_video_engine_impl.cc:100] Leaving session
+3: [C99-P2P-LOG][WARN][rtc-sig][wss_signaling_client.cc:276] Signaling WebSocket closed (WS closed, code=125)
+3: [C99-WS-SubH265] Remote track unpublished: peer=uav_h265 track=uav_h265_video0
+3: [C99 Part 2 Result] h265_pulled=16, pub_events=1, unpub_events=1
+3: [C99-P2P-LOG][INFO][tid:79884][rtc_video_engine_impl.cc:100] Leaving session
+3: [C99-P2P-LOG][WARN][rtc-sig][wss_signaling_client.cc:276] Signaling WebSocket closed (WS closed, code=125)
+3: [C99-P2P-LOG][INFO][tid:79884][rtc_video_engine_impl.cc:78] RtcVideoEngine destroyed cleanly
+3: [C99-P2P-LOG][INFO][tid:79884][rtc_video_engine_impl.cc:78] RtcVideoEngine destroyed cleanly
+3: === C99 WebRTC P2P Full Demo PASSED (logs_captured=58) ===
+3/7 Test #3: SdkExampleC99WebRtcP2pFull ........   Passed    3.19 sec
+test 4
+    Start 4: SdkExampleC99MoqMultiPullFull
+
+4: Test command: /home/leo/RTCSDK/build/rtc_example_c99_moq "--relay-bin" "/home/leo/RTCSDK/build/rtc_moq_relay_server"
+4: Test timeout computed to be: 10000000
+4: [2026-11-22 23:26:54.607] [INFO] [tid:79920] [embedded_moq_relay.cc:29] EmbeddedMoqRelayServer started on moq://127.0.0.1:39647
+4: [2026-11-22 23:26:54.607] [INFO] [tid:79920] [moq_relay_main.cc:70] IETF MoQ Multi-Stream Relay ready on moq://127.0.0.1:39647
+4: [2026-11-22 23:26:54.628] [INFO] [tid:79919] [rtc_video_engine_impl.cc:53] RtcVideoEngine created (mode=IETF_MoQ, codec=H264, simulcast=off)
+4: [2026-11-22 23:26:54.629] [INFO] [tid:79919] [rtc_video_engine_impl.cc:53] RtcVideoEngine created (mode=IETF_MoQ, codec=H265, simulcast=on)
+4: [2026-11-22 23:26:54.630] [INFO] [tid:79919] [rtc_video_engine_impl.cc:53] RtcVideoEngine created (mode=IETF_MoQ, codec=H264, simulcast=on)
+4: [2026-11-22 23:26:54.630] [INFO] [rtc-work] [moq_transport.cc:447] Connecting MoQ QUIC session to 127.0.0.1:39647 (room=c99_moq_fleet, peer=c99_nvr_console)
+4: [2026-11-22 23:26:54.634] [INFO] [rtc-net] [asio_quic_transport.cc:2702] AsioQuicClientEngine QUIC v1 1-RTT handshake established with 127.0.0.1:39647
+4: [2026-11-22 23:26:54.634] [INFO] [rtc-work] [moq_transport.cc:511] MoQ session connected, announced namespace=c99_moq_fleet/c99_nvr_console track_name=video/h264
+4: [2026-11-22 23:26:54.634] [INFO] [moq-relay] [asio_quic_transport.cc:3109] AsioQuicServer session=1 QUIC v1 handshake established from 127.0.0.1:34147
+4: [2026-11-22 23:26:54.634] [INFO] [moq-relay] [embedded_moq_relay.cc:262] MoQ Relay peer=c99_nvr_console announced namespace=c99_moq_fleet/c99_nvr_console (video/h264)
+4: [2026-11-22 23:26:54.641] [INFO] [rtc-work] [moq_transport.cc:447] Connecting MoQ QUIC session to 127.0.0.1:39647 (room=c99_moq_fleet, peer=c99_cam_h264)
+4: [2026-11-22 23:26:54.641] [INFO] [rtc-work] [moq_transport.cc:447] Connecting MoQ QUIC session to 127.0.0.1:39647 (room=c99_moq_fleet, peer=c99_cam_h265)
+4: [2026-11-22 23:26:54.642] [INFO] [rtc-net] [asio_quic_transport.cc:2702] AsioQuicClientEngine QUIC v1 1-RTT handshake established with 127.0.0.1:39647
+4: [2026-11-22 23:26:54.642] [INFO] [rtc-work] [moq_transport.cc:511] MoQ session connected, announced namespace=c99_moq_fleet/c99_cam_h264 track_name=video/h264
+4: [2026-11-22 23:26:54.642] [INFO] [moq-relay] [asio_quic_transport.cc:3109] AsioQuicServer session=2 QUIC v1 handshake established from 127.0.0.1:51197
+4: [2026-11-22 23:26:54.642] [INFO] [rtc-net] [asio_quic_transport.cc:2702] AsioQuicClientEngine QUIC v1 1-RTT handshake established with 127.0.0.1:39647
+4: [2026-11-22 23:26:54.642] [INFO] [moq-relay] [embedded_moq_relay.cc:262] MoQ Relay peer=c99_cam_h264 announced namespace=c99_moq_fleet/c99_cam_h264 (video/h264)
+4: [2026-11-22 23:26:54.642] [INFO] [rtc-work] [moq_transport.cc:511] MoQ session connected, announced namespace=c99_moq_fleet/c99_cam_h265 track_name=video/h265
+4: [2026-11-22 23:26:54.642] [INFO] [moq-relay] [asio_quic_transport.cc:3109] AsioQuicServer session=3 QUIC v1 handshake established from 127.0.0.1:54040
+4: [2026-11-22 23:26:54.642] [INFO] [moq-relay] [embedded_moq_relay.cc:262] MoQ Relay peer=c99_cam_h265 announced namespace=c99_moq_fleet/c99_cam_h265 (video/h265)
+4: [2026-11-22 23:26:54.651] [INFO] [rtc-work] [moq_transport.cc:702] MoQ subscribed track=c99_cam_h265 namespace=c99_moq_fleet/c99_cam_h265 alias=101 layer=video/high
+4: [2026-11-22 23:26:54.651] [INFO] [rtc-work] [moq_transport.cc:702] MoQ subscribed track=c99_cam_h264 namespace=c99_moq_fleet/c99_cam_h264 alias=102 layer=video/low
+4: [2026-11-22 23:26:54.651] [INFO] [moq-relay] [embedded_moq_relay.cc:298] MoQ Relay subscriber=c99_nvr_console subscribed to c99_moq_fleet/c99_cam_h265 alias=101 layer=HIGH
+4: [2026-11-22 23:26:54.651] [INFO] [moq-relay] [embedded_moq_relay.cc:298] MoQ Relay subscriber=c99_nvr_console subscribed to c99_moq_fleet/c99_cam_h264 alias=102 layer=LOW
+4: [2026-11-22 23:26:54.691] [INFO] [rtc-work] [video_coding_module.cc:793] Simulcast HIGH spatial layer ACTIVATED (media_budget=5853 kbps)
+4: [2026-11-22 23:26:54.691] [INFO] [rtc-work] [video_coding_module.cc:793] Simulcast HIGH spatial layer ACTIVATED (media_budget=5853 kbps)
+4: [2026-11-22 23:26:54.826] [INFO] [rtc-net] [asio_quic_transport.cc:1192] Hot-swapped QUIC congestion controller: BBRv1 -> BBRv2 (cwnd=29218B, bwe_kbps=233744)
+4: [2026-11-22 23:26:54.827] [INFO] [rtc-net] [asio_quic_transport.cc:1192] Hot-swapped QUIC congestion controller: CUBIC -> Copa (cwnd=12000B, bwe_kbps=96000)
+4: [2026-11-22 23:26:54.894] [INFO] [rtc-work] [moq_transport.cc:730] MoQ requested layer switch on track=c99_cam_h265 -> video/low
+4: [2026-11-22 23:26:54.894] [INFO] [rtc-work] [moq_transport.cc:730] MoQ requested layer switch on track=c99_cam_h264 -> video/high
+4: [2026-11-22 23:26:55.052] [INFO] [moq-relay] [embedded_moq_relay.cc:416] MoQ Relay completed GOP-aligned Simulcast switch for subscriber=c99_nvr_console -> LOW
+4: [2026-11-22 23:26:55.052] [INFO] [moq-relay] [embedded_moq_relay.cc:416] MoQ Relay completed GOP-aligned Simulcast switch for subscriber=c99_nvr_console -> HIGH
+4: [2026-11-22 23:26:55.096] [INFO] [rtc-net] [asio_quic_transport.cc:1192] Hot-swapped QUIC congestion controller: BBRv2 -> NewReno (cwnd=31618B, bwe_kbps=252944)
+4: [2026-11-22 23:26:55.096] [INFO] [rtc-net] [asio_quic_transport.cc:1192] Hot-swapped QUIC congestion controller: Copa -> BBRv1 (cwnd=12000B, bwe_kbps=96000)
+4: [2026-11-22 23:26:55.441] [INFO] [tid:79919] [rtc_video_engine_impl.cc:100] Leaving session
+4: [2026-11-22 23:26:55.462] [INFO] [tid:79919] [rtc_video_engine_impl.cc:100] Leaving session
+4: [2026-11-22 23:26:55.462] [INFO] [tid:79919] [rtc_video_engine_impl.cc:100] Leaving session
+4: [2026-11-22 23:26:55.463] [INFO] [tid:79919] [rtc_video_engine_impl.cc:78] RtcVideoEngine destroyed cleanly
+4: [2026-11-22 23:26:55.464] [INFO] [tid:79919] [rtc_video_engine_impl.cc:78] RtcVideoEngine destroyed cleanly
+4: [2026-11-22 23:26:55.464] [INFO] [tid:79919] [rtc_video_engine_impl.cc:78] RtcVideoEngine destroyed cleanly
+4: [2026-11-22 23:26:55.512] [INFO] [tid:79920] [embedded_moq_relay.cc:49] EmbeddedMoqRelayServer stopped
+4: [C99-MoQ] Initial QUIC CC modules: cam1=BBRv1, cam2=CUBIC
+4: [C99-CamH264] MoQ track discovered: peer=c99_nvr_console track=c99_nvr_console codec=H264
+4: [C99-CamH264] MoQ track discovered: peer=c99_cam_h265 track=c99_cam_h265 codec=H265
+4: [C99-NVR] MoQ track discovered: peer=c99_cam_h264 track=c99_cam_h264 codec=H264
+4: [C99-NVR] MoQ track discovered: peer=c99_cam_h265 track=c99_cam_h265 codec=H265
+4: [C99-CamH265] MoQ track discovered: peer=c99_nvr_console track=c99_nvr_console codec=H264
+4: [C99-CamH265] MoQ track discovered: peer=c99_cam_h264 track=c99_cam_h264 codec=H264
+4: [C99-NVR] MoQ track unpublished: peer=c99_cam_h265 track=c99_cam_h265
+4: [C99-CamH264] MoQ track unpublished: peer=c99_cam_h265 track=c99_cam_h265
+4: === C99 MoQ Multi-Pull Demo Summary: h265=28 (layer=LOW), h264=29 (layer=HIGH), unpub=1, stats=1 ===
+4/7 Test #4: SdkExampleC99MoqMultiPullFull .....   Passed    0.91 sec
+test 5
+    Start 5: SdkExampleCpp17WebRtcP2pFull
+
+5: Test command: /home/leo/RTCSDK/build/rtc_example_cpp17_p2p
+5: Test timeout computed to be: 10000000
+5: [2026-11-22 23:26:55.517] [INFO] [tid:79937] [rtc_video_engine_impl.cc:53] RtcVideoEngine created (mode=WebRTC_P2P, codec=H264, simulcast=off)
+5: [2026-11-22 23:26:55.519] [INFO] [tid:79937] [dtls_srtp_transport.cc:23] libsrtp2 initialized (status=0)
+5: [2026-11-22 23:26:55.520] [INFO] [tid:79937] [dtls_srtp_transport.cc:96] Generated ephemeral ECDSA P-256 DTLS certificate (sha-256=41:06:A0:A4:67:3C:22:B5...)
+5: [2026-11-22 23:26:55.520] [INFO] [tid:79937] [rtc_video_engine_impl.cc:100] Leaving session
+5: [2026-11-22 23:26:55.521] [INFO] [tid:79937] [rtc_video_engine_impl.cc:78] RtcVideoEngine destroyed cleanly
+5: [2026-11-22 23:26:55.521] [INFO] [tid:79937] [cpp17_webrtc_p2p_full_demo.cc:259] --- [C++17 Part 1] Serverless Direct SDP Bidirectional P2P ---
+5: [2026-11-22 23:26:55.522] [INFO] [tid:79937] [rtc_video_engine_impl.cc:53] RtcVideoEngine created (mode=WebRTC_P2P, codec=H264, simulcast=off)
+5: [2026-11-22 23:26:55.523] [INFO] [tid:79937] [dtls_srtp_transport.cc:96] Generated ephemeral ECDSA P-256 DTLS certificate (sha-256=97:35:7A:CA:55:87:C2:C5...)
+5: [2026-11-22 23:26:55.524] [INFO] [tid:79937] [rtc_video_engine_impl.cc:53] RtcVideoEngine created (mode=WebRTC_P2P, codec=H264, simulcast=off)
+5: [2026-11-22 23:26:55.524] [INFO] [tid:79937] [dtls_srtp_transport.cc:96] Generated ephemeral ECDSA P-256 DTLS certificate (sha-256=EC:41:D7:B1:06:1C:9C:BC...)
+5: [2026-11-22 23:26:55.525] [INFO] [rtc-net] [stun_turn_ice.cc:631] ICE socket bound on UDP port=48134 gathered_host_candidates=2
+5: [2026-11-22 23:26:55.525] [INFO] [rtc-net] [stun_turn_ice.cc:631] ICE socket bound on UDP port=45441 gathered_host_candidates=2
+5: [2026-11-22 23:26:55.525] [INFO] [rtc-net] [stun_turn_ice.cc:1098] ICE state transition: kNew -> kChecking
+5: [2026-11-22 23:26:55.526] [INFO] [rtc-net] [stun_turn_ice.cc:1098] ICE state transition: kNew -> kChecking
+5: [2026-11-22 23:26:55.526] [INFO] [rtc-cb] [cpp17_webrtc_p2p_full_demo.cc:84] [Cpp17-CamA] Remote track published: peer=app_b track=app_b_video0 codec=H264
+5: [2026-11-22 23:26:55.526] [INFO] [rtc-net] [stun_turn_ice.cc:1098] ICE state transition: kChecking -> kConnected
+5: [2026-11-22 23:26:55.526] [INFO] [rtc-net] [stun_turn_ice.cc:1043] ICE candidate pair nominated: 127.0.0.1:48134 <-> 127.0.0.1:45441 (rtt_ms=24)
+5: [2026-11-22 23:26:55.526] [INFO] [rtc-net] [stun_turn_ice.cc:1098] ICE state transition: kChecking -> kConnected
+5: [2026-11-22 23:26:55.526] [INFO] [rtc-net] [dtls_srtp_transport.cc:367] Starting DTLS 1.2 handshake (role=kClient)
+5: [2026-11-22 23:26:55.526] [INFO] [rtc-net] [dtls_srtp_transport.cc:367] Starting DTLS 1.2 handshake (role=kServer)
+5: [2026-11-22 23:26:55.526] [INFO] [rtc-cb] [cpp17_webrtc_p2p_full_demo.cc:84] [Cpp17-AppB] Remote track published: peer=cam_a track=cam_a_video0 codec=H264
+5: [2026-11-22 23:26:55.527] [INFO] [rtc-net] [dtls_srtp_transport.cc:498] Negotiated DTLS-SRTP profile=SRTP_AEAD_AES_128_GCM
+5: [2026-11-22 23:26:55.527] [INFO] [rtc-net] [dtls_srtp_transport.cc:420] DTLS-SRTP handshake verified and SRTP keys installed
+5: [2026-11-22 23:26:55.528] [INFO] [rtc-net] [dtls_srtp_transport.cc:498] Negotiated DTLS-SRTP profile=SRTP_AEAD_AES_128_GCM
+5: [2026-11-22 23:26:55.528] [INFO] [rtc-net] [dtls_srtp_transport.cc:420] DTLS-SRTP handshake verified and SRTP keys installed
+5: [2026-11-22 23:26:56.018] [INFO] [tid:79937] [cpp17_webrtc_p2p_full_demo.cc:319] [C++17 Part 1 Result] cam_pulled=20 app_pulled=20 stats_cbs=1 bwe_cbs=8
+5: [2026-11-22 23:26:56.018] [INFO] [tid:79937] [rtc_video_engine_impl.cc:100] Leaving session
+5: [2026-11-22 23:26:56.018] [INFO] [tid:79937] [rtc_video_engine_impl.cc:100] Leaving session
+5: [2026-11-22 23:26:56.019] [INFO] [tid:79937] [rtc_video_engine_impl.cc:78] RtcVideoEngine destroyed cleanly
+5: [2026-11-22 23:26:56.019] [INFO] [tid:79937] [rtc_video_engine_impl.cc:78] RtcVideoEngine destroyed cleanly
+5: [2026-11-22 23:26:56.019] [INFO] [tid:79937] [cpp17_webrtc_p2p_full_demo.cc:334] --- [C++17 Part 2] WebSocket Auto-Signaling H.265 P2P ---
+5: [2026-11-22 23:26:56.019] [INFO] [tid:79937] [p2p_ws_signaling_server.cc:108] P2pWsSignalingServer listening on ws://127.0.0.1:36249
+5: [2026-11-22 23:26:56.020] [INFO] [tid:79937] [rtc_video_engine_impl.cc:53] RtcVideoEngine created (mode=WebRTC_P2P, codec=H265, simulcast=off)
+5: [2026-11-22 23:26:56.021] [INFO] [tid:79937] [dtls_srtp_transport.cc:96] Generated ephemeral ECDSA P-256 DTLS certificate (sha-256=1B:C6:31:A9:F1:4A:62:5F...)
+5: [2026-11-22 23:26:56.021] [INFO] [tid:79937] [rtc_video_engine_impl.cc:53] RtcVideoEngine created (mode=WebRTC_P2P, codec=H265, simulcast=off)
+5: [2026-11-22 23:26:56.021] [INFO] [tid:79937] [dtls_srtp_transport.cc:96] Generated ephemeral ECDSA P-256 DTLS certificate (sha-256=9B:FC:B4:9B:F0:D6:C5:AC...)
+5: [2026-11-22 23:26:56.022] [INFO] [rtc-net] [stun_turn_ice.cc:631] ICE socket bound on UDP port=48952 gathered_host_candidates=2
+5: [2026-11-22 23:26:56.022] [INFO] [rtc-net] [stun_turn_ice.cc:631] ICE socket bound on UDP port=56362 gathered_host_candidates=2
+5: [2026-11-22 23:26:56.022] [INFO] [rtc-sig] [wss_signaling_client.cc:71] Connecting signaling WebSocket to ws://127.0.0.1:36249
+5: [2026-11-22 23:26:56.022] [INFO] [rtc-sig] [wss_signaling_client.cc:71] Connecting signaling WebSocket to ws://127.0.0.1:36249
+5: [2026-11-22 23:26:56.023] [INFO] [rtc-sig] [wss_signaling_client.cc:176] WS signaling connected
+5: [2026-11-22 23:26:56.023] [INFO] [rtc-sig] [wss_signaling_client.cc:176] WS signaling connected
+5: [2026-11-22 23:26:56.023] [INFO] [p2p-ws-sig] [p2p_ws_signaling_server.cc:163] P2P WS peer=teleop_cockpit joined room=cpp17_ws_room
+5: [2026-11-22 23:26:56.023] [INFO] [p2p-ws-sig] [p2p_ws_signaling_server.cc:163] P2P WS peer=robot_arm_cam joined room=cpp17_ws_room
+5: [2026-11-22 23:26:56.023] [INFO] [rtc-sig] [webrtc_p2p_backend.cc:543] Sent WebRTC P2P SDP Offer to peer=robot_arm_cam
+5: [2026-11-22 23:26:56.063] [INFO] [rtc-net] [stun_turn_ice.cc:1098] ICE state transition: kNew -> kChecking
+5: [2026-11-22 23:26:56.063] [INFO] [rtc-cb] [cpp17_webrtc_p2p_full_demo.cc:84] [Cpp17-WS-PubH265] Remote track published: peer=teleop_cockpit track=teleop_cockpit_video0 codec=H265
+5: [2026-11-22 23:26:56.063] [INFO] [rtc-net] [stun_turn_ice.cc:1098] ICE state transition: kNew -> kConnected
+5: [2026-11-22 23:26:56.063] [INFO] [rtc-net] [stun_turn_ice.cc:1043] ICE candidate pair nominated: 127.0.0.1:56362 <-> 127.0.0.1:48952 (rtt_ms=24)
+5: [2026-11-22 23:26:56.063] [INFO] [rtc-net] [stun_turn_ice.cc:1098] ICE state transition: kChecking -> kConnected
+5: [2026-11-22 23:26:56.063] [INFO] [rtc-net] [dtls_srtp_transport.cc:367] Starting DTLS 1.2 handshake (role=kClient)
+5: [2026-11-22 23:26:56.063] [INFO] [rtc-sig] [webrtc_p2p_backend.cc:565] Sent WebRTC P2P SDP Answer to peer=teleop_cockpit
+5: [2026-11-22 23:26:56.064] [INFO] [rtc-sig] [webrtc_p2p_backend.cc:576] Applied WebRTC P2P SDP Answer from peer=robot_arm_cam
+5: [2026-11-22 23:26:56.064] [INFO] [rtc-net] [dtls_srtp_transport.cc:367] Starting DTLS 1.2 handshake (role=kServer)
+5: [2026-11-22 23:26:56.064] [INFO] [rtc-cb] [cpp17_webrtc_p2p_full_demo.cc:84] [Cpp17-WS-SubH265] Remote track published: peer=robot_arm_cam track=robot_arm_cam_video0 codec=H265
+5: [2026-11-22 23:26:56.064] [INFO] [rtc-net] [stun_turn_ice.cc:1043] ICE candidate pair nominated: 127.0.0.1:48952 <-> 127.0.0.1:56362 (rtt_ms=24)
+5: [2026-11-22 23:26:57.065] [INFO] [rtc-net] [dtls_srtp_transport.cc:498] Negotiated DTLS-SRTP profile=SRTP_AEAD_AES_128_GCM
+5: [2026-11-22 23:26:57.065] [INFO] [rtc-net] [dtls_srtp_transport.cc:420] DTLS-SRTP handshake verified and SRTP keys installed
+5: [2026-11-22 23:26:57.065] [INFO] [rtc-net] [dtls_srtp_transport.cc:498] Negotiated DTLS-SRTP profile=SRTP_AEAD_AES_128_GCM
+5: [2026-11-22 23:26:57.065] [INFO] [rtc-net] [dtls_srtp_transport.cc:420] DTLS-SRTP handshake verified and SRTP keys installed
+5: [2026-11-22 23:26:57.434] [INFO] [tid:79937] [rtc_video_engine_impl.cc:100] Leaving session
+5: [2026-11-22 23:26:57.434] [WARNING] [rtc-sig] [wss_signaling_client.cc:276] Signaling WebSocket closed (WS closed, code=125)
+5: [2026-11-22 23:26:57.434] [INFO] [rtc-cb] [cpp17_webrtc_p2p_full_demo.cc:94] [Cpp17-WS-SubH265] Remote track unpublished: peer=robot_arm_cam track=robot_arm_cam_video0
+5: [2026-11-22 23:26:57.435] [INFO] [tid:79937] [cpp17_webrtc_p2p_full_demo.cc:392] [C++17 Part 2 Result] h265_pulled=18 pub_events=1 unpub_events=1
+5: [2026-11-22 23:26:57.435] [INFO] [tid:79937] [rtc_video_engine_impl.cc:100] Leaving session
+5: [2026-11-22 23:26:57.435] [WARNING] [rtc-sig] [wss_signaling_client.cc:276] Signaling WebSocket closed (WS closed, code=125)
+5: [2026-11-22 23:26:57.438] [INFO] [tid:79937] [rtc_video_engine_impl.cc:78] RtcVideoEngine destroyed cleanly
+5: [2026-11-22 23:26:57.439] [INFO] [tid:79937] [rtc_video_engine_impl.cc:78] RtcVideoEngine destroyed cleanly
+5: [2026-11-22 23:26:57.440] [INFO] [tid:79937] [cpp17_webrtc_p2p_full_demo.cc:426] === C++17 WebRTC P2P Full Demo Summary: exit=0 custom_sink_logs=68 ring_buffer_logs=68 ===
+5/7 Test #5: SdkExampleCpp17WebRtcP2pFull ......   Passed    1.93 sec
+test 6
+    Start 6: SdkExampleCpp17MoqMultiPullFull
+
+6: Test command: /home/leo/RTCSDK/build/rtc_example_cpp17_moq
+6: Test timeout computed to be: 10000000
+6: [2026-11-22 23:26:57.444] [INFO] [tid:80035] [embedded_moq_relay.cc:29] EmbeddedMoqRelayServer started on moq://127.0.0.1:41110
+6: [2026-11-22 23:26:57.445] [INFO] [tid:80035] [rtc_video_engine_impl.cc:53] RtcVideoEngine created (mode=IETF_MoQ, codec=H264, simulcast=off)
+6: [2026-11-22 23:26:57.445] [INFO] [rtc-work] [moq_transport.cc:447] Connecting MoQ QUIC session to 127.0.0.1:41110 (room=fleet_room, peer=nvr_console)
+6: [2026-11-22 23:26:57.447] [INFO] [rtc-net] [asio_quic_transport.cc:2702] AsioQuicClientEngine QUIC v1 1-RTT handshake established with 127.0.0.1:41110
+6: [2026-11-22 23:26:57.447] [INFO] [rtc-work] [moq_transport.cc:511] MoQ session connected, announced namespace=fleet_room/nvr_console track_name=video/h264
+6: [2026-11-22 23:26:57.447] [INFO] [moq-relay] [asio_quic_transport.cc:3109] AsioQuicServer session=1 QUIC v1 handshake established from 127.0.0.1:40423
+6: [2026-11-22 23:26:57.447] [INFO] [moq-relay] [embedded_moq_relay.cc:262] MoQ Relay peer=nvr_console announced namespace=fleet_room/nvr_console (video/h264)
+6: [2026-11-22 23:26:57.449] [INFO] [tid:80035] [rtc_video_engine_impl.cc:53] RtcVideoEngine created (mode=IETF_MoQ, codec=H265, simulcast=on)
+6: [2026-11-22 23:26:57.450] [INFO] [tid:80035] [rtc_video_engine_impl.cc:53] RtcVideoEngine created (mode=IETF_MoQ, codec=H264, simulcast=on)
+6: [2026-11-22 23:26:57.450] [INFO] [rtc-work] [moq_transport.cc:447] Connecting MoQ QUIC session to 127.0.0.1:41110 (room=fleet_room, peer=cam_front_h265)
+6: [2026-11-22 23:26:57.450] [INFO] [rtc-work] [moq_transport.cc:447] Connecting MoQ QUIC session to 127.0.0.1:41110 (room=fleet_room, peer=cam_rear_h264)
+6: [2026-11-22 23:26:57.451] [INFO] [rtc-net] [asio_quic_transport.cc:2702] AsioQuicClientEngine QUIC v1 1-RTT handshake established with 127.0.0.1:41110
+6: [2026-11-22 23:26:57.451] [INFO] [rtc-work] [moq_transport.cc:511] MoQ session connected, announced namespace=fleet_room/cam_rear_h264 track_name=video/h264
+6: [2026-11-22 23:26:57.451] [INFO] [moq-relay] [asio_quic_transport.cc:3109] AsioQuicServer session=2 QUIC v1 handshake established from 127.0.0.1:49018
+6: [2026-11-22 23:26:57.451] [INFO] [rtc-net] [asio_quic_transport.cc:2702] AsioQuicClientEngine QUIC v1 1-RTT handshake established with 127.0.0.1:41110
+6: [2026-11-22 23:26:57.451] [INFO] [rtc-work] [moq_transport.cc:511] MoQ session connected, announced namespace=fleet_room/cam_front_h265 track_name=video/h265
+6: [2026-11-22 23:26:57.451] [INFO] [moq-relay] [embedded_moq_relay.cc:262] MoQ Relay peer=cam_rear_h264 announced namespace=fleet_room/cam_rear_h264 (video/h264)
+6: [2026-11-22 23:26:57.451] [INFO] [moq-relay] [asio_quic_transport.cc:3109] AsioQuicServer session=3 QUIC v1 handshake established from 127.0.0.1:49144
+6: [2026-11-22 23:26:57.451] [INFO] [moq-relay] [embedded_moq_relay.cc:262] MoQ Relay peer=cam_front_h265 announced namespace=fleet_room/cam_front_h265 (video/h265)
+6: [2026-11-22 23:26:57.451] [INFO] [rtc-cb] [cpp17_moq_multipull_full_demo.cc:125] [NVR-Console] Remote camera online: peer=cam_rear_h264 track=cam_rear_h264 codec=H264
+6: [2026-11-22 23:26:57.451] [INFO] [rtc-cb] [cpp17_moq_multipull_full_demo.cc:125] [NVR-Console] Remote camera online: peer=cam_front_h265 track=cam_front_h265 codec=H265
+6: [2026-11-22 23:26:57.451] [INFO] [rtc-work] [moq_transport.cc:702] MoQ subscribed track=cam_front_h265 namespace=fleet_room/cam_front_h265 alias=101 layer=video/high
+6: [2026-11-22 23:26:57.451] [INFO] [moq-relay] [embedded_moq_relay.cc:298] MoQ Relay subscriber=nvr_console subscribed to fleet_room/cam_front_h265 alias=101 layer=HIGH
+6: [2026-11-22 23:26:57.451] [INFO] [rtc-work] [moq_transport.cc:702] MoQ subscribed track=cam_rear_h264 namespace=fleet_room/cam_rear_h264 alias=102 layer=video/low
+6: [2026-11-22 23:26:57.452] [INFO] [moq-relay] [embedded_moq_relay.cc:298] MoQ Relay subscriber=nvr_console subscribed to fleet_room/cam_rear_h264 alias=102 layer=LOW
+6: [2026-11-22 23:26:57.500] [INFO] [rtc-work] [video_coding_module.cc:793] Simulcast HIGH spatial layer ACTIVATED (media_budget=5853 kbps)
+6: [2026-11-22 23:26:57.500] [INFO] [rtc-work] [video_coding_module.cc:793] Simulcast HIGH spatial layer ACTIVATED (media_budget=5853 kbps)
+6: [2026-11-22 23:26:57.500] [INFO] [rtc-cb] [cpp17_moq_multipull_full_demo.cc:45] [CamFront-H265] VENC layer=LOW active=1 target_kbps=450 fps=20
+6: [2026-11-22 23:26:57.500] [INFO] [rtc-cb] [cpp17_moq_multipull_full_demo.cc:45] [CamFront-H265] VENC layer=HIGH active=1 target_kbps=5403 fps=30
+6: [2026-11-22 23:26:57.500] [INFO] [rtc-cb] [cpp17_moq_multipull_full_demo.cc:45] [CamRear-H264] VENC layer=LOW active=1 target_kbps=450 fps=20
+6: [2026-11-22 23:26:57.500] [INFO] [rtc-cb] [cpp17_moq_multipull_full_demo.cc:45] [CamRear-H264] VENC layer=HIGH active=1 target_kbps=5403 fps=30
+6: [2026-11-22 23:26:57.627] [INFO] [rtc-net] [asio_quic_transport.cc:1192] Hot-swapped QUIC congestion controller: BBRv2 -> Copa (cwnd=45126B, bwe_kbps=361008)
+6: [2026-11-22 23:26:57.627] [INFO] [moq-relay] [asio_quic_transport.cc:1192] Hot-swapped QUIC congestion controller: BBRv1 -> BBRv2 (cwnd=12677B, bwe_kbps=101416)
+6: [2026-11-22 23:26:57.627] [INFO] [moq-relay] [asio_quic_transport.cc:1192] Hot-swapped QUIC congestion controller: BBRv1 -> BBRv2 (cwnd=12674B, bwe_kbps=101392)
+6: [2026-11-22 23:26:57.627] [INFO] [moq-relay] [asio_quic_transport.cc:1192] Hot-swapped QUIC congestion controller: BBRv1 -> BBRv2 (cwnd=35010B, bwe_kbps=340696)
+6: [2026-11-22 23:26:57.627] [INFO] [rtc-net] [asio_quic_transport.cc:1192] Hot-swapped QUIC congestion controller: CUBIC -> NewReno (cwnd=9252B, bwe_kbps=74016)
+6: [2026-11-22 23:26:57.652] [INFO] [rtc-cb] [cpp17_moq_multipull_full_demo.cc:45] [CamRear-H264] VENC layer=HIGH active=1 target_kbps=5110 fps=30
+6: [2026-11-22 23:26:57.694] [INFO] [tid:80035] [cpp17_moq_multipull_full_demo.cc:454] [NVR-Console] Swapping main/PIP layout & requesting IDR: cam_front_h265 -> LOW, cam_rear_h264 -> HIGH
+6: [2026-11-22 23:26:57.694] [INFO] [rtc-work] [moq_transport.cc:730] MoQ requested layer switch on track=cam_front_h265 -> video/low
+6: [2026-11-22 23:26:57.694] [INFO] [rtc-work] [moq_transport.cc:730] MoQ requested layer switch on track=cam_rear_h264 -> video/high
+6: [2026-11-22 23:26:57.702] [INFO] [rtc-cb] [cpp17_moq_multipull_full_demo.cc:45] [CamRear-H264] VENC layer=HIGH active=1 target_kbps=5137 fps=30
+6: [2026-11-22 23:26:57.717] [INFO] [moq-relay] [embedded_moq_relay.cc:416] MoQ Relay completed GOP-aligned Simulcast switch for subscriber=nvr_console -> LOW
+6: [2026-11-22 23:26:57.717] [INFO] [moq-relay] [embedded_moq_relay.cc:416] MoQ Relay completed GOP-aligned Simulcast switch for subscriber=nvr_console -> HIGH
+6: [2026-11-22 23:26:57.803] [INFO] [rtc-cb] [cpp17_moq_multipull_full_demo.cc:45] [CamFront-H265] VENC layer=HIGH active=1 target_kbps=5213 fps=30
+6: [2026-11-22 23:26:57.852] [INFO] [rtc-net] [asio_quic_transport.cc:1192] Hot-swapped QUIC congestion controller: Copa -> CustomDroneCC (cwnd=45126B, bwe_kbps=180504)
+6: [2026-11-22 23:26:57.852] [INFO] [rtc-net] [asio_quic_transport.cc:1192] Hot-swapped QUIC congestion controller: NewReno -> BBRv1 (cwnd=6771B, bwe_kbps=54168)
+6: [2026-11-22 23:26:57.854] [INFO] [rtc-cb] [cpp17_moq_multipull_full_demo.cc:45] [CamRear-H264] VENC layer=HIGH active=1 target_kbps=5211 fps=30
+6: [2026-11-22 23:26:57.854] [INFO] [rtc-cb] [cpp17_moq_multipull_full_demo.cc:45] [CamFront-H265] VENC layer=HIGH active=1 target_kbps=5248 fps=30
+6: [2026-11-22 23:26:58.106] [INFO] [rtc-cb] [cpp17_moq_multipull_full_demo.cc:45] [CamFront-H265] VENC layer=HIGH active=1 target_kbps=5254 fps=30
+6: [2026-11-22 23:26:58.106] [INFO] [rtc-cb] [cpp17_moq_multipull_full_demo.cc:45] [CamRear-H264] VENC layer=HIGH active=1 target_kbps=5307 fps=30
+6: [2026-11-22 23:26:58.121] [INFO] [tid:80035] [rtc_video_engine_impl.cc:100] Leaving session
+6: [2026-11-22 23:26:58.121] [INFO] [rtc-cb] [cpp17_moq_multipull_full_demo.cc:135] [NVR-Console] Remote camera offline: track=cam_front_h265
+6: [2026-11-22 23:26:58.121] [INFO] [tid:80035] [cpp17_moq_multipull_full_demo.cc:485] === C++17 MoQ Multi-Pull Full Demo Summary: front=28 (layer=LOW), rear=29 (layer=HIGH), stats_cbs=1, ring_snapshot=52 ===
+6: [2026-11-22 23:26:58.121] [INFO] [tid:80035] [rtc_video_engine_impl.cc:100] Leaving session
+6: [2026-11-22 23:26:58.121] [INFO] [tid:80035] [rtc_video_engine_impl.cc:100] Leaving session
+6: [2026-11-22 23:26:58.122] [INFO] [tid:80035] [embedded_moq_relay.cc:49] EmbeddedMoqRelayServer stopped
+6: [2026-11-22 23:26:58.122] [INFO] [tid:80035] [rtc_video_engine_impl.cc:78] RtcVideoEngine destroyed cleanly
+6: [2026-11-22 23:26:58.123] [INFO] [tid:80035] [rtc_video_engine_impl.cc:78] RtcVideoEngine destroyed cleanly
+6: [2026-11-22 23:26:58.123] [INFO] [tid:80035] [rtc_video_engine_impl.cc:78] RtcVideoEngine destroyed cleanly
+6/7 Test #6: SdkExampleCpp17MoqMultiPullFull ...   Passed    0.68 sec
+test 7
+    Start 7: SdkExampleBrowserHttpP2p
+
+7: Test command: /home/leo/RTCSDK/build/rtc_example_browser_p2p "--self-test"
+7: Test timeout computed to be: 10000000
+7: [2026-11-22 23:26:58.127] [INFO] [tid:80052] [rtc_video_engine_impl.cc:53] RtcVideoEngine created (mode=WebRTC_P2P, codec=H264, simulcast=off)
+7: [2026-11-22 23:26:58.130] [INFO] [tid:80052] [dtls_srtp_transport.cc:23] libsrtp2 initialized (status=0)
+7: [2026-11-22 23:26:58.131] [INFO] [tid:80052] [dtls_srtp_transport.cc:96] Generated ephemeral ECDSA P-256 DTLS certificate (sha-256=68:67:6D:EB:5B:7C:67:18...)
+7: [2026-11-22 23:26:58.132] [INFO] [rtc-net] [stun_turn_ice.cc:631] ICE socket bound on UDP port=56096 gathered_host_candidates=2
+7: [2026-11-22 23:26:58.133] [INFO] [http-gw] [rtc_video_engine_impl.cc:53] RtcVideoEngine created (mode=WebRTC_P2P, codec=H264, simulcast=off)
+7: [2026-11-22 23:26:58.134] [INFO] [http-gw] [dtls_srtp_transport.cc:96] Generated ephemeral ECDSA P-256 DTLS certificate (sha-256=3C:0D:A4:D5:25:D5:12:DB...)
+7: [2026-11-22 23:26:58.134] [INFO] [rtc-net] [stun_turn_ice.cc:631] ICE socket bound on UDP port=60740 gathered_host_candidates=2
+7: [2026-11-22 23:26:58.134] [INFO] [rtc-cb] [browser_webrtc_p2p_gateway_demo.cc:134] [BrowserGateway] Target bitrate=1449 kbps
+7: [2026-11-22 23:26:58.134] [INFO] [rtc-net] [stun_turn_ice.cc:1098] ICE state transition: kNew -> kChecking
+7: [2026-11-22 23:26:58.134] [INFO] [rtc-net] [stun_turn_ice.cc:1098] ICE state transition: kNew -> kConnected
+7: [2026-11-22 23:26:58.134] [INFO] [rtc-net] [stun_turn_ice.cc:1043] ICE candidate pair nominated: 127.0.0.1:60740 <-> 127.0.0.1:56096 (rtt_ms=24)
+7: [2026-11-22 23:26:58.134] [INFO] [rtc-net] [stun_turn_ice.cc:1098] ICE state transition: kChecking -> kConnected
+7: [2026-11-22 23:26:58.134] [INFO] [rtc-net] [dtls_srtp_transport.cc:367] Starting DTLS 1.2 handshake (role=kClient)
+7: [2026-11-22 23:26:58.135] [INFO] [rtc-net] [dtls_srtp_transport.cc:367] Starting DTLS 1.2 handshake (role=kServer)
+7: [2026-11-22 23:26:58.135] [INFO] [rtc-net] [stun_turn_ice.cc:1043] ICE candidate pair nominated: 127.0.0.1:56096 <-> 127.0.0.1:60740 (rtt_ms=24)
+7: [2026-11-22 23:26:59.136] [INFO] [rtc-net] [dtls_srtp_transport.cc:498] Negotiated DTLS-SRTP profile=SRTP_AEAD_AES_128_GCM
+7: [2026-11-22 23:26:59.136] [INFO] [rtc-net] [dtls_srtp_transport.cc:420] DTLS-SRTP handshake verified and SRTP keys installed
+7: [2026-11-22 23:26:59.136] [INFO] [rtc-net] [dtls_srtp_transport.cc:498] Negotiated DTLS-SRTP profile=SRTP_AEAD_AES_128_GCM
+7: [2026-11-22 23:26:59.136] [INFO] [rtc-net] [dtls_srtp_transport.cc:420] DTLS-SRTP handshake verified and SRTP keys installed
+7: [2026-11-22 23:26:59.151] [INFO] [rtc-cb] [browser_webrtc_p2p_gateway_demo.cc:134] [BrowserGateway] Target bitrate=3791 kbps
+7: [2026-11-22 23:26:59.176] [INFO] [rtc-cb] [browser_webrtc_p2p_gateway_demo.cc:134] [BrowserGateway] Target bitrate=5797 kbps
+7: [2026-11-22 23:26:59.465] [INFO] [tid:80052] [browser_webrtc_p2p_gateway_demo.cc:416] === Browser HTTP P2P Self-Test Summary: http_port=45639 h264_frames_received=10 ===
+7: [2026-11-22 23:26:59.465] [INFO] [tid:80052] [rtc_video_engine_impl.cc:100] Leaving session
+7: [2026-11-22 23:26:59.466] [INFO] [tid:80052] [rtc_video_engine_impl.cc:78] RtcVideoEngine destroyed cleanly
+7: [2026-11-22 23:26:59.498] [INFO] [tid:80052] [rtc_video_engine_impl.cc:100] Leaving session
+7: [2026-11-22 23:26:59.499] [INFO] [tid:80052] [rtc_video_engine_impl.cc:78] RtcVideoEngine destroyed cleanly
+7/7 Test #7: SdkExampleBrowserHttpP2p ..........   Passed    1.38 sec
+
+The following tests passed:
+	RtcCoreUnitTests
+	RtcE2EIntegrationTests
+	SdkExampleC99WebRtcP2pFull
+	SdkExampleC99MoqMultiPullFull
+	SdkExampleCpp17WebRtcP2pFull
+	SdkExampleCpp17MoqMultiPullFull
+	SdkExampleBrowserHttpP2p
+
+100% tests passed, 0 tests failed out of 7
+
+Total Test time (real) =  11.55 sec
