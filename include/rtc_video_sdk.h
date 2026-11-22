@@ -81,6 +81,25 @@ typedef enum {
   RTC_QUIC_CC_NEWRENO = 4,  // 基于 RFC 9002 第 7 节的 NewReno AIMD 拥塞控制算法
 } rtc_quic_cc_algo_e;
 
+// 通用数据通道生命周期状态（兼容 W3C RTCDataChannelState 与 IETF MoQ 数据轨道）。
+typedef enum {
+  RTC_DATA_CHANNEL_CONNECTING = 0,
+  RTC_DATA_CHANNEL_OPEN = 1,
+  RTC_DATA_CHANNEL_CLOSING = 2,
+  RTC_DATA_CHANNEL_CLOSED = 3,
+} rtc_data_channel_state_e;
+
+// 通用数据通道创建参数（兼容 RFC 8831/8832 WebRTC DataChannel 与 MoQ 数据轨道）。
+typedef struct {
+  const char* label;               // 数据通道名称/主题（如 "telemetry"、"ptz_ctrl"）
+  const char* protocol;            // 可选子协议标识（如 "json"、"protobuf"），NULL 表示空串
+  bool ordered;                    // 是否保证按序交付（true = 有序，false = 无序低延迟）
+  int32_t max_retransmits;         // 最大重传次数（-1 = 完全可靠；>=0 = 部分可靠限次重传）
+  int32_t max_packet_lifetime_ms;  // 报文最大生存时间毫秒数（-1 = 不限时；>0 = 超时自动丢弃跳过）
+  bool negotiated;                 // 是否为双端预协商固定流 ID（false = 自动带内信令协商）
+  int32_t id;                      // 当 negotiated=true 时指定的通道流 ID（>=0）
+} rtc_data_channel_init_t;
+
 typedef struct {
   const uint8_t* data;      // Annex-B NALU 码流数据指针（00 00 00 01 ...）
   size_t size;              // 码流字节长度
@@ -137,6 +156,21 @@ typedef struct {
                                  const char* sdp_mid,
                                  int sdp_mline_index,
                                  const char* candidate_sdp);
+
+  // 数据通道状态变更回调（对端打开/关闭通道或本端通道就绪时触发）。
+  void (*on_data_channel_state)(void* user_data,
+                                const char* peer_id,
+                                int channel_id,
+                                const char* label,
+                                rtc_data_channel_state_e state);
+
+  // 数据通道消息接收回调（同时支持 UTF-8 文本与二进制帧负载）。
+  void (*on_data_channel_message)(void* user_data,
+                                  const char* peer_id,
+                                  int channel_id,
+                                  bool is_binary,
+                                  const uint8_t* data,
+                                  size_t size);
 } rtc_callbacks_t;
 
 typedef struct {
@@ -164,6 +198,7 @@ typedef struct {
   uint32_t low_layer_max_bps;
   uint32_t moq_delivery_timeout_ms;
   rtc_quic_cc_algo_e quic_cc_algo;  // 初始 QUIC 拥塞控制算法模块（0 = BBRv1）
+  bool disable_datachannel;  // 默认为 false（默认开启 WebRTC DataChannel 与 MoQ 数据通道）
 } rtc_config_t;
 
 // 全局统一日志 C 接口
@@ -226,6 +261,24 @@ RTC_SDK_API int rtc_client_set_remote_description(rtc_client_t* client,
 
 RTC_SDK_API int rtc_client_add_remote_ice_candidate(rtc_client_t* client,
                                                     const char* candidate_sdp);
+
+// 双模通用数据通道接口（WebRTC P2P 模式下映射为标准 SCTP over DTLS DataChannel，
+// IETF MoQ 模式下映射为 QUIC v1 高优/可控生存期 MoQ 数据轨道）。
+RTC_SDK_API void rtc_data_channel_init_default(rtc_data_channel_init_t* init,
+                                               const char* label);
+
+RTC_SDK_API int rtc_client_create_data_channel(
+    rtc_client_t* client,
+    const rtc_data_channel_init_t* init);
+
+RTC_SDK_API int rtc_client_send_data(rtc_client_t* client,
+                                     int channel_id,
+                                     const uint8_t* data,
+                                     size_t size,
+                                     bool is_binary);
+
+RTC_SDK_API int rtc_client_close_data_channel(rtc_client_t* client,
+                                              int channel_id);
 
 #ifdef __cplusplus
 }

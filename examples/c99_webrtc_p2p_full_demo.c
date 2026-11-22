@@ -43,6 +43,7 @@ typedef struct {
   size_t bytes_pulled;
   uint32_t stats_cbs;
   uint32_t local_candidates_cbs;
+  uint32_t dc_messages_rx;
   rtc_client_t* trickle_target;
 } c99_p2p_peer_t;
 
@@ -175,6 +176,35 @@ static void cb_ice_candidate(void* ud,
   }
 }
 
+static void cb_dc_state(void* ud,
+                        const char* peer_id,
+                        int channel_id,
+                        const char* label,
+                        rtc_data_channel_state_e state) {
+  c99_p2p_peer_t* p = (c99_p2p_peer_t*)ud;
+  if (state == RTC_DATA_CHANNEL_OPEN) {
+    printf("[%s] C99 P2P DataChannel OPEN: peer=%s id=%d label=%s\n", p->label,
+           peer_id, channel_id, label);
+  }
+}
+
+static void cb_dc_msg(void* ud,
+                      const char* peer_id,
+                      int channel_id,
+                      bool is_binary,
+                      const uint8_t* data,
+                      size_t size) {
+  (void)peer_id;
+  (void)channel_id;
+  (void)is_binary;
+  (void)data;
+  (void)size;
+  c99_p2p_peer_t* p = (c99_p2p_peer_t*)ud;
+  pthread_mutex_lock(&p->lock);
+  p->dc_messages_rx++;
+  pthread_mutex_unlock(&p->lock);
+}
+
 static rtc_callbacks_t make_full_callbacks(void) {
   rtc_callbacks_t cbs;
   memset(&cbs, 0, sizeof(cbs));
@@ -186,6 +216,8 @@ static rtc_callbacks_t make_full_callbacks(void) {
   cbs.on_connection_state = &cb_conn_state;
   cbs.on_network_stats = &cb_stats;
   cbs.on_local_ice_candidate = &cb_ice_candidate;
+  cbs.on_data_channel_state = &cb_dc_state;
+  cbs.on_data_channel_message = &cb_dc_msg;
   return cbs;
 }
 
@@ -303,6 +335,12 @@ static bool run_direct_sdp_bidirectional_p2p(void) {
   rtc_client_join_room(ca, "c99_direct", "cam_a");
   rtc_client_join_room(cb, "c99_direct", "viewer_b");
 
+  rtc_data_channel_init_t dc_init;
+  rtc_data_channel_init_default(&dc_init, "c99_gimbal_ctrl");
+  const int dc_id = rtc_client_create_data_channel(cb, &dc_init);
+  const char* kCmd = "GIMBAL:CENTER";
+  rtc_client_send_data(cb, dc_id, (const uint8_t*)kCmd, strlen(kCmd), false);
+
   char offer_sdp[4096];
   char answer_sdp[4096];
   if (rtc_client_create_offer(cb, offer_sdp, sizeof(offer_sdp)) != RTC_OK ||
@@ -350,6 +388,7 @@ static bool run_direct_sdp_bidirectional_p2p(void) {
   pthread_mutex_lock(&peer_a.lock);
   const uint32_t a_frames = peer_a.frames_pulled;
   const uint32_t a_stats = peer_a.stats_cbs;
+  const uint32_t a_dc_rx = peer_a.dc_messages_rx;
   pthread_mutex_unlock(&peer_a.lock);
 
   pthread_mutex_lock(&peer_b.lock);
@@ -357,8 +396,8 @@ static bool run_direct_sdp_bidirectional_p2p(void) {
   const uint32_t b_bwe = peer_b.bitrate_cbs;
   pthread_mutex_unlock(&peer_b.lock);
 
-  printf("[C99 Part 1 Result] a_pulled=%u, b_pulled=%u, stats_cbs=%u, bwe=%u\n",
-         a_frames, b_frames, a_stats, b_bwe);
+  printf("[C99 Part 1 Result] a_pulled=%u, b_pulled=%u, a_dc_rx=%u, stats_cbs=%u, bwe=%u\n",
+         a_frames, b_frames, a_dc_rx, a_stats, b_bwe);
 
   pthread_mutex_lock(&peer_a.lock);
   peer_a.trickle_target = NULL;
@@ -374,8 +413,8 @@ static bool run_direct_sdp_bidirectional_p2p(void) {
   destroy_peer_ctx(&peer_a);
   destroy_peer_ctx(&peer_b);
 
-  return (a_frames >= 12u) && (b_frames >= 12u) && (a_stats > 0u) &&
-         (b_bwe > 0u);
+  return (a_frames >= 12u) && (b_frames >= 12u) && (a_dc_rx > 0u) &&
+         (a_stats > 0u) && (b_bwe > 0u);
 }
 
 // 第 2 部分：WebSocket（`ws://`）自动信令 1v1 P2P（H.265 + 轨道取消发布）

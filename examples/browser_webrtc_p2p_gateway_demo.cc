@@ -58,19 +58,39 @@ constexpr const char kBrowserHtmlPage[] = R"HTML(<!DOCTYPE html>
   </style>
 </head>
 <body>
-  <h2>Embedded RTCSDK &harr; Browser WebRTC P2P</h2>
+  <h2>Embedded RTCSDK &harr; Browser WebRTC P2P + DataChannel</h2>
   <video id="remoteVideo" autoplay playsinline muted controls></video>
-  <button onclick="startP2P()">Start P2P Video</button>
-  <pre id="logBox">Ready. Click "Start P2P Video" to connect.</pre>
+  <div style="display:flex; gap:0.6rem; margin-bottom:0.8rem;">
+    <button onclick="startP2P()">Start P2P Video + DataChannel</button>
+    <input id="dcInput" value="PTZ:ZOOM_IN" style="padding:0.6rem; border-radius:8px; border:1px solid #475569; background:#0f172a; color:#f8fafc;">
+    <button onclick="sendDcMsg()">Send DataChannel</button>
+  </div>
+  <pre id="logBox">Ready. Click "Start P2P Video + DataChannel" to connect.</pre>
   <script>
+    let activeDc = null;
     const log = (m) => {
       const el = document.getElementById('logBox');
       el.textContent += '\n' + m;
       el.scrollTop = el.scrollHeight;
     };
+    function sendDcMsg() {
+      const txt = document.getElementById('dcInput').value;
+      if (activeDc && activeDc.readyState === 'open') {
+        activeDc.send(txt);
+        log('[DC TX] ' + txt);
+      } else {
+        log('DataChannel not open yet');
+      }
+    }
     async function startP2P() {
       const pc = new RTCPeerConnection();
       pc.addTransceiver('video', { direction: 'recvonly' });
+      activeDc = pc.createDataChannel('browser_ctrl');
+      activeDc.onopen = () => {
+        log('WebRTC DataChannel [browser_ctrl] OPEN!');
+        activeDc.send('HELLO_EMBEDDED_SDK');
+      };
+      activeDc.onmessage = (ev) => log('[DC RX] ' + ev.data);
       pc.ontrack = (ev) => {
         log('Received remote H.264 track from Embedded RTCSDK!');
         document.getElementById('remoteVideo').srcObject = ev.streams[0];
@@ -148,10 +168,28 @@ class GatewayObserver final : public rtc::IRtcEventObserver {
                             const std::string& /*track_id*/,
                             const rtc_encoded_frame_t& /*frame*/) override {}
 
+  void BindEngine(rtc::RtcVideoEngine* eng) {
+    std::lock_guard<std::mutex> lk(mu_);
+    engine_ = eng;
+  }
+
   void OnConnectionState(rtc_connection_state_e state,
                          int /*reason_code*/) override {
     connected_.store(state == RTC_CONN_STATE_CONNECTED,
                      std::memory_order_release);
+  }
+
+  void OnDataChannelMessage(const std::string& /*peer_id*/,
+                            int channel_id,
+                            bool /*is_binary*/,
+                            const uint8_t* data,
+                            size_t size) override {
+    std::string rx(reinterpret_cast<const char*>(data), size);
+    RTC_LOG(kInfo) << "[BrowserGateway] DataChannel RX: " << rx;
+    std::lock_guard<std::mutex> lk(mu_);
+    if (engine_ != nullptr) {
+      engine_->SendTextData(channel_id, "ACK:" + rx);
+    }
   }
 
   bool is_connected() const {
@@ -159,6 +197,8 @@ class GatewayObserver final : public rtc::IRtcEventObserver {
   }
 
  private:
+  std::mutex mu_;
+  rtc::RtcVideoEngine* engine_ = nullptr;
   std::atomic<bool> connected_{false};
 };
 
@@ -212,6 +252,9 @@ class BrowserP2pHttpGateway {
       pump_thread_.join();
     }
     std::lock_guard<std::mutex> lock(session_mu_);
+    if (active_obs_) {
+      active_obs_->BindEngine(nullptr);
+    }
     if (active_engine_) {
       active_engine_->LeaveRoom();
       active_engine_.reset();
@@ -270,6 +313,9 @@ class BrowserP2pHttpGateway {
   bool AcceptBrowserOffer(std::string_view offer_sdp,
                           std::string* out_answer_sdp) {
     std::lock_guard<std::mutex> lock(session_mu_);
+    if (active_obs_) {
+      active_obs_->BindEngine(nullptr);
+    }
     if (active_engine_) {
       active_engine_->LeaveRoom();
       active_engine_.reset();
@@ -283,6 +329,7 @@ class BrowserP2pHttpGateway {
     cfg.zero_playout_delay = true;
 
     active_engine_ = rtc::RtcVideoEngine::Create(cfg, active_obs_.get());
+    active_obs_->BindEngine(active_engine_.get());
     active_engine_->JoinRoom("browser_http_p2p", "embedded_gateway");
     return active_engine_->SetRemoteDescription("offer", offer_sdp,
                                                 out_answer_sdp) == RTC_OK;
@@ -348,29 +395,48 @@ int RunAutomatedBrowserSelfTest() {
       cv_.notify_all();
     }
     void OnConnectionState(rtc_connection_state_e, int) override {}
+    void OnDataChannelMessage(const std::string&,
+                              int,
+                              bool,
+                              const uint8_t* data,
+                              size_t size) override {
+      std::lock_guard<std::mutex> lock(mu_);
+      last_dc_reply_.assign(reinterpret_cast<const char*>(data), size);
+      cv_.notify_all();
+    }
 
-    bool WaitFrames(int target, int timeout_ms) {
+    bool WaitFramesAndDcReply(int target, int timeout_ms) {
       std::unique_lock<std::mutex> lock(mu_);
       return cv_.wait_for(lock, std::chrono::milliseconds(timeout_ms),
                           [this, target]() {
-                            return frames_received_ >= target;
+                            return frames_received_ >= target &&
+                                   last_dc_reply_ == "ACK:PING_FROM_CHROME";
                           });
     }
     int frames_received() const {
       std::lock_guard<std::mutex> lock(mu_);
       return frames_received_;
     }
+    std::string dc_reply() const {
+      std::lock_guard<std::mutex> lock(mu_);
+      return last_dc_reply_;
+    }
 
    private:
     mutable std::mutex mu_;
     std::condition_variable cv_;
     int frames_received_ = 0;
+    std::string last_dc_reply_;
   } browser_obs;
 
   rtc::EngineConfig browser_cfg;
   browser_cfg.transport_mode = RTC_TRANSPORT_MODE_WEBRTC_P2P;
   browser_cfg.publish_codec = RTC_CODEC_H264;
   auto browser_client = rtc::RtcVideoEngine::Create(browser_cfg, &browser_obs);
+  rtc::DataChannelConfig dc_cfg;
+  dc_cfg.label = "browser_ctrl";
+  const int dc_id = browser_client->CreateDataChannel(dc_cfg);
+  browser_client->SendTextData(dc_id, "PING_FROM_CHROME");
   browser_client->JoinRoom("browser_http_p2p", "simulated_chrome");
 
   std::string offer_sdp;
@@ -412,10 +478,11 @@ int RunAutomatedBrowserSelfTest() {
     return 6;
   }
 
-  const bool got_video = browser_obs.WaitFrames(10, 4000);
+  const bool got_video = browser_obs.WaitFramesAndDcReply(10, 4000);
   RTC_LOG(kInfo) << "=== Browser HTTP P2P Self-Test Summary: http_port="
                  << gateway.port()
                  << " h264_frames_received=" << browser_obs.frames_received()
+                 << " dc_reply=" << browser_obs.dc_reply()
                  << " ===";
 
   browser_client->LeaveRoom();

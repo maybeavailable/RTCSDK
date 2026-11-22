@@ -11,7 +11,9 @@
 #include <atomic>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <optional>
+#include <set>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -27,6 +29,7 @@
 #include "modules/video_coding/video_coding_module.h"
 #include "p2p/stun_turn_ice.h"
 #include "pc/dtls_srtp_transport.h"
+#include "pc/sctp_data_channel.h"
 #include "rtc_base/pending_task_safety_flag.h"
 #include "rtc_base/sequence_checker.h"
 #include "rtc_base/task_queue.h"
@@ -36,6 +39,7 @@ namespace rtc {
 
 class WebRtcP2pBackend final : public ISessionBackend,
                                public DtlsSrtpObserver,
+                               public SctpDataChannelObserver,
                                public PacingPacketSender,
                                public RtpPacketSinkInterface {
  public:
@@ -67,6 +71,12 @@ class WebRtcP2pBackend final : public ISessionBackend,
                            std::string* out_answer_sdp) override;
   int AddRemoteIceCandidate(std::string_view candidate_sdp) override;
 
+  int CreateDataChannel(const DataChannelConfig& config) override;
+  int SendData(int channel_id,
+               ArrayView<const uint8_t> payload,
+               bool is_binary) override;
+  int CloseDataChannel(int channel_id) override;
+
   // 用于弱网环境下 P2P UDP 丢包仿真的测试钩子。
   void SetSimulatedRxDropRate(double drop_probability);
 
@@ -77,6 +87,17 @@ class WebRtcP2pBackend final : public ISessionBackend,
                             Timestamp receive_time) override;
   void OnDecryptedRtcpPacket(ArrayView<const uint8_t> compound_rtcp,
                              Timestamp receive_time) override;
+  void OnDtlsApplicationData(ArrayView<const uint8_t> payload,
+                             Timestamp receive_time) override;
+
+  // SctpDataChannelObserver 接口重写（在 `worker` 队列上回调执行）：
+  bool SendSctpPacketOverDtls(ArrayView<const uint8_t> packet) override;
+  void OnSctpDataChannelState(int channel_id,
+                              const std::string& label,
+                              rtc_data_channel_state_e state) override;
+  void OnSctpDataChannelMessage(int channel_id,
+                                bool is_binary,
+                                std::vector<uint8_t> payload) override;
 
   // PacingPacketSender 接口重写（在 `pacer` 队列上回调执行）：
   void SendPacedPacket(std::unique_ptr<RtpPacket> packet,
@@ -177,6 +198,12 @@ class WebRtcP2pBackend final : public ISessionBackend,
 
   // 已协商的 SDP 参数（通过 PostTask 从 signaling 队列同步至 worker 队列）。
   std::string negotiated_mid_ = "0";
+  std::string negotiated_data_mid_ = "1";
+  bool negotiated_has_video_ = true;
+  bool negotiated_has_datachannel_ = true;
+  uint16_t local_sctp_port_ = 5000;
+  uint16_t remote_sctp_port_ = 5000;
+  std::vector<SdpMediaKind> negotiated_m_order_;
   VideoCodec negotiated_codec_ = VideoCodec::kH264;
   uint8_t negotiated_video_pt_ = 96;
   uint8_t negotiated_rtx_pt_ = 97;
@@ -185,6 +212,13 @@ class WebRtcP2pBackend final : public ISessionBackend,
   bool negotiated_has_flexfec_ = true;
   RtpHeaderExtensionMap negotiated_ext_map_ =
       RtpHeaderExtensionMap::BrowserDefault();
+
+  DtlsRole worker_dtls_role_ = DtlsRole::kClient;
+  bool worker_has_datachannel_ = false;
+  uint16_t worker_remote_sctp_port_ = 5000;
+  SctpDataChannelManager sctp_dc_;
+  mutable std::mutex dc_handles_mu_;
+  std::set<int> valid_dc_ids_;
 
   GoogCcNetworkController goog_cc_;
   TransportFeedbackAdapter twcc_adapter_;

@@ -97,6 +97,8 @@ class DtlsSrtpObserver {
                                     Timestamp receive_time) = 0;
   virtual void OnDecryptedRtcpPacket(ArrayView<const uint8_t> compound_rtcp,
                                      Timestamp receive_time) = 0;
+  virtual void OnDtlsApplicationData(ArrayView<const uint8_t> payload,
+                                     Timestamp receive_time) {}
 };
 
 class DtlsSrtpTransport final : public IceTransportObserver {
@@ -116,10 +118,12 @@ class DtlsSrtpTransport final : public IceTransportObserver {
   void SetRtpHeaderExtensionMap(const RtpHeaderExtensionMap& ext_map);
   void StartHandshakeIfReady();
 
+  bool IsDtlsConnected() const { return handshake_complete_; }
   bool IsSrtpReady() const { return srtp_.IsActive(); }
 
   bool SendRtpPacket(const RtpPacket& packet);
   bool SendRtcpPacket(ArrayView<const uint8_t> compound_rtcp);
+  bool SendDtlsApplicationData(ArrayView<const uint8_t> payload);
 
   void OnLocalCandidateGathered(const IceCandidate& candidate) override;
   void OnIceTransportStateChanged(IceTransportState state) override;
@@ -215,6 +219,17 @@ struct VideoMediaTrackDesc {
   RtpHeaderExtensionMap ext_map = RtpHeaderExtensionMap::BrowserDefault();
 };
 
+enum class SdpMediaKind {
+  kVideo = 0,
+  kApplication = 1,
+};
+
+struct DataChannelMediaDesc {
+  std::string mid = "1";
+  uint16_t sctp_port = 5000;
+  uint32_t max_message_size = 262144;
+};
+
 struct PureVideoSdpDescription {
   std::string session_type = "offer";
   IceParameters ice_params;
@@ -222,6 +237,8 @@ struct PureVideoSdpDescription {
   std::string dtls_setup = "actpass";
   std::vector<IceCandidate> candidates;
   std::vector<VideoMediaTrackDesc> video_m_sections;
+  std::optional<DataChannelMediaDesc> data_m_section;
+  std::vector<SdpMediaKind> m_section_order;
 
   std::string Serialize() const;
   static std::optional<PureVideoSdpDescription> Parse(

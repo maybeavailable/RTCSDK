@@ -48,6 +48,7 @@ set(RTC_CORE_SOURCES
   src/modules/video_coding/video_coding_module.cc
   src/p2p/stun_turn_ice.cc
   src/pc/dtls_srtp_transport.cc
+  src/pc/sctp_data_channel.cc
   src/signaling/wss_signaling_client.cc
   src/moq/quic_congestion_control.cc
   src/moq/asio_quic_transport.cc

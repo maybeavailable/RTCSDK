@@ -190,6 +190,24 @@ int RtcVideoEngineImpl::AddRemoteIceCandidate(std::string_view candidate_sdp) {
   return backend_->AddRemoteIceCandidate(candidate_sdp);
 }
 
+int RtcVideoEngineImpl::CreateDataChannel(const DataChannelConfig& config) {
+  return backend_->CreateDataChannel(config);
+}
+
+int RtcVideoEngineImpl::SendData(int channel_id,
+                                 const uint8_t* data,
+                                 size_t size,
+                                 bool is_binary) {
+  if (size > 0 && data == nullptr) {
+    return RTC_ERR_INVALID_ARG;
+  }
+  return backend_->SendData(channel_id, MakeArrayView(data, size), is_binary);
+}
+
+int RtcVideoEngineImpl::CloseDataChannel(int channel_id) {
+  return backend_->CloseDataChannel(channel_id);
+}
+
 // ======================= 隔离队列事件回调分发 =======================
 
 void RtcVideoEngineImpl::OnBackendConnectionState(rtc_connection_state_e state,
@@ -357,6 +375,42 @@ void RtcVideoEngineImpl::OnBackendLocalIceCandidate(
       }));
 }
 
+void RtcVideoEngineImpl::OnBackendDataChannelState(
+    const std::string& peer_id,
+    int channel_id,
+    const std::string& label,
+    rtc_data_channel_state_e state) {
+  if (observer_ == nullptr) {
+    return;
+  }
+  queues_->callback()->PostTask(
+      SafeTask(cb_safety_.flag(),
+               [this, peer_id, channel_id, label, state]() {
+                 RTC_DCHECK_RUN_ON(&cb_checker_);
+                 observer_->OnDataChannelState(peer_id, channel_id, label,
+                                               state);
+               }));
+}
+
+void RtcVideoEngineImpl::OnBackendDataChannelMessage(
+    const std::string& peer_id,
+    int channel_id,
+    bool is_binary,
+    std::vector<uint8_t> payload) {
+  if (observer_ == nullptr) {
+    return;
+  }
+  queues_->callback()->PostTask(SafeTask(
+      cb_safety_.flag(),
+      [this, peer_id, channel_id, is_binary, buf = std::move(payload)]() {
+        RTC_DCHECK_RUN_ON(&cb_checker_);
+        static constexpr uint8_t kEmptyByte = 0;
+        const uint8_t* ptr = buf.empty() ? &kEmptyByte : buf.data();
+        observer_->OnDataChannelMessage(peer_id, channel_id, is_binary, ptr,
+                                        buf.size());
+      }));
+}
+
 }  // namespace rtc
 
 // ======================= 纯 C99 ABI 接口实现 =======================
@@ -426,6 +480,25 @@ struct rtc_client_t {
                                           sdp_mline_index, candidate.c_str());
       }
     }
+    void OnDataChannelState(const std::string& peer_id,
+                            int channel_id,
+                            const std::string& label,
+                            rtc_data_channel_state_e state) override {
+      if (callbacks_.on_data_channel_state != nullptr) {
+        callbacks_.on_data_channel_state(user_data_, peer_id.c_str(),
+                                         channel_id, label.c_str(), state);
+      }
+    }
+    void OnDataChannelMessage(const std::string& peer_id,
+                              int channel_id,
+                              bool is_binary,
+                              const uint8_t* data,
+                              size_t size) override {
+      if (callbacks_.on_data_channel_message != nullptr) {
+        callbacks_.on_data_channel_message(user_data_, peer_id.c_str(),
+                                           channel_id, is_binary, data, size);
+      }
+    }
 
    private:
     rtc_callbacks_t callbacks_{};
@@ -486,6 +559,7 @@ rtc_client_t* rtc_client_create(const rtc_config_t* cfg,
   cpp_cfg.enable_simulcast = cfg->enable_simulcast;
   cpp_cfg.enable_flexfec = cfg->enable_flexfec;
   cpp_cfg.zero_playout_delay = cfg->zero_playout_delay;
+  cpp_cfg.enable_datachannel = !cfg->disable_datachannel;
   if (cfg->min_bitrate_bps > 0) {
     cpp_cfg.min_bitrate_bps = cfg->min_bitrate_bps;
   }
@@ -644,6 +718,61 @@ int rtc_client_add_remote_ice_candidate(rtc_client_t* client,
   }
   return client->engine->AddRemoteIceCandidate(
       candidate_sdp != nullptr ? candidate_sdp : "");
+}
+
+void rtc_data_channel_init_default(rtc_data_channel_init_t* init,
+                                   const char* label) {
+  if (init == nullptr) {
+    return;
+  }
+  std::memset(init, 0, sizeof(*init));
+  init->label = (label != nullptr) ? label : "data";
+  init->protocol = "";
+  init->ordered = true;
+  init->max_retransmits = -1;
+  init->max_packet_lifetime_ms = -1;
+  init->negotiated = false;
+  init->id = -1;
+}
+
+int rtc_client_create_data_channel(rtc_client_t* client,
+                                   const rtc_data_channel_init_t* init) {
+  if (client == nullptr) {
+    return RTC_ERR_INVALID_ARG;
+  }
+  rtc::DataChannelConfig cfg;
+  if (init != nullptr) {
+    if (init->label != nullptr) {
+      cfg.label = init->label;
+    }
+    if (init->protocol != nullptr) {
+      cfg.protocol = init->protocol;
+    }
+    cfg.ordered = init->ordered;
+    cfg.max_retransmits = init->max_retransmits;
+    cfg.max_packet_lifetime_ms = init->max_packet_lifetime_ms;
+    cfg.negotiated = init->negotiated;
+    cfg.id = init->id;
+  }
+  return client->engine->CreateDataChannel(cfg);
+}
+
+int rtc_client_send_data(rtc_client_t* client,
+                         int channel_id,
+                         const uint8_t* data,
+                         size_t size,
+                         bool is_binary) {
+  if (client == nullptr) {
+    return RTC_ERR_INVALID_ARG;
+  }
+  return client->engine->SendData(channel_id, data, size, is_binary);
+}
+
+int rtc_client_close_data_channel(rtc_client_t* client, int channel_id) {
+  if (client == nullptr) {
+    return RTC_ERR_INVALID_ARG;
+  }
+  return client->engine->CloseDataChannel(channel_id);
 }
 
 }  // extern "C"

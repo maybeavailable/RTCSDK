@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <map>
 #include <memory>
+#include <set>
 #include <string>
 #include <utility>
 #include <vector>
@@ -92,6 +93,9 @@ class EmbeddedMoqRelayServer final : public IQuicServerVisitor {
     std::string announced_namespace;
     std::string announced_track_name;
     bool is_announced = false;
+    std::set<std::string> announced_data_tracks;
+    bool has_data_subscription = false;
+    uint64_t data_downstream_alias = kMoqDownstreamDataTrackAlias;
     bool has_low_layer = false;
     bool has_high_layer = false;
     Timestamp first_media_time = Timestamp::MinusInfinity();

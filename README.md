@@ -8,11 +8,13 @@
    - **`RTC_TRANSPORT_MODE_WEBRTC_P2P`（点对点低延迟直连，100% 兼容主流浏览器）**：
      - 完整实现 Full-ICE（Host / STUN `srflx` / TURN `relay` / `prflx` 对等反射学习、Controlling/Controlled 角色自动协商与 487 Role Conflict 自愈）+ Ephemeral ECDSA P-256 `DTLS-SRTP`（`actpass` / `active` / `passive` 双向协商）。
      - **完整兼容 Chrome / Edge / Firefox / Safari `RTCPeerConnection`**：支持多编码器 SDP Offer 动态 Payload Type 选择（自动匹配 H.264 `42e01f;packetization-mode=1`、RTX `apt=`、`flexfec-03`）、动态 `a=extmap:` 扩展头 ID 映射（同时兼容 RFC 8285 One-Byte `0xBEDE` 与 Two-Byte `0x1000` 扩展头）、`.local` mDNS 候选容错以及无 `a=ssrc:`（Unsignaled SSRC / `mid`）浏览器媒体流自动解复用。
+     - **完整支持标准 WebRTC DataChannel（`src/pc/sctp_data_channel.h/.cc`）**：从零自研无外部重依赖的 RFC 4960 / RFC 3309（Castagnoli CRC-32c）SCTP over DTLS（RFC 8261）协议栈，完整支持四次握手、大报文自动分片重组、SACK 选择性确认、HEARTBEAT 保活、RFC 3758 PR-SCTP（`FORWARD-TSN` 限次重传与报文生存期超时跳过）、RFC 6525 `RE-CONFIG` 流关闭、RFC 8832 DCEP 带内通道协商及 RFC 8831 二进制/UTF-8 字符串传输，与浏览器 `RTCPeerConnection.createDataChannel()` / `ondatachannel` 原生互通。
      - 同时支持 **WebSocket 自动信令配对** 与 **无信令服务的直连 SDP/Trickle-ICE API**（`CreateLocalOffer` / `SetRemoteDescription` / `AddRemoteIceCandidate`）。
    - **`RTC_TRANSPORT_MODE_MOQ`（一对多分发与多路并发拉流）**：
      - 基于 `Boost.Asio` UDP 与 OpenSSL 3.0 EVP 原语从零实现的 **RFC 9000 / 9001 / 9002 QUIC v1 传输层**（`AsioQuicClientEngine` / `AsioQuicServer`）。
      - **可热插拔 QUIC 拥塞控制模组（`include/rtc_quic_congestion_control.hpp`）**：内置 **5 种主流 QUIC 拥塞控制算法**——**`BBRv1`**（默认）、**`BBRv2`**（丢包阈值与 `inflight_hi` 头空间感知）、**`CUBIC`**（RFC 9438 + RFC 9406 HyStart++）、**`Copa`**（MIT/Meta `mvfst` 低延迟目标速率控制）与 **`NewReno`**（RFC 9002 标准 AIMD），支持在不断连、不掉帧的前提下**推拉流运行期实时热切换**（自动迁移 `cwnd / BtlBw / min_rtt / ssthresh` 状态），同时支持 C++17 注入外部自定义 `IQuicCongestionControllerFactory` 插件及中继服 `--cc bbr|bbr2|cubic|copa|newreno` 参数。
      - 原生支持 `moq-transport` 控制协议、`LOC` 低开销容器封装、Simulcast 高低双流零转码分发、GOP 边界无花屏动态切流（`SUBSCRIBE_UPDATE`）、`(publisher_priority, send_order)` 抢占式调度以及超时 `RESET_STREAM` 队头阻塞消除。
+     - **原生 IETF MoQ 通用数据传输通道（`MoqDataPackager` + `data/*` 轨道）**：与 WebRTC DataChannel 共享完全一致的 C99/C++17 API（`CreateDataChannel` / `SendData` / `CloseDataChannel`），支持高优先级有序可靠长流（抢占大体积视频 I 帧传输云台/急停指令）、无序/限时生存期独立对象流（拥塞超时自动 `RESET_STREAM`）以及 MoQ Relay 零拷贝一对多广播与反向控制回传。
 
 2. **严格遵循 Google C++ Style Guide 与统一分级日志（`RTC_LOG`）**：
    - 内置 `.clang-format`（`BasedOnStyle: Google`），全仓库零 C++ 异常（`JsonObject` + `<charconv>` `std::from_chars`）、`rtc::ArrayView<const uint8_t>` 零拷贝视图、显式指针输出参数，开启 `-Wall -Wextra -Wshadow -Wnon-virtual-dtor` 零告警构建。

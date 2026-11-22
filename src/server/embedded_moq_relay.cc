@@ -104,16 +104,31 @@ void EmbeddedMoqRelayServer::OnServerSessionDisconnected(uint64_t session_id,
   const std::string room = it->second->room_id;
   const std::string ns = it->second->announced_namespace;
   const bool was_announced = it->second->is_announced;
+  const std::set<std::string> data_tracks = it->second->announced_data_tracks;
   sessions_.erase(it);
 
-  if (was_announced && !ns.empty()) {
-    MoqControlMessage unann;
-    unann.type = MoqControlMessageType::kUnannounce;
-    unann.track_namespace = ns;
-    for (auto& [sid, peer] : sessions_) {
-      (void)sid;
-      if (peer->room_id == room) {
-        SendControlToPeer(peer.get(), unann);
+  if (!ns.empty()) {
+    for (const auto& dtrack : data_tracks) {
+      MoqControlMessage dc_unann;
+      dc_unann.type = MoqControlMessageType::kUnannounce;
+      dc_unann.track_namespace = ns;
+      dc_unann.track_name = dtrack;
+      for (auto& [sid, peer] : sessions_) {
+        (void)sid;
+        if (peer->room_id == room) {
+          SendControlToPeer(peer.get(), dc_unann);
+        }
+      }
+    }
+    if (was_announced) {
+      MoqControlMessage unann;
+      unann.type = MoqControlMessageType::kUnannounce;
+      unann.track_namespace = ns;
+      for (auto& [sid, peer] : sessions_) {
+        (void)sid;
+        if (peer->room_id == room) {
+          SendControlToPeer(peer.get(), unann);
+        }
       }
     }
   }
@@ -232,17 +247,25 @@ void EmbeddedMoqRelayServer::HandleControlBytes(PeerSession* peer,
         srv_setup.track_namespace = msg->track_namespace;
         SendControlToPeer(peer, srv_setup);
 
-        // 向新加入的节点通知同一房间内所有当前活跃的发布流声明。
+        // 向新加入的节点通知同一房间内所有当前活跃的视频流与数据轨道声明。
         for (const auto& [other_id, other] : sessions_) {
-          if (other_id == peer->session_id || other->room_id != peer->room_id ||
-              !other->is_announced) {
+          if (other_id == peer->session_id || other->room_id != peer->room_id) {
             continue;
           }
-          MoqControlMessage ann;
-          ann.type = MoqControlMessageType::kAnnounce;
-          ann.track_namespace = other->announced_namespace;
-          ann.track_name = other->announced_track_name;
-          SendControlToPeer(peer, ann);
+          if (other->is_announced) {
+            MoqControlMessage ann;
+            ann.type = MoqControlMessageType::kAnnounce;
+            ann.track_namespace = other->announced_namespace;
+            ann.track_name = other->announced_track_name;
+            SendControlToPeer(peer, ann);
+          }
+          for (const auto& dtrack : other->announced_data_tracks) {
+            MoqControlMessage dc_ann;
+            dc_ann.type = MoqControlMessageType::kAnnounce;
+            dc_ann.track_namespace = other->announced_namespace;
+            dc_ann.track_name = dtrack;
+            SendControlToPeer(peer, dc_ann);
+          }
         }
         break;
       }
@@ -251,17 +274,24 @@ void EmbeddedMoqRelayServer::HandleControlBytes(PeerSession* peer,
           SplitRoomAndPeer(msg->track_namespace, &peer->room_id,
                            &peer->peer_id);
         }
-        peer->announced_namespace = msg->track_namespace;
-        peer->announced_track_name = msg->track_name;
-        peer->is_announced = true;
+        if (peer->announced_namespace.empty()) {
+          peer->announced_namespace = msg->track_namespace;
+        }
+        if (msg->track_name.rfind("data/", 0) == 0) {
+          peer->announced_data_tracks.insert(msg->track_name);
+        } else {
+          peer->announced_namespace = msg->track_namespace;
+          peer->announced_track_name = msg->track_name;
+          peer->is_announced = true;
+        }
 
         MoqControlMessage ok = *msg;
         ok.type = MoqControlMessageType::kAnnounceOk;
         SendControlToPeer(peer, ok);
 
         RTC_LOG(kInfo) << "MoQ Relay peer=" << peer->peer_id
-                       << " announced namespace=" << peer->announced_namespace
-                       << " (" << peer->announced_track_name << ")";
+                       << " announced namespace=" << msg->track_namespace
+                       << " (" << msg->track_name << ")";
 
         for (auto& [other_id, other] : sessions_) {
           if (other_id == peer->session_id || other->room_id != peer->room_id) {
@@ -272,7 +302,11 @@ void EmbeddedMoqRelayServer::HandleControlBytes(PeerSession* peer,
         break;
       }
       case MoqControlMessageType::kUnannounce: {
-        peer->is_announced = false;
+        if (msg->track_name.rfind("data/", 0) == 0) {
+          peer->announced_data_tracks.erase(msg->track_name);
+        } else {
+          peer->is_announced = false;
+        }
         for (auto& [other_id, other] : sessions_) {
           if (other_id != peer->session_id && other->room_id == peer->room_id) {
             SendControlToPeer(other.get(), *msg);
@@ -281,6 +315,14 @@ void EmbeddedMoqRelayServer::HandleControlBytes(PeerSession* peer,
         break;
       }
       case MoqControlMessageType::kSubscribe: {
+        if (msg->track_name.rfind("data/", 0) == 0) {
+          peer->has_data_subscription = true;
+          peer->data_downstream_alias = msg->track_alias;
+          MoqControlMessage ok = *msg;
+          ok.type = MoqControlMessageType::kSubscribeOk;
+          SendControlToPeer(peer, ok);
+          break;
+        }
         DownstreamSubscription sub;
         sub.subscribe_id = msg->subscribe_id;
         sub.downstream_track_alias = msg->track_alias;
@@ -351,37 +393,60 @@ void EmbeddedMoqRelayServer::HandleUnidirectionalBytes(
     fanout.header = *hdr;
     fanout.header_parsed = true;
 
-    const Timestamp now = clock_->CurrentTime();
-    if (!publisher->first_media_time.IsFinite()) {
-      publisher->first_media_time = now;
-    }
-    const SpatialLayer stream_layer =
-        (hdr->track_alias == 1) ? SpatialLayer::kLow : SpatialLayer::kHigh;
-    if (stream_layer == SpatialLayer::kLow) {
-      publisher->has_low_layer = true;
-      publisher->last_low_time = now;
-    } else {
-      publisher->has_high_layer = true;
-      publisher->last_high_time = now;
-    }
-    const bool low_alive =
-        publisher->has_low_layer &&
-        (now - publisher->last_low_time) < TimeDelta::Millis(350);
-    // 首帧启动 200ms 宽限期内等待高优先级低清包之后紧随到达的高清层流头，避免首帧误降级。
-    const bool high_startup_grace =
-        !publisher->has_high_layer &&
-        (now - publisher->first_media_time) < TimeDelta::Millis(200);
-    const bool high_alive =
-        high_startup_grace ||
-        (publisher->has_high_layer &&
-         (now - publisher->last_high_time) < TimeDelta::Millis(350));
-
-    auto detach_other_layer_fanout = [&](uint64_t target_sub_sess_id,
-                                         SpatialLayer keep_layer) {
-      for (auto& [in_sid, in_fan] : publisher->inbound_uni_streams) {
-        if (in_sid == stream_id || !in_fan.header_parsed) {
+    if (hdr->track_alias == kMoqUpstreamDataTrackAlias) {
+      // 零拷贝高优扇出房间内 MoQ 数据通道流（完全独立于视频 Simulcast 状态机）。
+      const int64_t data_send_order =
+          (int64_t{1} << 50) - static_cast<int64_t>(hdr->group_id);
+      for (auto& [other_id, sub_peer] : sessions_) {
+        if (other_id == publisher->session_id || !sub_peer->quic ||
+            sub_peer->room_id != publisher->room_id ||
+            !sub_peer->has_data_subscription) {
           continue;
         }
+        const uint64_t down_sid = sub_peer->quic->OpenUnidirectionalStream(
+            hdr->publisher_priority, data_send_order);
+        MoqSubgroupHeader down_hdr = *hdr;
+        down_hdr.track_alias = sub_peer->data_downstream_alias;
+        const auto down_hdr_bytes = down_hdr.Encode();
+        sub_peer->quic->WriteStream(down_sid, down_hdr_bytes, false);
+        fanout.downstream_targets.emplace_back(other_id, down_sid);
+      }
+      payload_to_forward = ArrayView<const uint8_t>(
+          fanout.header_buf.data() + hdr_consumed,
+          fanout.header_buf.size() - hdr_consumed);
+    } else {
+      const Timestamp now = clock_->CurrentTime();
+      if (!publisher->first_media_time.IsFinite()) {
+        publisher->first_media_time = now;
+      }
+      const SpatialLayer stream_layer =
+          (hdr->track_alias == 1) ? SpatialLayer::kLow : SpatialLayer::kHigh;
+      if (stream_layer == SpatialLayer::kLow) {
+        publisher->has_low_layer = true;
+        publisher->last_low_time = now;
+      } else {
+        publisher->has_high_layer = true;
+        publisher->last_high_time = now;
+      }
+      const bool low_alive =
+          publisher->has_low_layer &&
+          (now - publisher->last_low_time) < TimeDelta::Millis(350);
+      // 首帧启动 200ms 宽限期内等待高优先级低清包之后紧随到达的高清层流头，避免首帧误降级。
+      const bool high_startup_grace =
+          !publisher->has_high_layer &&
+          (now - publisher->first_media_time) < TimeDelta::Millis(200);
+      const bool high_alive =
+          high_startup_grace ||
+          (publisher->has_high_layer &&
+           (now - publisher->last_high_time) < TimeDelta::Millis(350));
+
+      auto detach_other_layer_fanout = [&](uint64_t target_sub_sess_id,
+                                           SpatialLayer keep_layer) {
+        for (auto& [in_sid, in_fan] : publisher->inbound_uni_streams) {
+          if (in_sid == stream_id || !in_fan.header_parsed ||
+              in_fan.header.track_alias == kMoqUpstreamDataTrackAlias) {
+            continue;
+          }
         const SpatialLayer in_layer =
             (in_fan.header.track_alias == 1) ? SpatialLayer::kLow
                                              : SpatialLayer::kHigh;
@@ -465,9 +530,10 @@ void EmbeddedMoqRelayServer::HandleUnidirectionalBytes(
       }
     }
 
-    payload_to_forward = ArrayView<const uint8_t>(
-        fanout.header_buf.data() + hdr_consumed,
-        fanout.header_buf.size() - hdr_consumed);
+      payload_to_forward = ArrayView<const uint8_t>(
+          fanout.header_buf.data() + hdr_consumed,
+          fanout.header_buf.size() - hdr_consumed);
+    }
   }
 
   if (!payload_to_forward.empty() || fin) {

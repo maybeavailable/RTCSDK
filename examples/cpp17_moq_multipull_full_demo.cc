@@ -162,6 +162,19 @@ class MultiPullConsoleObserver final : public rtc::IRtcEventObserver {
     cv_.notify_all();
   }
 
+  void OnDataChannelMessage(const std::string& peer_id,
+                            int /*channel_id*/,
+                            bool /*is_binary*/,
+                            const uint8_t* data,
+                            size_t size) override {
+    std::lock_guard<std::mutex> lock(mutex_);
+    ++dc_messages_rx_;
+    RTC_LOG(kInfo) << "[NVR-Console] MoQ DataChannel RX from " << peer_id
+                   << ": "
+                   << std::string(reinterpret_cast<const char*>(data), size);
+    cv_.notify_all();
+  }
+
   bool WaitConnected(int timeout_ms = 5000) {
     std::unique_lock<std::mutex> lock(mutex_);
     return cv_.wait_for(lock, std::chrono::milliseconds(timeout_ms),
@@ -208,6 +221,10 @@ class MultiPullConsoleObserver final : public rtc::IRtcEventObserver {
     std::lock_guard<std::mutex> lock(mutex_);
     return stats_cbs_;
   }
+  uint32_t dc_messages_rx() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return dc_messages_rx_;
+  }
 
  private:
   mutable std::mutex mutex_;
@@ -215,6 +232,7 @@ class MultiPullConsoleObserver final : public rtc::IRtcEventObserver {
   bool connected_ = false;
   uint32_t unpublished_count_ = 0;
   uint32_t stats_cbs_ = 0;
+  uint32_t dc_messages_rx_ = 0;
   std::map<std::string, rtc_video_codec_e> published_tracks_;
   std::map<std::string, PullTrackStats> stats_by_track_;
 };
@@ -404,6 +422,12 @@ int main(int argc, char** argv) {
   std::this_thread::sleep_for(std::chrono::milliseconds(40));
 
   uint64_t ts_us = 1'000'000;
+  rtc::DataChannelConfig moq_dc_cfg;
+  moq_dc_cfg.label = "ai_bbox_meta";
+  moq_dc_cfg.ordered = true;
+  const int cam1_dc = cam1_engine->CreateDataChannel(moq_dc_cfg);
+  cam1_engine->SendTextData(cam1_dc, "{\"obj\":\"person\",\"conf\":0.98}");
+
   for (int f = 0; f < 28; ++f) {
     const bool gop_boundary = (f % 8) == 0;
     const uint8_t tid = (f % 2 == 0) ? 0 : 1;
@@ -503,6 +527,7 @@ int main(int argc, char** argv) {
   const bool passed = decoded_ok && unpub_ok &&
                       front_stats.last_layer == RTC_STREAM_LAYER_LOW &&
                       rear_stats.last_layer == RTC_STREAM_LAYER_HIGH &&
+                      console_obs.dc_messages_rx() > 0 &&
                       console_obs.stats_cbs() > 0 && !snapshot.empty();
   return passed ? 0 : 5;
 }

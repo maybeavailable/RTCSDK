@@ -43,6 +43,7 @@ WebRtcP2pBackend::WebRtcP2pBackend(Clock* clock,
       work_checker_(queues->worker()),
       negotiated_codec_(static_cast<VideoCodec>(config.publish_codec)),
       negotiated_has_flexfec_(config.enable_flexfec),
+      sctp_dc_(clock, this),
       goog_cc_(MakeGoogCcConfig(config)),
       sig_safety_(PendingTaskSafetyFlag::CreateDetached()),
       work_safety_(PendingTaskSafetyFlag::CreateDetached()),
@@ -240,15 +241,6 @@ void WebRtcP2pBackend::StopSession() {
       }
     });
   }
-  paced_sender_.reset();
-  if (!queues_->worker()->IsStopped()) {
-    queues_->worker()->Invoke([this]() {
-      RTC_DCHECK_RUN_ON(&work_checker_);
-      work_safety_.flag()->SetNotAlive();
-      demuxer_.RemoveSink(this);
-      inbound_.reset();
-    });
-  }
   if (!queues_->network()->IsStopped()) {
     queues_->network()->Invoke([this]() {
       net_safety_.flag()->SetNotAlive();
@@ -257,6 +249,20 @@ void WebRtcP2pBackend::StopSession() {
       }
     });
   }
+  if (!queues_->worker()->IsStopped()) {
+    queues_->worker()->Invoke([this]() {
+      RTC_DCHECK_RUN_ON(&work_checker_);
+      work_safety_.flag()->SetNotAlive();
+      sctp_dc_.Shutdown();
+      demuxer_.RemoveSink(this);
+      inbound_.reset();
+    });
+  }
+  {
+    std::lock_guard<std::mutex> lock(dc_handles_mu_);
+    valid_dc_ids_.clear();
+  }
+  paced_sender_.reset();
   dtls_srtp_.reset();
   ice_.reset();
   signaling_.reset();
@@ -284,25 +290,42 @@ PureVideoSdpDescription WebRtcP2pBackend::BuildLocalSdpOnSigQueue(
   desc.dtls_setup = dtls_setup;
   desc.candidates = ice_->LocalCandidatesSnapshot();
 
-  VideoMediaTrackDesc m;
-  m.mid = negotiated_mid_;
-  m.stream_id = local_peer_id_;
-  m.track_id = local_peer_id_ + "_video0";
-  m.cname = local_peer_id_;
-  m.codec = negotiated_codec_;
-  m.direction_send = direction_send;
-  m.direction_recv = direction_recv;
-  m.video_pt = negotiated_video_pt_;
-  m.rtx_pt = negotiated_rtx_pt_;
-  m.flexfec_pt = negotiated_flexfec_pt_;
-  m.has_rtx = negotiated_has_rtx_;
-  m.has_flexfec = negotiated_has_flexfec_ && config_.enable_flexfec;
-  m.primary_ssrc = outbound_.media_ssrc;
-  m.primary_rtx_ssrc = m.has_rtx ? outbound_.rtx_ssrc : 0;
-  m.flexfec_ssrc = m.has_flexfec ? outbound_.flexfec_ssrc : 0;
-  m.ext_map = negotiated_ext_map_;
+  if (session_type == "offer" || negotiated_has_video_) {
+    VideoMediaTrackDesc m;
+    m.mid = negotiated_mid_;
+    m.stream_id = local_peer_id_;
+    m.track_id = local_peer_id_ + "_video0";
+    m.cname = local_peer_id_;
+    m.codec = negotiated_codec_;
+    m.direction_send = direction_send;
+    m.direction_recv = direction_recv;
+    m.video_pt = negotiated_video_pt_;
+    m.rtx_pt = negotiated_rtx_pt_;
+    m.flexfec_pt = negotiated_flexfec_pt_;
+    m.has_rtx = negotiated_has_rtx_;
+    m.has_flexfec = negotiated_has_flexfec_ && config_.enable_flexfec;
+    m.primary_ssrc = outbound_.media_ssrc;
+    m.primary_rtx_ssrc = m.has_rtx ? outbound_.rtx_ssrc : 0;
+    m.flexfec_ssrc = m.has_flexfec ? outbound_.flexfec_ssrc : 0;
+    m.ext_map = negotiated_ext_map_;
 
-  desc.video_m_sections.push_back(std::move(m));
+    desc.video_m_sections.push_back(std::move(m));
+  }
+
+  if (config_.enable_datachannel &&
+      (session_type == "offer" || negotiated_has_datachannel_)) {
+    DataChannelMediaDesc dm;
+    dm.mid = negotiated_data_mid_;
+    if (!desc.video_m_sections.empty() && dm.mid == negotiated_mid_) {
+      dm.mid = (negotiated_mid_ == "1") ? "data" : "1";
+    }
+    dm.sctp_port = local_sctp_port_;
+    dm.max_message_size = 262144;
+    desc.data_m_section = dm;
+  }
+  if (session_type == "answer" && !negotiated_m_order_.empty()) {
+    desc.m_section_order = negotiated_m_order_;
+  }
   return desc;
 }
 
@@ -311,25 +334,58 @@ bool WebRtcP2pBackend::ApplyRemoteSdpOnSigQueue(
     bool remote_is_offer,
     std::string* out_answer_sdp) {
   RTC_DCHECK_RUN_ON(&sig_checker_);
-  if (remote_desc.video_m_sections.empty() ||
+  if ((remote_desc.video_m_sections.empty() &&
+       !remote_desc.data_m_section.has_value()) ||
       remote_desc.dtls_fingerprint_sha256.empty()) {
-    RTC_LOG(kError) << "Rejected remote SDP missing video m= or fingerprint";
+    RTC_LOG(kError)
+        << "Rejected remote SDP missing media/datachannel m= or fingerprint";
     return false;
   }
 
-  const auto& rm = remote_desc.video_m_sections.front();
-  negotiated_mid_ = rm.mid.empty() ? "0" : rm.mid;
-  negotiated_codec_ = rm.codec;
-  negotiated_video_pt_ = rm.video_pt;
-  negotiated_has_rtx_ = rm.has_rtx;
-  if (rm.has_rtx) {
-    negotiated_rtx_pt_ = rm.rtx_pt;
+  negotiated_has_video_ = !remote_desc.video_m_sections.empty();
+  negotiated_has_datachannel_ =
+      config_.enable_datachannel && remote_desc.data_m_section.has_value();
+  negotiated_m_order_ = remote_desc.m_section_order;
+  if (negotiated_has_datachannel_) {
+    negotiated_data_mid_ = remote_desc.data_m_section->mid.empty()
+                               ? "1"
+                               : remote_desc.data_m_section->mid;
+    remote_sctp_port_ = remote_desc.data_m_section->sctp_port;
   }
-  negotiated_has_flexfec_ = rm.has_flexfec && config_.enable_flexfec;
-  if (negotiated_has_flexfec_) {
-    negotiated_flexfec_pt_ = rm.flexfec_pt;
+
+  bool remote_sends = false;
+  bool remote_recvs = false;
+  std::string r_peer = remote_peer_id_;
+  std::string r_track = remote_peer_id_ + "_video0";
+  uint32_t r_media_ssrc = 0;
+  uint32_t r_rtx_ssrc = 0;
+  if (negotiated_has_video_) {
+    const auto& rm = remote_desc.video_m_sections.front();
+    negotiated_mid_ = rm.mid.empty() ? "0" : rm.mid;
+    negotiated_codec_ = rm.codec;
+    negotiated_video_pt_ = rm.video_pt;
+    negotiated_has_rtx_ = rm.has_rtx;
+    if (rm.has_rtx) {
+      negotiated_rtx_pt_ = rm.rtx_pt;
+    }
+    negotiated_has_flexfec_ = rm.has_flexfec && config_.enable_flexfec;
+    if (negotiated_has_flexfec_) {
+      negotiated_flexfec_pt_ = rm.flexfec_pt;
+    }
+    negotiated_ext_map_ = rm.ext_map;
+    remote_sends = rm.direction_send;
+    remote_recvs = rm.direction_recv;
+    if (!rm.stream_id.empty()) {
+      r_peer = rm.stream_id;
+    }
+    if (!rm.track_id.empty()) {
+      r_track = rm.track_id;
+    } else {
+      r_track = r_peer + "_video0";
+    }
+    r_media_ssrc = rm.primary_ssrc;
+    r_rtx_ssrc = rm.primary_rtx_ssrc;
   }
-  negotiated_ext_map_ = rm.ext_map;
 
   ice_->SetIceControlling(!remote_is_offer);
   ice_->SetRemoteIceParameters(remote_desc.ice_params);
@@ -357,63 +413,71 @@ bool WebRtcP2pBackend::ApplyRemoteSdpOnSigQueue(
   dtls_srtp_->SetDtlsRoleAndRemoteFingerprint(
       local_dtls_role, remote_desc.dtls_fingerprint_sha256);
 
-  const std::string r_peer =
-      rm.stream_id.empty() ? remote_peer_id_ : rm.stream_id;
-  const std::string r_track =
-      rm.track_id.empty() ? (r_peer + "_video0") : rm.track_id;
-  const uint32_t r_media_ssrc = rm.primary_ssrc;
-  const uint32_t r_rtx_ssrc = rm.primary_rtx_ssrc;
   const VideoCodec r_codec = negotiated_codec_;
   const std::string mid_copy = negotiated_mid_;
   const uint8_t f_pt = negotiated_flexfec_pt_;
   const bool has_fec = negotiated_has_flexfec_;
-  const bool remote_sends = rm.direction_send;
+  const bool has_vid = negotiated_has_video_;
+  const bool has_dc = negotiated_has_datachannel_;
+  const uint16_t r_sctp_port = remote_sctp_port_;
 
   queues_->worker()->PostTask(SafeTask(
       work_safety_.flag(),
       [this, r_peer, r_track, r_media_ssrc, r_rtx_ssrc, r_codec, mid_copy, f_pt,
-       has_fec, remote_sends]() {
+       has_fec, has_vid, remote_sends, has_dc, local_dtls_role,
+       r_sctp_port]() {
         RTC_DCHECK_RUN_ON(&work_checker_);
-        if (has_fec) {
-          outbound_.flexfec = std::make_unique<FlexfecSender>(
-              f_pt, outbound_.flexfec_ssrc, outbound_.media_ssrc, mid_copy);
-        } else {
-          outbound_.flexfec.reset();
+        worker_dtls_role_ = local_dtls_role;
+        worker_has_datachannel_ = has_dc;
+        worker_remote_sctp_port_ = r_sctp_port;
+        if (has_dc && media_ready_.load(std::memory_order_acquire)) {
+          sctp_dc_.ConfigureAndStart(worker_dtls_role_, local_sctp_port_,
+                                     worker_remote_sctp_port_);
         }
 
-        inbound_ = std::make_unique<InboundStreamState>(
-            r_codec, clock_->CurrentTime(), config_.zero_playout_delay);
-        inbound_->remote_peer_id = r_peer;
-        inbound_->remote_track_id = r_track;
-        inbound_->media_ssrc = r_media_ssrc;
-        inbound_->rtx_ssrc = r_rtx_ssrc;
-        if (r_media_ssrc != 0) {
-          inbound_->flexfec_rx =
-              std::make_unique<FlexfecReceiver>(0, r_media_ssrc);
-        }
+        if (has_vid) {
+          if (has_fec) {
+            outbound_.flexfec = std::make_unique<FlexfecSender>(
+                f_pt, outbound_.flexfec_ssrc, outbound_.media_ssrc, mid_copy);
+          } else {
+            outbound_.flexfec.reset();
+          }
 
-        demuxer_.RemoveSink(this);
-        RtpDemuxCriteria crit;
-        crit.mid = mid_copy;
-        if (r_media_ssrc != 0) {
-          crit.ssrcs.push_back(r_media_ssrc);
-        }
-        if (r_rtx_ssrc != 0) {
-          crit.ssrcs.push_back(r_rtx_ssrc);
-        }
-        demuxer_.AddSink(crit, this);
-        demuxer_.SetDefaultSink(this);
+          inbound_ = std::make_unique<InboundStreamState>(
+              r_codec, clock_->CurrentTime(), config_.zero_playout_delay);
+          inbound_->remote_peer_id = r_peer;
+          inbound_->remote_track_id = r_track;
+          inbound_->media_ssrc = r_media_ssrc;
+          inbound_->rtx_ssrc = r_rtx_ssrc;
+          if (r_media_ssrc != 0) {
+            inbound_->flexfec_rx =
+                std::make_unique<FlexfecReceiver>(0, r_media_ssrc);
+          }
 
-        if (remote_sends && !inbound_->track_announced && observer_ != nullptr) {
-          inbound_->track_announced = true;
-          observer_->OnBackendRemoteTrackPublished(r_peer, r_track, r_codec);
+          demuxer_.RemoveSink(this);
+          RtpDemuxCriteria crit;
+          crit.mid = mid_copy;
+          if (r_media_ssrc != 0) {
+            crit.ssrcs.push_back(r_media_ssrc);
+          }
+          if (r_rtx_ssrc != 0) {
+            crit.ssrcs.push_back(r_rtx_ssrc);
+          }
+          demuxer_.AddSink(crit, this);
+          demuxer_.SetDefaultSink(this);
+
+          if (remote_sends && !inbound_->track_announced &&
+              observer_ != nullptr) {
+            inbound_->track_announced = true;
+            observer_->OnBackendRemoteTrackPublished(r_peer, r_track, r_codec);
+          }
         }
       }));
 
   if (remote_is_offer) {
     // RFC 3264 第 6.1 节 SDP Answer 媒体传输方向匹配：
-    const bool answer_send = rm.direction_recv;
-    const bool answer_recv = rm.direction_send;
+    const bool answer_send = remote_recvs;
+    const bool answer_recv = remote_sends;
     const auto answer = BuildLocalSdpOnSigQueue("answer", answer_dtls_setup,
                                                 answer_send, answer_recv);
     if (out_answer_sdp != nullptr) {
@@ -607,10 +671,77 @@ void WebRtcP2pBackend::OnDtlsSrtpHandshakeComplete() {
     // 在 DTLS-SRTP 握手完成且媒体通道就绪后再触发初始带宽探测簇（3x / 6x），避免探测包在就绪前被丢弃。
     ApplyNetworkControlUpdate(
         goog_cc_.OnNetworkAvailability(clock_->CurrentTime(), true));
+    if (worker_has_datachannel_) {
+      sctp_dc_.ConfigureAndStart(worker_dtls_role_, local_sctp_port_,
+                                 worker_remote_sctp_port_);
+    }
   }));
   if (observer_ != nullptr) {
     observer_->OnBackendConnectionState(RTC_CONN_STATE_CONNECTED, 0);
     observer_->OnBackendForceKeyFrame(SpatialLayer::kHigh);
+  }
+}
+
+void WebRtcP2pBackend::OnDtlsApplicationData(ArrayView<const uint8_t> payload,
+                                             Timestamp receive_time) {
+  if (!config_.enable_datachannel || payload.empty()) {
+    return;
+  }
+  std::vector<uint8_t> pkt(payload.begin(), payload.end());
+  queues_->worker()->PostTask(SafeTask(
+      work_safety_.flag(),
+      [this, p = std::move(pkt), receive_time]() {
+        RTC_DCHECK_RUN_ON(&work_checker_);
+        if (worker_has_datachannel_) {
+          sctp_dc_.ConfigureAndStart(worker_dtls_role_, local_sctp_port_,
+                                     worker_remote_sctp_port_);
+        }
+        sctp_dc_.OnInboundSctpPacket(p, receive_time);
+      }));
+}
+
+bool WebRtcP2pBackend::SendSctpPacketOverDtls(ArrayView<const uint8_t> packet) {
+  if (packet.empty() || !dtls_srtp_) {
+    return false;
+  }
+  std::vector<uint8_t> wire(packet.begin(), packet.end());
+  queues_->network()->PostTask(
+      SafeTask(net_safety_.flag(), [this, w = std::move(wire)]() {
+        if (dtls_srtp_) {
+          dtls_srtp_->SendDtlsApplicationData(w);
+        }
+      }));
+  return true;
+}
+
+void WebRtcP2pBackend::OnSctpDataChannelState(int channel_id,
+                                              const std::string& label,
+                                              rtc_data_channel_state_e state) {
+  RTC_DCHECK_RUN_ON(&work_checker_);
+  {
+    std::lock_guard<std::mutex> lock(dc_handles_mu_);
+    if (state == RTC_DATA_CHANNEL_CLOSED) {
+      valid_dc_ids_.erase(channel_id);
+    } else {
+      valid_dc_ids_.insert(channel_id);
+    }
+  }
+  if (observer_ != nullptr) {
+    const std::string peer =
+        inbound_ ? inbound_->remote_peer_id : remote_peer_id_;
+    observer_->OnBackendDataChannelState(peer, channel_id, label, state);
+  }
+}
+
+void WebRtcP2pBackend::OnSctpDataChannelMessage(int channel_id,
+                                                bool is_binary,
+                                                std::vector<uint8_t> payload) {
+  RTC_DCHECK_RUN_ON(&work_checker_);
+  if (observer_ != nullptr) {
+    const std::string peer =
+        inbound_ ? inbound_->remote_peer_id : remote_peer_id_;
+    observer_->OnBackendDataChannelMessage(peer, channel_id, is_binary,
+                                           std::move(payload));
   }
 }
 
@@ -1012,6 +1143,7 @@ void WebRtcP2pBackend::OnWorkerPeriodicTick() {
   const Timestamp now = clock_->CurrentTime();
 
   if (media_ready_.load(std::memory_order_acquire)) {
+    sctp_dc_.OnPeriodicTick(now);
     const TimeDelta ice_rtt = ice_ ? ice_->last_rtt() : TimeDelta::Millis(30);
     outbound_.history.SetRtt(ice_rtt);
     twcc_adapter_.CullExpiredInFlight(now);
@@ -1160,6 +1292,68 @@ int WebRtcP2pBackend::RequestRemoteKeyFrame(const std::string& /*track_id*/) {
     SendPliForRemoteStream(clock_->CurrentTime());
   }));
   return RTC_OK;
+}
+
+int WebRtcP2pBackend::CreateDataChannel(const DataChannelConfig& config) {
+  if (!config_.enable_datachannel) {
+    return RTC_ERR_PROTOCOL;
+  }
+  int cid = RTC_ERR_INTERNAL;
+  queues_->worker()->Invoke([this, &config, &cid]() {
+    RTC_DCHECK_RUN_ON(&work_checker_);
+    cid = sctp_dc_.CreateDataChannel(config);
+    if (cid >= 0) {
+      std::lock_guard<std::mutex> lock(dc_handles_mu_);
+      valid_dc_ids_.insert(cid);
+    }
+  });
+  return cid;
+}
+
+int WebRtcP2pBackend::SendData(int channel_id,
+                               ArrayView<const uint8_t> payload,
+                               bool is_binary) {
+  if (!config_.enable_datachannel) {
+    return RTC_ERR_PROTOCOL;
+  }
+  if (channel_id < 0 || (payload.size() > 0 && payload.data() == nullptr)) {
+    return RTC_ERR_INVALID_ARG;
+  }
+  {
+    std::lock_guard<std::mutex> lock(dc_handles_mu_);
+    if (valid_dc_ids_.find(channel_id) == valid_dc_ids_.end()) {
+      return RTC_ERR_INVALID_ARG;
+    }
+  }
+  std::vector<uint8_t> copy(payload.begin(), payload.end());
+  queues_->worker()->PostTask(SafeTask(
+      work_safety_.flag(),
+      [this, channel_id, buf = std::move(copy), is_binary]() {
+        RTC_DCHECK_RUN_ON(&work_checker_);
+        sctp_dc_.SendData(channel_id, buf, is_binary);
+      }));
+  return RTC_OK;
+}
+
+int WebRtcP2pBackend::CloseDataChannel(int channel_id) {
+  if (!config_.enable_datachannel) {
+    return RTC_ERR_PROTOCOL;
+  }
+  if (channel_id < 0) {
+    return RTC_ERR_INVALID_ARG;
+  }
+  {
+    std::lock_guard<std::mutex> lock(dc_handles_mu_);
+    if (valid_dc_ids_.find(channel_id) == valid_dc_ids_.end()) {
+      return RTC_ERR_INVALID_ARG;
+    }
+  }
+  int rc = RTC_OK;
+  queues_->worker()->Invoke([this, channel_id, &rc]() {
+    RTC_DCHECK_RUN_ON(&work_checker_);
+    rc = sctp_dc_.CloseDataChannel(channel_id);
+  });
+  return rc;
 }
 
 }  // namespace rtc

@@ -102,6 +102,16 @@ class ISessionBackendObserver {
   virtual void OnBackendLocalIceCandidate(const std::string& /*sdp_mid*/,
                                           int /*sdp_mline_index*/,
                                           const std::string& /*candidate*/) {}
+
+  virtual void OnBackendDataChannelState(const std::string& /*peer_id*/,
+                                         int /*channel_id*/,
+                                         const std::string& /*label*/,
+                                         rtc_data_channel_state_e /*state*/) {}
+
+  virtual void OnBackendDataChannelMessage(const std::string& /*peer_id*/,
+                                           int /*channel_id*/,
+                                           bool /*is_binary*/,
+                                           std::vector<uint8_t> /*payload*/) {}
 };
 
 class ISessionBackend {
@@ -125,6 +135,18 @@ class ISessionBackend {
                                     SpatialLayer preferred_layer) = 0;
   virtual int UnsubscribeRemoteTrack(const std::string& track_id) = 0;
   virtual int RequestRemoteKeyFrame(const std::string& track_id) = 0;
+
+  virtual int CreateDataChannel(const DataChannelConfig& /*config*/) {
+    return RTC_ERR_PROTOCOL;
+  }
+  virtual int SendData(int /*channel_id*/,
+                       ArrayView<const uint8_t> /*payload*/,
+                       bool /*is_binary*/) {
+    return RTC_ERR_PROTOCOL;
+  }
+  virtual int CloseDataChannel(int /*channel_id*/) {
+    return RTC_ERR_PROTOCOL;
+  }
 
   virtual int SetQuicCongestionControl(rtc_quic_cc_algo_e /*algo*/) {
     return RTC_ERR_PROTOCOL;

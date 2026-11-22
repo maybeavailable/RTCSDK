@@ -44,6 +44,7 @@ typedef struct {
   uint32_t h264_frames;
   rtc_stream_layer_e h265_last_layer;
   rtc_stream_layer_e h264_last_layer;
+  uint32_t dc_messages_rx;
 } c99_moq_peer_t;
 
 static void sleep_ms(int ms) {
@@ -145,6 +146,22 @@ static void on_moq_stats(void* ud, const rtc_network_stats_t* stats) {
   pthread_mutex_lock(&p->lock);
   p->stats_cbs++;
   pthread_mutex_unlock(&p->lock);
+}
+
+static void on_moq_dc_msg(void* ud,
+                          const char* peer_id,
+                          int channel_id,
+                          bool is_binary,
+                          const uint8_t* data,
+                          size_t size) {
+  (void)channel_id;
+  (void)is_binary;
+  c99_moq_peer_t* p = (c99_moq_peer_t*)ud;
+  pthread_mutex_lock(&p->lock);
+  p->dc_messages_rx++;
+  pthread_mutex_unlock(&p->lock);
+  printf("[%s] MoQ DataChannel RX from %s: %.*s\n", p->name, peer_id,
+         (int)size, (const char*)data);
 }
 
 static bool wait_moq_connected(c99_moq_peer_t* p, int timeout_ms) {
@@ -267,6 +284,7 @@ int main(int argc, char** argv) {
   cbs.on_remote_encoded_frame = &on_moq_frame;
   cbs.on_connection_state = &on_moq_conn_state;
   cbs.on_network_stats = &on_moq_stats;
+  cbs.on_data_channel_message = &on_moq_dc_msg;
 
   rtc_config_t pull_cfg;
   memset(&pull_cfg, 0, sizeof(pull_cfg));
@@ -318,10 +336,18 @@ int main(int argc, char** argv) {
     sleep_ms(20);
   }
 
-  // 在单条 QUIC v1 连接上并发订阅两路媒体轨道
+  // 在单条 QUIC v1 连接上并发订阅两路媒体轨道，并由摄像头 1 广播 MoQ 数据轨道报文
   rtc_client_subscribe_track(nvr, "c99_cam_h265", RTC_STREAM_LAYER_HIGH);
   rtc_client_subscribe_track(nvr, "c99_cam_h264", RTC_STREAM_LAYER_LOW);
   sleep_ms(40);
+  {
+    rtc_data_channel_init_t dc_init;
+    rtc_data_channel_init_default(&dc_init, "cam_gps");
+    const int gps_dc = rtc_client_create_data_channel(cam1, &dc_init);
+    const char* kGps = "{\"lat\":31.2304,\"lon\":121.4737}";
+    rtc_client_send_data(cam1, gps_dc, (const uint8_t*)kGps, strlen(kGps),
+                         false);
+  }
 
   uint8_t low_buf[4096];
   uint8_t high_buf[8192];
@@ -412,12 +438,14 @@ int main(int argc, char** argv) {
   const rtc_stream_layer_e l264 = nvr_ctx.h264_last_layer;
   const uint32_t unpub = nvr_ctx.unpub_events;
   const uint32_t stats_cnt = nvr_ctx.stats_cbs;
+  const uint32_t dc_rx = nvr_ctx.dc_messages_rx;
   pthread_mutex_unlock(&nvr_ctx.lock);
 
   printf("=== C99 MoQ Multi-Pull Demo Summary: h265=%u (layer=%s), "
-         "h264=%u (layer=%s), unpub=%u, stats=%u ===\n",
+         "h264=%u (layer=%s), dc_rx=%u, unpub=%u, stats=%u ===\n",
          f265, l265 == RTC_STREAM_LAYER_LOW ? "LOW" : "HIGH", f264,
-         l264 == RTC_STREAM_LAYER_LOW ? "LOW" : "HIGH", unpub, stats_cnt);
+         l264 == RTC_STREAM_LAYER_LOW ? "LOW" : "HIGH", dc_rx, unpub,
+         stats_cnt);
 
   rtc_client_leave_room(cam2);
   rtc_client_leave_room(nvr);
@@ -433,7 +461,7 @@ int main(int argc, char** argv) {
 
   const bool passed = (f265 >= 18u) && (f264 >= 18u) &&
                       (l265 == RTC_STREAM_LAYER_LOW) &&
-                      (l264 == RTC_STREAM_LAYER_HIGH) && (unpub > 0u) &&
-                      (stats_cnt > 0u);
+                      (l264 == RTC_STREAM_LAYER_HIGH) && (dc_rx > 0u) &&
+                      (unpub > 0u) && (stats_cnt > 0u);
   return passed ? 0 : 4;
 }

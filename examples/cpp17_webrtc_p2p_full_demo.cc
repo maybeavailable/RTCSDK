@@ -135,6 +135,31 @@ class FullP2pObserver final : public rtc::IRtcEventObserver {
     }
   }
 
+  void OnDataChannelState(const std::string& /*peer_id*/,
+                          int channel_id,
+                          const std::string& label,
+                          rtc_data_channel_state_e state) override {
+    std::lock_guard<std::mutex> lock(mu_);
+    if (state == RTC_DATA_CHANNEL_OPEN) {
+      last_dc_id_ = channel_id;
+      ++dc_open_cbs_;
+      RTC_LOG(kInfo) << "[" << name_ << "] DataChannel OPEN label=" << label
+                     << " id=" << channel_id;
+    }
+    cv_.notify_all();
+  }
+
+  void OnDataChannelMessage(const std::string& /*peer_id*/,
+                            int /*channel_id*/,
+                            bool /*is_binary*/,
+                            const uint8_t* data,
+                            size_t size) override {
+    std::lock_guard<std::mutex> lock(mu_);
+    ++dc_messages_rx_;
+    last_dc_text_.assign(reinterpret_cast<const char*>(data), size);
+    cv_.notify_all();
+  }
+
   bool WaitConnected(int timeout_ms = 5000) {
     std::unique_lock<std::mutex> lock(mu_);
     return cv_.wait_for(lock, std::chrono::milliseconds(timeout_ms),
@@ -182,6 +207,10 @@ class FullP2pObserver final : public rtc::IRtcEventObserver {
     std::lock_guard<std::mutex> lock(mu_);
     return unpublished_events_;
   }
+  uint32_t dc_messages_rx() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    return dc_messages_rx_;
+  }
 
  private:
   const std::string name_;
@@ -203,6 +232,10 @@ class FullP2pObserver final : public rtc::IRtcEventObserver {
   uint32_t stats_cbs_ = 0;
   int64_t last_rtt_ms_ = 0;
   uint32_t local_cand_cbs_ = 0;
+  int last_dc_id_ = -1;
+  uint32_t dc_open_cbs_ = 0;
+  uint32_t dc_messages_rx_ = 0;
+  std::string last_dc_text_;
 };
 
 std::vector<uint8_t> BuildAnnexBBitstream(rtc_video_codec_e codec,
@@ -275,6 +308,11 @@ bool RunDirectSdpBidirectionalCpp17P2p() {
   cam_eng->JoinRoom("cpp17_direct", "cam_a");
   app_eng->JoinRoom("cpp17_direct", "app_b");
 
+  rtc::DataChannelConfig dc_cfg;
+  dc_cfg.label = "ptz_cmd";
+  const int app_dc = app_eng->CreateDataChannel(dc_cfg);
+  app_eng->SendTextData(app_dc, "PTZ:TILT_UP:10");
+
   std::string offer_sdp;
   std::string answer_sdp;
   if (app_eng->CreateLocalOffer(&offer_sdp) != RTC_OK ||
@@ -319,6 +357,7 @@ bool RunDirectSdpBidirectionalCpp17P2p() {
   RTC_LOG(kInfo) << "[C++17 Part 1 Result] cam_pulled="
                  << cam_obs.frames_pulled()
                  << " app_pulled=" << app_obs.frames_pulled()
+                 << " cam_dc_rx=" << cam_obs.dc_messages_rx()
                  << " stats_cbs=" << cam_obs.stats_cbs()
                  << " bwe_cbs=" << cam_obs.bitrate_cbs();
 
@@ -327,7 +366,8 @@ bool RunDirectSdpBidirectionalCpp17P2p() {
   cam_eng->LeaveRoom();
   app_eng->LeaveRoom();
 
-  return frames_ok && cam_obs.stats_cbs() > 0 && cam_obs.bitrate_cbs() > 0;
+  return frames_ok && cam_obs.dc_messages_rx() > 0 &&
+         cam_obs.stats_cbs() > 0 && cam_obs.bitrate_cbs() > 0;
 }
 
 bool RunWsSignalingH265Cpp17P2p() {

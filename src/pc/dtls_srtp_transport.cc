@@ -241,7 +241,7 @@ long DgramBioCtrl(BIO* /*bio*/, int cmd, long /*num*/, void* /*ptr*/) {
       return 1;
     case BIO_CTRL_DGRAM_QUERY_MTU:
     case BIO_CTRL_DGRAM_GET_FALLBACK_MTU:
-      return 1200;
+      return 1280;
     default:
       return 0;
   }
@@ -347,8 +347,8 @@ void DtlsSrtpTransport::StartHandshakeIfReady() {
 
   ssl_ = SSL_new(ssl_ctx_);
   SSL_set_options(ssl_, SSL_OP_NO_QUERY_MTU);
-  SSL_set_mtu(ssl_, 1200);
-  DTLS_set_link_mtu(ssl_, 1200);
+  SSL_set_mtu(ssl_, 1280);
+  DTLS_set_link_mtu(ssl_, 1280);
 
   read_bio_ = BIO_new(BIO_s_mem());
   BIO_set_mem_eof_return(read_bio_, -1);
@@ -538,9 +538,20 @@ void DtlsSrtpTransport::OnIcePacketReceived(ArrayView<const uint8_t> packet,
       BIO_write(read_bio_, packet.data(), static_cast<int>(packet.size()));
       if (!handshake_complete_) {
         DriveDtlsHandshake();
-      } else {
-        uint8_t app_buf[1500];
-        SSL_read(ssl_, app_buf, sizeof(app_buf));
+      }
+      if (handshake_complete_) {
+        // RFC 8261：读取所有解密后的 DTLS 应用数据记录（如 SCTP DataChannel 分组）。
+        uint8_t app_buf[4096];
+        while (true) {
+          const int n = SSL_read(ssl_, app_buf, sizeof(app_buf));
+          if (n <= 0) {
+            break;
+          }
+          if (observer_ != nullptr) {
+            observer_->OnDtlsApplicationData(
+                MakeArrayView(app_buf, static_cast<size_t>(n)), receive_time);
+          }
+        }
       }
     }
     return;
@@ -585,6 +596,15 @@ bool DtlsSrtpTransport::SendRtcpPacket(ArrayView<const uint8_t> compound_rtcp) {
     return false;
   }
   return ice_channel_->SendPacket(wire) > 0;
+}
+
+bool DtlsSrtpTransport::SendDtlsApplicationData(
+    ArrayView<const uint8_t> payload) {
+  RTC_DCHECK_RUN_ON(&net_checker_);
+  if (!handshake_complete_ || ssl_ == nullptr || payload.empty()) {
+    return false;
+  }
+  return SSL_write(ssl_, payload.data(), static_cast<int>(payload.size())) > 0;
 }
 
 // ======================= RtpDemuxer RTP 解复用器 =======================
@@ -684,10 +704,42 @@ std::string PureVideoSdpDescription::Serialize() const {
       << "s=-\r\n"
       << "t=0 0\r\n";
 
-  if (!video_m_sections.empty()) {
+  // 按 RFC 3264 规范保持 m= 媒体段与 BUNDLE 顺序一致。
+  std::vector<SdpMediaKind> order = m_section_order;
+  if (order.empty()) {
+    for (size_t i = 0; i < video_m_sections.size(); ++i) {
+      order.push_back(SdpMediaKind::kVideo);
+    }
+    if (data_m_section.has_value()) {
+      order.push_back(SdpMediaKind::kApplication);
+    }
+  }
+
+  std::vector<std::string> bundle_mids;
+  size_t b_vid_idx = 0;
+  bool b_data_used = false;
+  for (SdpMediaKind kind : order) {
+    if (kind == SdpMediaKind::kVideo && b_vid_idx < video_m_sections.size()) {
+      bundle_mids.push_back(video_m_sections[b_vid_idx++].mid);
+    } else if (kind == SdpMediaKind::kApplication &&
+               data_m_section.has_value() && !b_data_used) {
+      bundle_mids.push_back(data_m_section->mid);
+      b_data_used = true;
+    }
+  }
+  while (b_vid_idx < video_m_sections.size()) {
+    order.push_back(SdpMediaKind::kVideo);
+    bundle_mids.push_back(video_m_sections[b_vid_idx++].mid);
+  }
+  if (data_m_section.has_value() && !b_data_used) {
+    order.push_back(SdpMediaKind::kApplication);
+    bundle_mids.push_back(data_m_section->mid);
+  }
+
+  if (!bundle_mids.empty()) {
     sdp << "a=group:BUNDLE";
-    for (const auto& m : video_m_sections) {
-      sdp << " " << m.mid;
+    for (const auto& mid : bundle_mids) {
+      sdp << " " << mid;
     }
     sdp << "\r\n";
   }
@@ -705,8 +757,39 @@ std::string PureVideoSdpDescription::Serialize() const {
     sdp << "a=ice-lite\r\n";
   }
 
-  for (size_t idx = 0; idx < video_m_sections.size(); ++idx) {
-    const auto& m = video_m_sections[idx];
+  size_t vid_idx = 0;
+  bool data_emitted = false;
+  size_t emitted_m_count = 0;
+  for (SdpMediaKind kind : order) {
+    if (kind == SdpMediaKind::kApplication) {
+      if (!data_m_section.has_value() || data_emitted) {
+        continue;
+      }
+      data_emitted = true;
+      const auto& dm = *data_m_section;
+      sdp << "m=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\n"
+          << "c=IN IP4 0.0.0.0\r\n"
+          << "a=ice-ufrag:" << ice_params.ufrag << "\r\n"
+          << "a=ice-pwd:" << ice_params.pwd << "\r\n"
+          << "a=ice-options:trickle\r\n"
+          << "a=fingerprint:sha-256 " << dtls_fingerprint_sha256 << "\r\n"
+          << "a=setup:" << dtls_setup << "\r\n"
+          << "a=mid:" << dm.mid << "\r\n"
+          << "a=sctp-port:" << dm.sctp_port << "\r\n"
+          << "a=max-message-size:" << dm.max_message_size << "\r\n";
+      if (emitted_m_count == 0) {
+        for (const auto& c : candidates) {
+          sdp << "a=" << c.ToSdpAttribute() << "\r\n";
+        }
+      }
+      ++emitted_m_count;
+      continue;
+    }
+
+    if (vid_idx >= video_m_sections.size()) {
+      continue;
+    }
+    const auto& m = video_m_sections[vid_idx++];
     sdp << "m=video 9 UDP/TLS/RTP/SAVPF " << static_cast<int>(m.video_pt);
     if (m.has_rtx) {
       sdp << " " << static_cast<int>(m.rtx_pt);
@@ -808,11 +891,12 @@ std::string PureVideoSdpDescription::Serialize() const {
       }
     }
 
-    if (idx == 0) {
+    if (emitted_m_count == 0) {
       for (const auto& c : candidates) {
         sdp << "a=" << c.ToSdpAttribute() << "\r\n";
       }
     }
+    ++emitted_m_count;
   }
   return sdp.str();
 }
@@ -839,6 +923,7 @@ std::optional<PureVideoSdpDescription> PureVideoSdpDescription::Parse(
   std::string line;
   VideoMediaTrackDesc* cur_m = nullptr;
   MSectionCodecScratch* cur_scratch = nullptr;
+  bool in_data_m = false;
 
   auto parse_extmap_line = [](std::string_view ext_body,
                               RtpHeaderExtensionMap* target_map) {
@@ -885,6 +970,8 @@ std::optional<PureVideoSdpDescription> PureVideoSdpDescription::Parse(
     }
 
     if (line.rfind("m=video ", 0) == 0) {
+      in_data_m = false;
+      out.m_section_order.push_back(SdpMediaKind::kVideo);
       out.video_m_sections.emplace_back();
       scratches.emplace_back();
       cur_m = &out.video_m_sections.back();
@@ -894,10 +981,41 @@ std::optional<PureVideoSdpDescription> PureVideoSdpDescription::Parse(
       cur_m->direction_recv = true;
       continue;
     }
-    if (line.rfind("m=", 0) == 0) {
-      // 忽略非视频的 m= 媒体段（例如 application/datachannel 或音频段）。
+    if (line.rfind("m=application ", 0) == 0) {
       cur_m = nullptr;
       cur_scratch = nullptr;
+      in_data_m = false;
+      // 解析 RFC 8841 `m=application <port> UDP/DTLS/SCTP webrtc-datachannel`
+      // 及旧版草案 `m=application <port> DTLS/SCTP <sctp-port>`。
+      std::istringstream ms(line.substr(14));
+      std::string port_tok;
+      std::string proto_tok;
+      std::string fmt_tok;
+      if ((ms >> port_tok >> proto_tok >> fmt_tok) && port_tok != "0") {
+        std::string proto_upper = proto_tok;
+        std::transform(proto_upper.begin(), proto_upper.end(),
+                       proto_upper.begin(), [](unsigned char c) {
+                         return static_cast<char>(std::toupper(c));
+                       });
+        if (proto_upper.find("SCTP") != std::string::npos &&
+            !out.data_m_section.has_value()) {
+          DataChannelMediaDesc ddesc;
+          uint16_t legacy_port = 0;
+          if (ParseUint16(fmt_tok, &legacy_port) && legacy_port > 0) {
+            ddesc.sctp_port = legacy_port;
+          }
+          out.data_m_section = ddesc;
+          out.m_section_order.push_back(SdpMediaKind::kApplication);
+          in_data_m = true;
+        }
+      }
+      continue;
+    }
+    if (line.rfind("m=", 0) == 0) {
+      // 忽略其他非视频/非数据通道的 m= 媒体段（如音频段）。
+      cur_m = nullptr;
+      cur_scratch = nullptr;
+      in_data_m = false;
       continue;
     }
 
@@ -925,10 +1043,34 @@ std::optional<PureVideoSdpDescription> PureVideoSdpDescription::Parse(
       if (auto c = IceCandidate::FromSdpAttribute(line)) {
         out.candidates.push_back(*c);
       }
-    } else if (line.rfind("a=extmap:", 0) == 0 && cur_m == nullptr) {
+    } else if (line.rfind("a=extmap:", 0) == 0 && cur_m == nullptr &&
+               !in_data_m) {
       if (parse_extmap_line(std::string_view(line).substr(9),
                             &session_ext_map)) {
         saw_session_extmap = true;
+      }
+    } else if (in_data_m && out.data_m_section.has_value()) {
+      if (line.rfind("a=mid:", 0) == 0) {
+        out.data_m_section->mid = line.substr(6);
+      } else if (line.rfind("a=sctp-port:", 0) == 0) {
+        uint16_t sp = 5000;
+        if (ParseUint16(std::string_view(line).substr(12), &sp) && sp > 0) {
+          out.data_m_section->sctp_port = sp;
+        }
+      } else if (line.rfind("a=sctpmap:", 0) == 0) {
+        const std::string_view rest = std::string_view(line).substr(10);
+        const size_t space = rest.find(' ');
+        const std::string_view port_part =
+            (space == std::string_view::npos) ? rest : rest.substr(0, space);
+        uint16_t sp = 5000;
+        if (ParseUint16(port_part, &sp) && sp > 0) {
+          out.data_m_section->sctp_port = sp;
+        }
+      } else if (line.rfind("a=max-message-size:", 0) == 0) {
+        uint32_t mms = 262144;
+        if (ParseUint32(std::string_view(line).substr(19), &mms) && mms > 0) {
+          out.data_m_section->max_message_size = mms;
+        }
       }
     } else if (cur_m != nullptr && cur_scratch != nullptr) {
       if (line.rfind("a=mid:", 0) == 0) {
@@ -1058,7 +1200,8 @@ std::optional<PureVideoSdpDescription> PureVideoSdpDescription::Parse(
     }
   }
 
-  if (out.ice_params.ufrag.empty() && out.video_m_sections.empty()) {
+  if (out.ice_params.ufrag.empty() && out.video_m_sections.empty() &&
+      !out.data_m_section.has_value()) {
     return std::nullopt;
   }
   return out;

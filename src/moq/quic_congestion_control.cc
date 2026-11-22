@@ -530,9 +530,8 @@ void Bbr2QuicCongestionController::OnCongestionEvent(
   } else if (!full_bw_reached_ && min_rtt_us_ > 0 &&
              delivered_bytes_ >= 4 * mss_ &&
              sample_rtt > min_rtt_us_ * 2 + 30'000) {
-    // 超窄带链路 Startup 排队延迟翻倍早退保护，立即转入 Drain 排空积压队列。
+    // 超窄带链路 Startup 排队延迟翻倍早退保护：转入 Drain 排空积压队列，但不伪造丢包上限 inflight_hi_。
     full_bw_reached_ = true;
-    inflight_hi_ = std::max(TargetBdpBytes(1.5), 2 * mss_);
   }
 
   // BBRv2 在非 Startup 等状态下的短期丢包响应。
@@ -595,7 +594,7 @@ void Bbr2QuicCongestionController::OnCongestionEvent(
       }
       break;
     case State::kProbeBwCruise:
-      if ((now_us - cycle_stamp_us_) >= std::max<int64_t>(1'200'000, 20 * ref_rtt_us)) {
+      if ((now_us - cycle_stamp_us_) >= std::max<int64_t>(320'000, 8 * ref_rtt_us)) {
         EnterProbeBwRefill(now_us);
       }
       break;

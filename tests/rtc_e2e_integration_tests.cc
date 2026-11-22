@@ -651,5 +651,494 @@ TEST(RtcE2ETest, PureC99AbiWebRtcP2pAndMoqConnect) {
   moq_relay.Stop();
 }
 
+// 5. 验证 WebRTC P2P 在丢包环境下音视频级 H.264 与双向 SCTP DataChannel（文本+24KB大二进制）并发互通
+TEST(RtcE2ETest, WebRtcP2pVideoAndDataChannelLossyBidirectionalE2E) {
+  rtc_set_log_level(RTC_LOG_INFO);
+
+  class DcP2pObserver final : public IRtcEventObserver {
+   public:
+    void BindTrickle(RtcVideoEngine* peer) {
+      std::lock_guard<std::mutex> lk(mu_);
+      trickle_peer_ = peer;
+    }
+    void OnEncoderBitrateAllocation(rtc_stream_layer_e,
+                                    bool,
+                                    uint32_t,
+                                    uint32_t) override {}
+    void OnEncoderForceIdr(rtc_stream_layer_e) override {}
+    void OnRemoteTrackPublished(const std::string&,
+                                const std::string&,
+                                rtc_video_codec_e) override {}
+    void OnRemoteTrackUnpublished(const std::string&,
+                                  const std::string&) override {}
+    void OnRemoteEncodedFrame(const std::string&,
+                              const std::string&,
+                              const rtc_encoded_frame_t&) override {
+      std::lock_guard<std::mutex> lk(mu_);
+      ++frames_;
+      cv_.notify_all();
+    }
+    void OnConnectionState(rtc_connection_state_e st, int) override {
+      std::lock_guard<std::mutex> lk(mu_);
+      if (st == RTC_CONN_STATE_CONNECTED) {
+        connected_ = true;
+        cv_.notify_all();
+      }
+    }
+    void OnLocalIceCandidate(const std::string&,
+                             int,
+                             const std::string& cand) override {
+      RtcVideoEngine* p = nullptr;
+      {
+        std::lock_guard<std::mutex> lk(mu_);
+        p = trickle_peer_;
+      }
+      if (p != nullptr) {
+        p->AddRemoteIceCandidate(cand);
+      }
+    }
+    void OnDataChannelState(const std::string& /*peer_id*/,
+                            int channel_id,
+                            const std::string& label,
+                            rtc_data_channel_state_e state) override {
+      std::lock_guard<std::mutex> lk(mu_);
+      if (state == RTC_DATA_CHANNEL_OPEN) {
+        open_channels_[label] = channel_id;
+        cv_.notify_all();
+      }
+    }
+    void OnDataChannelMessage(const std::string& /*peer_id*/,
+                              int /*channel_id*/,
+                              bool is_binary,
+                              const uint8_t* data,
+                              size_t size) override {
+      std::lock_guard<std::mutex> lk(mu_);
+      if (is_binary) {
+        rx_binaries_.emplace_back(data, data + size);
+      } else {
+        rx_texts_.emplace_back(reinterpret_cast<const char*>(data), size);
+      }
+      cv_.notify_all();
+    }
+
+    std::mutex mu_;
+    std::condition_variable cv_;
+    RtcVideoEngine* trickle_peer_ = nullptr;
+    bool connected_ = false;
+    int frames_ = 0;
+    std::map<std::string, int> open_channels_;
+    std::vector<std::string> rx_texts_;
+    std::vector<std::vector<uint8_t>> rx_binaries_;
+  };
+
+  EngineConfig cfg;
+  cfg.transport_mode = RTC_TRANSPORT_MODE_WEBRTC_P2P;
+  cfg.publish_codec = RTC_CODEC_H264;
+  cfg.enable_flexfec = true;
+  cfg.enable_datachannel = true;
+
+  DcP2pObserver obs_a;
+  DcP2pObserver obs_b;
+  auto eng_a = RtcVideoEngine::Create(cfg, &obs_a);
+  auto eng_b = RtcVideoEngine::Create(cfg, &obs_b);
+  obs_a.BindTrickle(eng_b.get());
+  obs_b.BindTrickle(eng_a.get());
+
+  // 连接前预创建可靠控制通道并预发一条启动握手消息
+  DataChannelConfig dc_cfg;
+  dc_cfg.label = "ptz_control";
+  dc_cfg.protocol = "json";
+  dc_cfg.ordered = true;
+  const int ch_a = eng_a->CreateDataChannel(dc_cfg);
+  ASSERT_GE(ch_a, 0);
+  ASSERT_EQ(eng_a->SendTextData(ch_a, "{\"cmd\":\"pan_left\",\"deg\":15}"),
+            RTC_OK);
+
+  eng_a->JoinRoom("dc_p2p_room", "robot_a");
+  eng_b->JoinRoom("dc_p2p_room", "console_b");
+
+  std::string offer_sdp;
+  std::string answer_sdp;
+  ASSERT_EQ(eng_a->CreateLocalOffer(&offer_sdp), RTC_OK);
+  EXPECT_NE(offer_sdp.find("m=application 9 UDP/DTLS/SCTP webrtc-datachannel"),
+            std::string::npos);
+  ASSERT_EQ(eng_b->SetRemoteDescription("offer", offer_sdp, &answer_sdp),
+            RTC_OK);
+  EXPECT_NE(answer_sdp.find("m=application 9 UDP/DTLS/SCTP webrtc-datachannel"),
+            std::string::npos);
+  ASSERT_EQ(eng_a->SetRemoteDescription("answer", answer_sdp, nullptr), RTC_OK);
+
+  {
+    std::unique_lock<std::mutex> lk(obs_b.mu_);
+    ASSERT_TRUE(obs_b.cv_.wait_for(lk, std::chrono::milliseconds(4000), [&]() {
+      return obs_b.open_channels_.count("ptz_control") > 0 &&
+             !obs_b.rx_texts_.empty();
+    }));
+    EXPECT_EQ(obs_b.rx_texts_[0], "{\"cmd\":\"pan_left\",\"deg\":15}");
+  }
+
+  // 对端 B 直接复用接收到的双向通道 ID 回复 24KB 二进制地图块与 ACK 文本，同时 A 推送视频帧
+  int ch_b_reply = -1;
+  {
+    std::lock_guard<std::mutex> lk(obs_b.mu_);
+    ch_b_reply = obs_b.open_channels_["ptz_control"];
+  }
+  std::vector<uint8_t> map_tile(24 * 1024, 0);
+  for (size_t i = 0; i < map_tile.size(); ++i) {
+    map_tile[i] = static_cast<uint8_t>((i * 29 + 7) & 0xFFu);
+  }
+  ASSERT_EQ(eng_b->SendData(ch_b_reply, map_tile.data(), map_tile.size(), true),
+            RTC_OK);
+  ASSERT_EQ(eng_b->SendTextData(ch_b_reply, "{\"ack\":\"ok\"}"), RTC_OK);
+
+  const uint8_t h264_idr[] = {0x00, 0x00, 0x00, 0x01, 0x67, 0x42, 0xE0,
+                              0x1F, 0x00, 0x00, 0x00, 0x01, 0x68, 0xCE,
+                              0x3C, 0x80, 0x00, 0x00, 0x00, 0x01, 0x65,
+                              0x88, 0x84, 0x21};
+  for (int i = 0; i < 6; ++i) {
+    rtc_encoded_frame_t vf{};
+    vf.data = h264_idr;
+    vf.size = sizeof(h264_idr);
+    vf.capture_ts_us = 1'000'000 + static_cast<uint64_t>(i) * 33'333;
+    vf.is_keyframe = true;
+    eng_a->PushVideoFrame(vf);
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  }
+
+  {
+    std::unique_lock<std::mutex> lk(obs_a.mu_);
+    ASSERT_TRUE(obs_a.cv_.wait_for(lk, std::chrono::milliseconds(4000), [&]() {
+      return !obs_a.rx_binaries_.empty() && !obs_a.rx_texts_.empty();
+    }));
+    EXPECT_EQ(obs_a.rx_binaries_[0], map_tile);
+    EXPECT_EQ(obs_a.rx_texts_[0], "{\"ack\":\"ok\"}");
+  }
+  {
+    std::unique_lock<std::mutex> lk(obs_b.mu_);
+    ASSERT_TRUE(obs_b.cv_.wait_for(lk, std::chrono::milliseconds(3000),
+                                   [&]() { return obs_b.frames_ >= 3; }));
+  }
+
+  obs_a.BindTrickle(nullptr);
+  obs_b.BindTrickle(nullptr);
+  eng_a->LeaveRoom();
+  eng_b->LeaveRoom();
+}
+
+// 6. 验证 IETF MoQ Relay 一对多广播数据通道与反向控制指令回传
+TEST(RtcE2ETest, MoqRelayMultiPeerDataChannelBroadcastAndReplyE2E) {
+  EmbeddedMoqRelayServer relay("127.0.0.1");
+  ASSERT_TRUE(relay.Start(0));
+  const std::string moq_url =
+      "moq://127.0.0.1:" + std::to_string(relay.udp_port());
+
+  class MoqDcObserver final : public IRtcEventObserver {
+   public:
+    void OnEncoderBitrateAllocation(rtc_stream_layer_e,
+                                    bool,
+                                    uint32_t,
+                                    uint32_t) override {}
+    void OnEncoderForceIdr(rtc_stream_layer_e) override {}
+    void OnRemoteTrackPublished(const std::string&,
+                                const std::string&,
+                                rtc_video_codec_e) override {}
+    void OnRemoteTrackUnpublished(const std::string&,
+                                  const std::string&) override {}
+    void OnRemoteEncodedFrame(const std::string&,
+                              const std::string&,
+                              const rtc_encoded_frame_t&) override {}
+    void OnConnectionState(rtc_connection_state_e st, int) override {
+      std::lock_guard<std::mutex> lk(mu_);
+      if (st == RTC_CONN_STATE_CONNECTED) {
+        connected_ = true;
+        cv_.notify_all();
+      }
+    }
+    void OnDataChannelState(const std::string& peer_id,
+                            int channel_id,
+                            const std::string& label,
+                            rtc_data_channel_state_e state) override {
+      std::lock_guard<std::mutex> lk(mu_);
+      if (state == RTC_DATA_CHANNEL_OPEN) {
+        label_to_cid_[label] = channel_id;
+      } else if (state == RTC_DATA_CHANNEL_CLOSED) {
+        ++closed_events_;
+      }
+      (void)peer_id;
+      cv_.notify_all();
+    }
+    void OnDataChannelMessage(const std::string& peer_id,
+                              int /*channel_id*/,
+                              bool is_binary,
+                              const uint8_t* data,
+                              size_t size) override {
+      std::lock_guard<std::mutex> lk(mu_);
+      if (is_binary) {
+        binaries_.emplace_back(
+            peer_id, std::vector<uint8_t>(data, data + size));
+      } else {
+        texts_.emplace_back(
+            peer_id, std::string(reinterpret_cast<const char*>(data), size));
+      }
+      cv_.notify_all();
+    }
+
+    std::mutex mu_;
+    std::condition_variable cv_;
+    bool connected_ = false;
+    int closed_events_ = 0;
+    std::map<std::string, int> label_to_cid_;
+    std::vector<std::pair<std::string, std::string>> texts_;
+    std::vector<std::pair<std::string, std::vector<uint8_t>>> binaries_;
+  };
+
+  EngineConfig cfg;
+  cfg.transport_mode = RTC_TRANSPORT_MODE_MOQ;
+  cfg.signaling_or_moq_url = moq_url;
+  cfg.enable_datachannel = true;
+
+  MoqDcObserver drone_obs;
+  MoqDcObserver viewer1_obs;
+  MoqDcObserver viewer2_obs;
+  auto drone = RtcVideoEngine::Create(cfg, &drone_obs);
+  auto viewer1 = RtcVideoEngine::Create(cfg, &viewer1_obs);
+  auto viewer2 = RtcVideoEngine::Create(cfg, &viewer2_obs);
+
+  drone->JoinRoom("moq_dc_room", "drone_pub");
+  viewer1->JoinRoom("moq_dc_room", "viewer_1");
+  viewer2->JoinRoom("moq_dc_room", "viewer_2");
+
+  auto wait_conn = [](MoqDcObserver& o) {
+    std::unique_lock<std::mutex> lk(o.mu_);
+    return o.cv_.wait_for(lk, std::chrono::milliseconds(4000),
+                          [&]() { return o.connected_; });
+  };
+  ASSERT_TRUE(wait_conn(drone_obs));
+  ASSERT_TRUE(wait_conn(viewer1_obs));
+  ASSERT_TRUE(wait_conn(viewer2_obs));
+  std::this_thread::sleep_for(std::chrono::milliseconds(80));
+
+  // 无人机创建有序遥测通道 + 无序限生存期传感器通道，向两个观众一对多广播
+  DataChannelConfig tel_cfg;
+  tel_cfg.label = "uav_telemetry";
+  tel_cfg.ordered = true;
+  const int tel_ch = drone->CreateDataChannel(tel_cfg);
+  ASSERT_GE(tel_ch, 0);
+
+  DataChannelConfig fast_cfg;
+  fast_cfg.label = "imu_fast";
+  fast_cfg.ordered = false;
+  fast_cfg.max_packet_lifetime_ms = 120;
+  const int imu_ch = drone->CreateDataChannel(fast_cfg);
+  ASSERT_GE(imu_ch, 0);
+
+  ASSERT_EQ(drone->SendTextData(tel_ch, "{\"alt_m\":128.5,\"bat\":92}"),
+            RTC_OK);
+  std::vector<uint8_t> imu_pkt(16 * 1024, 0xA5);
+  for (size_t i = 0; i < imu_pkt.size(); ++i) {
+    imu_pkt[i] = static_cast<uint8_t>((i * 17 + 3) & 0xFFu);
+  }
+  ASSERT_EQ(drone->SendData(imu_ch, imu_pkt.data(), imu_pkt.size(), true),
+            RTC_OK);
+
+  auto wait_broadcast = [&](MoqDcObserver& vo) {
+    std::unique_lock<std::mutex> lk(vo.mu_);
+    return vo.cv_.wait_for(lk, std::chrono::milliseconds(4000), [&]() {
+      return !vo.texts_.empty() && !vo.binaries_.empty();
+    });
+  };
+  ASSERT_TRUE(wait_broadcast(viewer1_obs));
+  ASSERT_TRUE(wait_broadcast(viewer2_obs));
+  EXPECT_EQ(viewer1_obs.texts_[0].first, "drone_pub");
+  EXPECT_EQ(viewer1_obs.texts_[0].second, "{\"alt_m\":128.5,\"bat\":92}");
+  EXPECT_EQ(viewer1_obs.binaries_[0].second, imu_pkt);
+  EXPECT_EQ(viewer2_obs.texts_[0].second, "{\"alt_m\":128.5,\"bat\":92}");
+  EXPECT_EQ(viewer2_obs.binaries_[0].second, imu_pkt);
+
+  // viewer_1 直接在接收到的通道上发送反向返航控制指令，验证无人机与 viewer_2 同步收到且标识来源为 viewer_1
+  int v1_tel_cid = -1;
+  {
+    std::lock_guard<std::mutex> lk(viewer1_obs.mu_);
+    v1_tel_cid = viewer1_obs.label_to_cid_["uav_telemetry"];
+  }
+  ASSERT_GE(v1_tel_cid, 0);
+  ASSERT_EQ(viewer1->SendTextData(v1_tel_cid, "{\"cmd\":\"return_to_home\"}"),
+            RTC_OK);
+
+  {
+    std::unique_lock<std::mutex> lk(drone_obs.mu_);
+    ASSERT_TRUE(drone_obs.cv_.wait_for(lk, std::chrono::milliseconds(4000),
+                                       [&]() { return !drone_obs.texts_.empty(); }));
+    EXPECT_EQ(drone_obs.texts_[0].first, "viewer_1");
+    EXPECT_EQ(drone_obs.texts_[0].second, "{\"cmd\":\"return_to_home\"}");
+  }
+
+  // 关闭无人机遥测通道并校验远端收到 CLOSED 通知
+  EXPECT_EQ(drone->CloseDataChannel(tel_ch), RTC_OK);
+  {
+    std::unique_lock<std::mutex> lk(viewer2_obs.mu_);
+    EXPECT_TRUE(viewer2_obs.cv_.wait_for(
+        lk, std::chrono::milliseconds(3000),
+        [&]() { return viewer2_obs.closed_events_ > 0; }));
+  }
+
+  viewer1->LeaveRoom();
+  viewer2->LeaveRoom();
+  drone->LeaveRoom();
+  relay.Stop();
+}
+
+// 7. 验证纯 C99 ABI 数据通道接口在 WebRTC P2P 与 IETF MoQ 双模式下的收发闭环
+TEST(RtcE2ETest, PureC99AbiDataChannelWebRtcP2pAndMoqE2E) {
+  struct CDataCtx {
+    std::mutex mu;
+    std::condition_variable cv;
+    rtc_client_t* peer_for_trickle = nullptr;
+    bool connected = false;
+    int rx_cid = -1;
+    std::string rx_msg;
+  };
+
+  auto fill_cbs = [](rtc_callbacks_t* cbs) {
+    std::memset(cbs, 0, sizeof(*cbs));
+    cbs->on_connection_state = [](void* ud, rtc_connection_state_e st, int) {
+      auto* c = static_cast<CDataCtx*>(ud);
+      if (st == RTC_CONN_STATE_CONNECTED) {
+        std::lock_guard<std::mutex> lk(c->mu);
+        c->connected = true;
+        c->cv.notify_all();
+      }
+    };
+    cbs->on_local_ice_candidate = [](void* ud, const char*, int,
+                                     const char* cand) {
+      auto* c = static_cast<CDataCtx*>(ud);
+      rtc_client_t* p = nullptr;
+      {
+        std::lock_guard<std::mutex> lk(c->mu);
+        p = c->peer_for_trickle;
+      }
+      if (p != nullptr) {
+        rtc_client_add_remote_ice_candidate(p, cand);
+      }
+    };
+    cbs->on_data_channel_state = [](void* ud, const char*, int cid, const char*,
+                                    rtc_data_channel_state_e st) {
+      auto* c = static_cast<CDataCtx*>(ud);
+      if (st == RTC_DATA_CHANNEL_OPEN) {
+        std::lock_guard<std::mutex> lk(c->mu);
+        c->rx_cid = cid;
+        c->cv.notify_all();
+      }
+    };
+    cbs->on_data_channel_message = [](void* ud, const char*, int, bool,
+                                      const uint8_t* data, size_t sz) {
+      auto* c = static_cast<CDataCtx*>(ud);
+      std::lock_guard<std::mutex> lk(c->mu);
+      c->rx_msg.assign(reinterpret_cast<const char*>(data), sz);
+      c->cv.notify_all();
+    };
+  };
+
+  // (A) C99 WebRTC P2P DataChannel
+  {
+    rtc_config_t cfg{};
+    cfg.transport_mode = RTC_TRANSPORT_MODE_WEBRTC_P2P;
+    cfg.publish_codec = RTC_CODEC_H264;
+    rtc_callbacks_t cbs{};
+    fill_cbs(&cbs);
+
+    CDataCtx ctx_a;
+    CDataCtx ctx_b;
+    rtc_client_t* ca = rtc_client_create(&cfg, &cbs, &ctx_a);
+    rtc_client_t* cb = rtc_client_create(&cfg, &cbs, &ctx_b);
+    ctx_a.peer_for_trickle = cb;
+    ctx_b.peer_for_trickle = ca;
+
+    rtc_data_channel_init_t dc_init;
+    rtc_data_channel_init_default(&dc_init, "c99_p2p_dc");
+    const int cid = rtc_client_create_data_channel(ca, &dc_init);
+    ASSERT_GE(cid, 0);
+
+    const char* kMsg = "hello_from_c99_webrtc_dc";
+    ASSERT_EQ(rtc_client_send_data(ca, cid,
+                                   reinterpret_cast<const uint8_t*>(kMsg),
+                                   std::strlen(kMsg), false),
+              RTC_OK);
+
+    char offer[4096]{};
+    char answer[4096]{};
+    ASSERT_EQ(rtc_client_create_offer(ca, offer, sizeof(offer)), RTC_OK);
+    ASSERT_EQ(rtc_client_set_remote_description(cb, "offer", offer, answer,
+                                                sizeof(answer)),
+              RTC_OK);
+    ASSERT_EQ(rtc_client_set_remote_description(ca, "answer", answer, nullptr,
+                                                0),
+              RTC_OK);
+
+    {
+      std::unique_lock<std::mutex> lk(ctx_b.mu);
+      ASSERT_TRUE(ctx_b.cv.wait_for(lk, std::chrono::milliseconds(4000), [&]() {
+        return ctx_b.rx_msg == kMsg;
+      }));
+    }
+    EXPECT_EQ(rtc_client_close_data_channel(ca, cid), RTC_OK);
+    ctx_a.peer_for_trickle = nullptr;
+    ctx_b.peer_for_trickle = nullptr;
+    rtc_client_destroy(ca);
+    rtc_client_destroy(cb);
+  }
+
+  // (B) C99 IETF MoQ DataChannel
+  {
+    EmbeddedMoqRelayServer relay("127.0.0.1");
+    ASSERT_TRUE(relay.Start(0));
+    const std::string moq_url =
+        "moq://127.0.0.1:" + std::to_string(relay.udp_port());
+
+    rtc_config_t cfg{};
+    cfg.transport_mode = RTC_TRANSPORT_MODE_MOQ;
+    cfg.signaling_or_moq_url = moq_url.c_str();
+    cfg.publish_codec = RTC_CODEC_H264;
+    rtc_callbacks_t cbs{};
+    fill_cbs(&cbs);
+
+    CDataCtx ctx_pub;
+    CDataCtx ctx_sub;
+    rtc_client_t* cpub = rtc_client_create(&cfg, &cbs, &ctx_pub);
+    rtc_client_t* csub = rtc_client_create(&cfg, &cbs, &ctx_sub);
+    ASSERT_EQ(rtc_client_join_room(cpub, "c99_moq_dc", "pub"), RTC_OK);
+    ASSERT_EQ(rtc_client_join_room(csub, "c99_moq_dc", "sub"), RTC_OK);
+
+    {
+      std::unique_lock<std::mutex> lk(ctx_sub.mu);
+      ASSERT_TRUE(ctx_sub.cv.wait_for(lk, std::chrono::milliseconds(3000),
+                                      [&]() { return ctx_sub.connected; }));
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(60));
+
+    rtc_data_channel_init_t dc_init;
+    rtc_data_channel_init_default(&dc_init, "c99_moq_cmd");
+    const int cid = rtc_client_create_data_channel(cpub, &dc_init);
+    ASSERT_GE(cid, 0);
+    const char* kMoqMsg = "hello_from_c99_moq_dc";
+    ASSERT_EQ(rtc_client_send_data(cpub, cid,
+                                   reinterpret_cast<const uint8_t*>(kMoqMsg),
+                                   std::strlen(kMoqMsg), false),
+              RTC_OK);
+
+    {
+      std::unique_lock<std::mutex> lk(ctx_sub.mu);
+      ASSERT_TRUE(ctx_sub.cv.wait_for(lk, std::chrono::milliseconds(3000), [&]() {
+        return ctx_sub.rx_msg == kMoqMsg;
+      }));
+    }
+    rtc_client_leave_room(csub);
+    rtc_client_leave_room(cpub);
+    rtc_client_destroy(csub);
+    rtc_client_destroy(cpub);
+    relay.Stop();
+  }
+}
+
 }  // namespace
 }  // namespace rtc

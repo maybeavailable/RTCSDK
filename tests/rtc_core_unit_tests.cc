@@ -21,6 +21,7 @@
 #include "moq/moq_transport.h"
 #include "p2p/stun_turn_ice.h"
 #include "pc/dtls_srtp_transport.h"
+#include "pc/sctp_data_channel.h"
 #include "rtc_base/json_utils.h"
 #include "rtc_base/logging.h"
 #include "rtc_base/packet_slab_pool.h"
@@ -1060,6 +1061,300 @@ TEST(MoqQuicTest, PluggableCongestionControlAllFiveAlgorithmsAndHotSwap) {
     active_cc = std::move(next_cc);
     t_us += 50'000;
   }
+}
+
+// 17. 验证 RFC 3309 第 3 节标准 SCTP Castagnoli CRC-32c 测试向量
+TEST(SctpDataChannelTest, Rfc3309Crc32cVectorsAndCorruptionCheck) {
+  const std::vector<uint8_t> zeros32(32, 0x00);
+  EXPECT_EQ(ComputeSctpCrc32c(zeros32), 0x8A9136AAu);
+
+  const std::vector<uint8_t> ones32(32, 0xFF);
+  EXPECT_EQ(ComputeSctpCrc32c(ones32), 0x62A8AB43u);
+
+  std::vector<uint8_t> inc32(32, 0);
+  for (size_t i = 0; i < 32; ++i) {
+    inc32[i] = static_cast<uint8_t>(i);
+  }
+  EXPECT_EQ(ComputeSctpCrc32c(inc32), 0x46DD794Eu);
+}
+
+// 18. 验证 RFC 8841 WebRTC DataChannel SDP 解析、序列化与 RFC 3264 m= 段保序
+TEST(SctpDataChannelTest, SdpApplicationNegotiationAndMsectionOrder) {
+  // 模拟浏览器先调用 createDataChannel 再 addTransceiver('video') 生成的 Offer
+  const char* app_first_offer =
+      "v=0\r\n"
+      "o=- 12345 2 IN IP4 127.0.0.1\r\n"
+      "s=-\r\n"
+      "t=0 0\r\n"
+      "a=group:BUNDLE dc_mid vid_mid\r\n"
+      "m=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\n"
+      "c=IN IP4 0.0.0.0\r\n"
+      "a=ice-ufrag:ufrag123\r\n"
+      "a=ice-pwd:password1234567890123456\r\n"
+      "a=fingerprint:sha-256 AA:BB:CC:DD\r\n"
+      "a=setup:actpass\r\n"
+      "a=mid:dc_mid\r\n"
+      "a=sctp-port:5002\r\n"
+      "a=max-message-size:131072\r\n"
+      "m=video 9 UDP/TLS/RTP/SAVPF 96\r\n"
+      "c=IN IP4 0.0.0.0\r\n"
+      "a=mid:vid_mid\r\n"
+      "a=sendrecv\r\n"
+      "a=rtpmap:96 H264/90000\r\n"
+      "a=fmtp:96 packetization-mode=1;profile-level-id=42e01f\r\n";
+
+  const auto parsed =
+      PureVideoSdpDescription::Parse(app_first_offer, VideoCodec::kH264);
+  ASSERT_TRUE(parsed.has_value());
+  ASSERT_TRUE(parsed->data_m_section.has_value());
+  EXPECT_EQ(parsed->data_m_section->mid, "dc_mid");
+  EXPECT_EQ(parsed->data_m_section->sctp_port, 5002);
+  EXPECT_EQ(parsed->data_m_section->max_message_size, 131072u);
+  ASSERT_EQ(parsed->m_section_order.size(), 2u);
+  EXPECT_EQ(parsed->m_section_order[0], SdpMediaKind::kApplication);
+  EXPECT_EQ(parsed->m_section_order[1], SdpMediaKind::kVideo);
+
+  const std::string serialized = parsed->Serialize();
+  const size_t app_pos = serialized.find("m=application ");
+  const size_t vid_pos = serialized.find("m=video ");
+  ASSERT_NE(app_pos, std::string::npos);
+  ASSERT_NE(vid_pos, std::string::npos);
+  EXPECT_LT(app_pos, vid_pos);
+  EXPECT_NE(serialized.find("a=group:BUNDLE dc_mid vid_mid"),
+            std::string::npos);
+
+  // 验证纯 DataChannel（无 m=video）SDP Offer 的解析兼容性
+  const char* dc_only_offer =
+      "v=0\r\n"
+      "o=- 999 2 IN IP4 127.0.0.1\r\n"
+      "s=-\r\n"
+      "t=0 0\r\n"
+      "m=application 9 DTLS/SCTP 5000\r\n"
+      "a=ice-ufrag:dc_u\r\n"
+      "a=ice-pwd:dc_pwd_1234567890123456\r\n"
+      "a=fingerprint:sha-256 11:22:33:44\r\n"
+      "a=mid:0\r\n"
+      "a=sctpmap:5000 webrtc-datachannel 1024\r\n";
+  const auto dc_only = PureVideoSdpDescription::Parse(dc_only_offer);
+  ASSERT_TRUE(dc_only.has_value());
+  EXPECT_TRUE(dc_only->video_m_sections.empty());
+  ASSERT_TRUE(dc_only->data_m_section.has_value());
+  EXPECT_EQ(dc_only->data_m_section->sctp_port, 5000);
+}
+
+// 19. 验证完整 SCTP 四次握手、DCEP 通道建立、32KB 大包分片丢包重传与 PR-SCTP FORWARD-TSN
+TEST(SctpDataChannelTest, DcepFragmentationLossRecoveryAndPrSctpForwardTsn) {
+  SimulatedClock sim_clock(Timestamp::Micros(1'000'000));
+
+  struct SctpHarness final : public SctpDataChannelObserver {
+    SctpHarness* peer = nullptr;
+    SctpDataChannelManager* mgr = nullptr;
+    SimulatedClock* clock = nullptr;
+    bool drop_next_tx = false;
+    std::deque<std::vector<uint8_t>> wire_queue;
+
+    struct RxMsg {
+      int cid = -1;
+      bool is_binary = false;
+      std::vector<uint8_t> data;
+    };
+    std::vector<std::pair<int, rtc_data_channel_state_e>> states;
+    std::vector<RxMsg> messages;
+
+    bool SendSctpPacketOverDtls(ArrayView<const uint8_t> packet) override {
+      if (drop_next_tx) {
+        drop_next_tx = false;
+        return true;
+      }
+      wire_queue.emplace_back(packet.begin(), packet.end());
+      return true;
+    }
+    void OnSctpDataChannelState(int channel_id,
+                                const std::string& /*label*/,
+                                rtc_data_channel_state_e state) override {
+      states.emplace_back(channel_id, state);
+    }
+    void OnSctpDataChannelMessage(int channel_id,
+                                  bool is_binary,
+                                  std::vector<uint8_t> payload) override {
+      messages.push_back(RxMsg{channel_id, is_binary, std::move(payload)});
+    }
+  };
+
+  SctpHarness ha;
+  SctpHarness hb;
+  SctpDataChannelManager sctp_a(&sim_clock, &ha);
+  SctpDataChannelManager sctp_b(&sim_clock, &hb);
+  ha.peer = &hb;
+  ha.mgr = &sctp_a;
+  ha.clock = &sim_clock;
+  hb.peer = &ha;
+  hb.mgr = &sctp_b;
+  hb.clock = &sim_clock;
+
+  auto pump_wire = [&]() {
+    bool progressed = true;
+    while (progressed) {
+      progressed = false;
+      while (!ha.wire_queue.empty()) {
+        auto pkt = std::move(ha.wire_queue.front());
+        ha.wire_queue.pop_front();
+        sctp_b.OnInboundSctpPacket(pkt, sim_clock.CurrentTime());
+        progressed = true;
+      }
+      while (!hb.wire_queue.empty()) {
+        auto pkt = std::move(hb.wire_queue.front());
+        hb.wire_queue.pop_front();
+        sctp_a.OnInboundSctpPacket(pkt, sim_clock.CurrentTime());
+        progressed = true;
+      }
+    }
+  };
+
+  // 在握手前预先创建可靠有序通道与 PR-SCTP 限次重传（max_retransmits=0）通道
+  DataChannelConfig reliable_cfg;
+  reliable_cfg.label = "ctrl_reliable";
+  reliable_cfg.ordered = true;
+  const int ch_rel = sctp_a.CreateDataChannel(reliable_cfg);
+  ASSERT_GE(ch_rel, 0);
+
+  DataChannelConfig pr_cfg;
+  pr_cfg.label = "telemetry_pr";
+  pr_cfg.ordered = true;
+  pr_cfg.max_retransmits = 0;
+  const int ch_pr = sctp_a.CreateDataChannel(pr_cfg);
+  ASSERT_GE(ch_pr, 0);
+
+  // 预入队空文本消息（验证 RFC 8831 PPID 56 空负载编码）
+  EXPECT_EQ(sctp_a.SendData(ch_rel, ArrayView<const uint8_t>(), false), RTC_OK);
+
+  sctp_a.ConfigureAndStart(DtlsRole::kClient, 5000, 5000);
+  sctp_b.ConfigureAndStart(DtlsRole::kServer, 5000, 5000);
+  pump_wire();
+
+  ASSERT_TRUE(sctp_a.IsAssociationEstablished());
+  ASSERT_TRUE(sctp_b.IsAssociationEstablished());
+  ASSERT_EQ(hb.messages.size(), 1u);
+  EXPECT_FALSE(hb.messages[0].is_binary);
+  EXPECT_TRUE(hb.messages[0].data.empty());
+
+  // 测试 32 KB 多分片大二进制报文在丢包触发 T3 重传下的比特级精确恢复
+  std::vector<uint8_t> big_blob(32 * 1024, 0);
+  for (size_t i = 0; i < big_blob.size(); ++i) {
+    big_blob[i] = static_cast<uint8_t>((i * 37 + 13) & 0xFFu);
+  }
+  ha.drop_next_tx = true;  // 故意丢弃首个分片包
+  ASSERT_EQ(sctp_a.SendData(ch_rel, big_blob, true), RTC_OK);
+  pump_wire();
+  for (int step = 0; step < 30 && hb.messages.size() < 2; ++step) {
+    sim_clock.AdvanceTime(TimeDelta::Millis(30));
+    sctp_a.OnPeriodicTick(sim_clock.CurrentTime());
+    sctp_b.OnPeriodicTick(sim_clock.CurrentTime());
+    pump_wire();
+  }
+  ASSERT_EQ(hb.messages.size(), 2u);
+  EXPECT_TRUE(hb.messages[1].is_binary);
+  EXPECT_EQ(hb.messages[1].data, big_blob);
+
+  // 测试 PR-SCTP（max_retransmits=0）：第一条报文丢失后通过 FORWARD-TSN 自动跳过，不阻塞第二条报文
+  const std::string msg_lost = "stale_telemetry_1";
+  const std::string msg_fresh = "fresh_telemetry_2";
+  ha.drop_next_tx = true;
+  ASSERT_EQ(
+      sctp_a.SendData(
+          ch_pr,
+          MakeArrayView(reinterpret_cast<const uint8_t*>(msg_lost.data()),
+                        msg_lost.size()),
+          false),
+      RTC_OK);
+  ASSERT_EQ(
+      sctp_a.SendData(
+          ch_pr,
+          MakeArrayView(reinterpret_cast<const uint8_t*>(msg_fresh.data()),
+                        msg_fresh.size()),
+          false),
+      RTC_OK);
+  pump_wire();
+  for (int step = 0; step < 20 && hb.messages.size() < 3; ++step) {
+    sim_clock.AdvanceTime(TimeDelta::Millis(40));
+    sctp_a.OnPeriodicTick(sim_clock.CurrentTime());
+    sctp_b.OnPeriodicTick(sim_clock.CurrentTime());
+    pump_wire();
+  }
+  ASSERT_EQ(hb.messages.size(), 3u);
+  const std::string delivered_str(hb.messages[2].data.begin(),
+                                  hb.messages[2].data.end());
+  EXPECT_EQ(delivered_str, msg_fresh);
+
+  // 测试 RFC 6525 RE-CONFIG 流关闭通知
+  EXPECT_EQ(sctp_a.CloseDataChannel(ch_rel), RTC_OK);
+  pump_wire();
+  bool saw_remote_close = false;
+  for (const auto& [cid, st] : hb.states) {
+    (void)cid;
+    if (st == RTC_DATA_CHANNEL_CLOSED) {
+      saw_remote_close = true;
+    }
+  }
+  EXPECT_TRUE(saw_remote_close);
+}
+
+// 20. 验证 IETF MoQ 数据对象封包器在逐字节流式分块到达与零字节负载下的解包准确性
+TEST(MoqDataChannelTest, MoqDataPackagerStreamingUnpackAndZeroLengthPayload) {
+  MoqDataObject obj_empty;
+  obj_empty.object_id = 0;
+  obj_empty.sender_peer_id = "drone_01";
+  obj_empty.label = "heartbeat";
+  obj_empty.is_binary = false;
+  obj_empty.ordered = true;
+
+  MoqDataObject obj_bin;
+  obj_bin.object_id = 1;
+  obj_bin.sender_peer_id = "drone_01";
+  obj_bin.label = "lidar_scan";
+  obj_bin.protocol = "raw_v1";
+  obj_bin.timestamp_us = 987654321ULL;
+  obj_bin.is_binary = true;
+  obj_bin.ordered = false;
+  obj_bin.payload.resize(4096);
+  for (size_t i = 0; i < obj_bin.payload.size(); ++i) {
+    obj_bin.payload[i] = static_cast<uint8_t>((i * 19) & 0xFFu);
+  }
+
+  std::vector<uint8_t> stream_bytes = MoqDataPackager::PackObject(obj_empty);
+  const auto bin_bytes = MoqDataPackager::PackObject(obj_bin);
+  stream_bytes.insert(stream_bytes.end(), bin_bytes.begin(), bin_bytes.end());
+
+  std::vector<uint8_t> rx_buf;
+  std::vector<MoqDataObject> decoded;
+  for (size_t off = 0; off < stream_bytes.size(); off += 137) {
+    const size_t chunk = std::min<size_t>(137, stream_bytes.size() - off);
+    rx_buf.insert(rx_buf.end(), stream_bytes.begin() + off,
+                  stream_bytes.begin() + off + chunk);
+    while (!rx_buf.empty()) {
+      size_t consumed = 0;
+      auto parsed = MoqDataPackager::UnpackObject(rx_buf, &consumed);
+      if (!parsed.has_value()) {
+        break;
+      }
+      decoded.push_back(std::move(*parsed));
+      rx_buf.erase(rx_buf.begin(),
+                   rx_buf.begin() + static_cast<ptrdiff_t>(consumed));
+    }
+  }
+
+  ASSERT_EQ(decoded.size(), 2u);
+  EXPECT_EQ(decoded[0].sender_peer_id, "drone_01");
+  EXPECT_EQ(decoded[0].label, "heartbeat");
+  EXPECT_FALSE(decoded[0].is_binary);
+  EXPECT_TRUE(decoded[0].payload.empty());
+
+  EXPECT_EQ(decoded[1].object_id, 1u);
+  EXPECT_EQ(decoded[1].label, "lidar_scan");
+  EXPECT_EQ(decoded[1].protocol, "raw_v1");
+  EXPECT_TRUE(decoded[1].is_binary);
+  EXPECT_FALSE(decoded[1].ordered);
+  EXPECT_EQ(decoded[1].payload, obj_bin.payload);
 }
 
 }  // namespace

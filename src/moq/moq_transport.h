@@ -9,9 +9,12 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
+#include <set>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -82,6 +85,31 @@ struct MoqSubgroupHeader {
                                                  size_t* consumed);
 };
 
+// MoQ 数据轨道固定轨道别名约定（与视频低清层=1、高清层=2 隔离解复用）。
+inline constexpr uint64_t kMoqUpstreamDataTrackAlias = 3;
+inline constexpr uint64_t kMoqDownstreamDataTrackAlias = 50;
+
+// IETF MoQ 通用数据通道对象容器（承载二进制或 UTF-8 消息及通道元数据）。
+struct MoqDataObject {
+  uint64_t object_id = 0;
+  std::string sender_peer_id;
+  std::string label;
+  std::string protocol;
+  uint64_t timestamp_us = 0;
+  bool is_binary = true;
+  bool ordered = true;
+  bool is_close = false;
+  std::vector<uint8_t> payload;
+};
+
+class MoqDataPackager {
+ public:
+  static std::vector<uint8_t> PackObject(const MoqDataObject& obj);
+  static std::optional<MoqDataObject> UnpackObject(
+      ArrayView<const uint8_t> data,
+      size_t* consumed);
+};
+
 class LocFramePackager {
  public:
   static std::vector<uint8_t> PackObject(uint64_t object_id,
@@ -126,6 +154,11 @@ class MoqRelayBackend final : public ISessionBackend,
                             SpatialLayer preferred_layer) override;
   int UnsubscribeRemoteTrack(const std::string& track_id) override;
   int RequestRemoteKeyFrame(const std::string& track_id) override;
+  int CreateDataChannel(const DataChannelConfig& config) override;
+  int SendData(int channel_id,
+               ArrayView<const uint8_t> payload,
+               bool is_binary) override;
+  int CloseDataChannel(int channel_id) override;
   int SetQuicCongestionControl(rtc_quic_cc_algo_e algo) override;
   int SetCustomQuicCongestionController(
       std::shared_ptr<IQuicCongestionControllerFactory> factory) override;
@@ -179,8 +212,32 @@ class MoqRelayBackend final : public ISessionBackend,
   void HandleInboundUnidirectionalData(uint64_t stream_id,
                                        ArrayView<const uint8_t> data,
                                        bool fin);
+  void HandleInboundDataStreamObjects(InboundStreamState* st);
+  int EnsureDataChannelForLabelOnWorker(const std::string& label,
+                                        const DataChannelConfig* explicit_cfg);
+  void TransmitMoqDataMessageOnWorker(int channel_id,
+                                      ArrayView<const uint8_t> payload,
+                                      bool is_binary,
+                                      bool is_close);
   void OnPeriodicMaintenanceTick();
   void DrainDecodableFrames(SubscribedTrackContext* sub);
+
+  struct PendingMoqDataMsg {
+    std::vector<uint8_t> payload;
+    bool is_binary = true;
+  };
+
+  struct MoqDataChannelState {
+    int channel_id = 0;
+    DataChannelConfig config;
+    rtc_data_channel_state_e state = RTC_DATA_CHANNEL_CONNECTING;
+    bool local_created = false;
+    bool announced = false;
+    bool local_open_notified = false;
+    std::optional<uint64_t> ordered_stream_id;
+    uint64_t next_object_id = 0;
+    std::deque<PendingMoqDataMsg> pending_messages;
+  };
 
   Clock* const clock_;
   SdkTaskQueues* const queues_;
@@ -206,6 +263,15 @@ class MoqRelayBackend final : public ISessionBackend,
   std::map<std::string, std::unique_ptr<SubscribedTrackContext>> subscriptions_;
   std::map<uint64_t, std::string> alias_to_track_id_;
   std::map<uint64_t, InboundStreamState> inbound_streams_;
+
+  // MoQ 数据轨道通道状态表与句柄校验集。
+  int next_dc_id_ = 0;
+  std::map<int, MoqDataChannelState> data_channels_;
+  std::map<std::string, int> label_to_dc_id_;
+  std::set<std::pair<std::string, int>> notified_remote_dc_peers_;
+  std::vector<std::pair<uint64_t, Timestamp>> ttl_data_streams_;
+  mutable std::mutex dc_handles_mu_;
+  std::set<int> valid_dc_ids_;
 
   // 用于 OnBackendStatsSnapshot 回调的遥测统计计数器。
   Timestamp last_stats_time_ = Timestamp::MinusInfinity();

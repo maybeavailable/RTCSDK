@@ -3,6 +3,7 @@
 {
   global:
     rtc_client_*;
+    rtc_data_channel_*;
     rtc_quic_cc_*;
     rtc_set_log_*;
     rtc_enable_stderr_logging;

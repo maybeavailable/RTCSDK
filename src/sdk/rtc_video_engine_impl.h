@@ -46,6 +46,13 @@ class RtcVideoEngineImpl final : public RtcVideoEngine,
                            std::string* out_answer_sdp = nullptr) override;
   int AddRemoteIceCandidate(std::string_view candidate_sdp) override;
 
+  int CreateDataChannel(const DataChannelConfig& config) override;
+  int SendData(int channel_id,
+               const uint8_t* data,
+               size_t size,
+               bool is_binary = true) override;
+  int CloseDataChannel(int channel_id) override;
+
   void OnBackendConnectionState(rtc_connection_state_e state,
                                 int reason_code) override;
   void OnBackendTargetTransferRate(const TargetTransferRate& rate) override;
@@ -62,6 +69,14 @@ class RtcVideoEngineImpl final : public RtcVideoEngine,
   void OnBackendLocalIceCandidate(const std::string& sdp_mid,
                                   int sdp_mline_index,
                                   const std::string& candidate) override;
+  void OnBackendDataChannelState(const std::string& peer_id,
+                                 int channel_id,
+                                 const std::string& label,
+                                 rtc_data_channel_state_e state) override;
+  void OnBackendDataChannelMessage(const std::string& peer_id,
+                                   int channel_id,
+                                   bool is_binary,
+                                   std::vector<uint8_t> payload) override;
 
   SdkTaskQueues* task_queues() { return queues_.get(); }
 
