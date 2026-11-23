@@ -47,10 +47,14 @@ typedef void (*rtc_log_callback_fn)(void* user_data,
                                     const char* message);
 
 typedef enum {
-  // 1 对 1 纯 WebRTC P2P 模式（完整 ICE + DTLS-SRTP，兼容 W3C 浏览器）。
+  // 1 对 1 纯 WebRTC P2P 模式（完整 ICE + DTLS-SRTP + SCTP，兼容 W3C 浏览器）。
   RTC_TRANSPORT_MODE_WEBRTC_P2P = 0,
-  // 1 对多 / 多路拉流 IETF Media over QUIC (MoQ) 中继模式。
+  // 1 对多 / 多路拉流 IETF Media over QUIC（draft-ietf-moq-transport-17）中继模式
+  // （moqt:// 默认走原生 QUIC ALPN "moqt-17"；https:// 或 wt:// 自动切换至 HTTP/3 + WebTransport）。
   RTC_TRANSPORT_MODE_MOQ = 1,
+  // 显式通过 HTTP/3 + WebTransport（RFC 9114 + QPACK + draft-ietf-webtrans-http3，ALPN "h3"）
+  // 承载 IETF MoQ（draft-17，WT-Protocol: "moqt-17"）的中继模式。
+  RTC_TRANSPORT_MODE_MOQ_WEBTRANSPORT = 2,
 } rtc_transport_mode_e;
 
 typedef enum {

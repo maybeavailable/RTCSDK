@@ -52,6 +52,7 @@ set(RTC_CORE_SOURCES
   src/signaling/wss_signaling_client.cc
   src/moq/quic_congestion_control.cc
   src/moq/asio_quic_transport.cc
+  src/moq/http3_webtransport.cc
   src/moq/moq_transport.cc
   src/call/webrtc_p2p_backend.cc
   src/sdk/rtc_video_engine_impl.cc
@@ -98,10 +99,11 @@ if(RTC_BUILD_SHARED_SDK)
   endif()
 endif()
 
-# 4. 配套轻量级服务端（零媒体转发 P2P WS 信令服务 + MoQ QUIC 中继服务）
+# 4. 配套轻量级服务端（P2P WS 信令服务 + 可选内置 STUN/TURN 中继服务 + MoQ QUIC 中继服务）
 if(RTC_BUILD_SERVERS)
   add_library(rtc_companion_servers STATIC
     src/server/p2p_ws_signaling_server.cc
+    src/server/stun_turn_relay_server.cc
     src/server/embedded_moq_relay.cc
   )
   target_include_directories(rtc_companion_servers PUBLIC
@@ -172,6 +174,16 @@ if(RTC_BUILD_EXAMPLES AND RTC_BUILD_SERVERS)
   )
   target_compile_options(rtc_example_browser_p2p PRIVATE ${RTC_STRICT_CXX_FLAGS})
   target_link_libraries(rtc_example_browser_p2p PRIVATE rtc_video_core)
+
+  # 5.6 浏览器 HTML5 <canvas> IETF MoQ (draft-17) WebTransport + WebCodecs 实时播放器与自测示例
+  add_executable(rtc_example_browser_moq
+    examples/browser_moq_player_demo.cc
+  )
+  target_compile_options(rtc_example_browser_moq PRIVATE ${RTC_STRICT_CXX_FLAGS})
+  target_link_libraries(rtc_example_browser_moq PRIVATE
+    rtc_companion_servers
+    rtc_video_core
+  )
 endif()
 
 # 6. 单元测试、弱网端到端（E2E）测试及完整 C99/C++17 示例验证套件
@@ -246,6 +258,11 @@ if(RTC_BUILD_TESTS)
     if(TARGET rtc_example_browser_p2p)
       add_test(NAME SdkExampleBrowserHttpP2p
         COMMAND rtc_example_browser_p2p --self-test
+      )
+    endif()
+    if(TARGET rtc_example_browser_moq)
+      add_test(NAME SdkExampleBrowserMoqPlayer
+        COMMAND rtc_example_browser_moq --self-test
       )
     endif()
   endif()

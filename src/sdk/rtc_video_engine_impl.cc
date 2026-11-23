@@ -40,8 +40,10 @@ RtcVideoEngineImpl::RtcVideoEngineImpl(
     std::shared_ptr<IMoqQuicEngine> custom_moq_quic_engine)
     : clock_(Clock::GetRealTimeClock()),
       config_(config),
-      use_simulcast_(config.transport_mode == RTC_TRANSPORT_MODE_MOQ &&
-                     config.enable_simulcast),
+      use_simulcast_(
+          (config.transport_mode == RTC_TRANSPORT_MODE_MOQ ||
+           config.transport_mode == RTC_TRANSPORT_MODE_MOQ_WEBTRANSPORT) &&
+          config.enable_simulcast),
       observer_(observer),
       queues_(std::make_unique<SdkTaskQueues>()),
       slab_pool_(PacketSlabPool::Create(2048)),
@@ -50,14 +52,18 @@ RtcVideoEngineImpl::RtcVideoEngineImpl(
           config.low_layer_max_bps, 400'000, 80'000, config.max_bitrate_bps}),
       cb_checker_(queues_->callback()),
       cb_safety_(PendingTaskSafetyFlag::CreateDetached()) {
+  const bool is_moq =
+      (config_.transport_mode == RTC_TRANSPORT_MODE_MOQ ||
+       config_.transport_mode == RTC_TRANSPORT_MODE_MOQ_WEBTRANSPORT);
   RTC_LOG(kInfo) << "RtcVideoEngine created (mode="
-                 << (config_.transport_mode == RTC_TRANSPORT_MODE_MOQ
-                         ? "IETF_MoQ"
-                         : "WebRTC_P2P")
+                 << (config_.transport_mode ==
+                             RTC_TRANSPORT_MODE_MOQ_WEBTRANSPORT
+                         ? "IETF_MoQ_WebTransport_H3"
+                         : (is_moq ? "IETF_MoQ_Draft17" : "WebRTC_P2P"))
                  << ", codec="
                  << (config_.publish_codec == RTC_CODEC_H265 ? "H265" : "H264")
                  << ", simulcast=" << (use_simulcast_ ? "on" : "off") << ")";
-  if (config_.transport_mode == RTC_TRANSPORT_MODE_MOQ) {
+  if (is_moq) {
     backend_ = std::make_unique<MoqRelayBackend>(
         clock_, queues_.get(), config_, this,
         std::move(custom_moq_quic_engine));
@@ -226,7 +232,8 @@ void RtcVideoEngineImpl::OnBackendTargetTransferRate(
     const TargetTransferRate& rate) {
   const double loss = std::clamp(rate.loss_rate_ratio, 0.0, 0.45);
   double overhead_ratio = 0.0;
-  if (config_.transport_mode == RTC_TRANSPORT_MODE_MOQ) {
+  if (config_.transport_mode == RTC_TRANSPORT_MODE_MOQ ||
+      config_.transport_mode == RTC_TRANSPORT_MODE_MOQ_WEBTRANSPORT) {
     // LOC 封装头 + QUIC 1-RTT 流帧头（约 2.5%）+ ARQ 流重传开销。
     overhead_ratio = 0.025 + (loss / (1.0 - loss));
   } else {

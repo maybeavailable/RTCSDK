@@ -212,11 +212,30 @@ std::vector<uint8_t> StunMessage::Serialize(std::string_view integrity_key,
     WriteBigEndian16(b, *channel_number_);
     AppendAttr(stun_attr_type::kChannelNumber, b, 4, &out);
   }
-  if (error_code_.has_value()) {
+  if (lifetime_.has_value()) {
     uint8_t b[4]{};
-    b[2] = static_cast<uint8_t>(*error_code_ / 100);
-    b[3] = static_cast<uint8_t>(*error_code_ % 100);
-    AppendAttr(stun_attr_type::kErrorCode, b, 4, &out);
+    WriteBigEndian32(b, *lifetime_);
+    AppendAttr(stun_attr_type::kLifetime, b, 4, &out);
+  }
+  if (requested_transport_.has_value()) {
+    uint8_t b[4]{*requested_transport_, 0, 0, 0};
+    AppendAttr(stun_attr_type::kRequestedTransport, b, 4, &out);
+  }
+  if (software_.has_value()) {
+    AppendAttr(stun_attr_type::kSoftware,
+               reinterpret_cast<const uint8_t*>(software_->data()),
+               software_->size(), &out);
+  }
+  if (error_code_.has_value()) {
+    std::vector<uint8_t> err_val(4 + error_reason_.size(), 0);
+    err_val[2] = static_cast<uint8_t>(*error_code_ / 100);
+    err_val[3] = static_cast<uint8_t>(*error_code_ % 100);
+    if (!error_reason_.empty()) {
+      std::memcpy(err_val.data() + 4, error_reason_.data(),
+                  error_reason_.size());
+    }
+    AppendAttr(stun_attr_type::kErrorCode, err_val.data(), err_val.size(),
+               &out);
   }
   if (xor_mapped_.has_value()) {
     AppendXorEndpointAttr(stun_attr_type::kXorMappedAddress, *xor_mapped_,
@@ -226,9 +245,11 @@ std::vector<uint8_t> StunMessage::Serialize(std::string_view integrity_key,
     AppendXorEndpointAttr(stun_attr_type::kXorRelayedAddress, *xor_relayed_,
                           tx_id_, &out);
   }
-  if (xor_peer_.has_value()) {
-    AppendXorEndpointAttr(stun_attr_type::kXorPeerAddress, *xor_peer_, tx_id_,
-                          &out);
+  for (const auto& xp : xor_peers_) {
+    AppendXorEndpointAttr(stun_attr_type::kXorPeerAddress, xp, tx_id_, &out);
+  }
+  if (data_.has_value()) {
+    AppendAttr(stun_attr_type::kData, data_->data(), data_->size(), &out);
   }
 
   if (!integrity_key.empty()) {
@@ -322,9 +343,29 @@ std::optional<StunMessage> StunMessage::Parse(
           msg.channel_number_ = ReadBigEndian16(val);
         }
         break;
+      case stun_attr_type::kLifetime:
+        if (attr_len == 4) {
+          msg.lifetime_ = ReadBigEndian32(val);
+        }
+        break;
+      case stun_attr_type::kRequestedTransport:
+        if (attr_len >= 1) {
+          msg.requested_transport_ = val[0];
+        }
+        break;
+      case stun_attr_type::kData:
+        msg.data_.emplace(val, val + attr_len);
+        break;
+      case stun_attr_type::kSoftware:
+        msg.software_.emplace(reinterpret_cast<const char*>(val), attr_len);
+        break;
       case stun_attr_type::kErrorCode:
         if (attr_len >= 4) {
           msg.error_code_ = static_cast<int>(val[2] & 0x07) * 100 + val[3];
+          if (attr_len > 4) {
+            msg.error_reason_.assign(reinterpret_cast<const char*>(val + 4),
+                                     attr_len - 4);
+          }
         }
         break;
       case stun_attr_type::kXorMappedAddress:
@@ -334,9 +375,12 @@ std::optional<StunMessage> StunMessage::Parse(
         msg.xor_relayed_ = ParseXorEndpointAttr(val, attr_len, msg.tx_id_);
         break;
       case stun_attr_type::kXorPeerAddress:
-        msg.xor_peer_ = ParseXorEndpointAttr(val, attr_len, msg.tx_id_);
+        if (auto ep = ParseXorEndpointAttr(val, attr_len, msg.tx_id_)) {
+          msg.xor_peers_.push_back(*ep);
+        }
         break;
       case stun_attr_type::kMessageIntegrity:
+        msg.has_message_integrity_ = true;
         if (!verify_integrity_key.empty()) {
           if (attr_len != 20) {
             return std::nullopt;
@@ -506,6 +550,160 @@ std::optional<IceCandidate> IceCandidate::FromSdpAttribute(
   return c;
 }
 
+bool IceTransportChannel::ParseIceServerUri(std::string_view uri,
+                                            std::string_view username,
+                                            std::string_view password,
+                                            TurnServerSpec* out_spec) {
+  if (out_spec == nullptr) {
+    return false;
+  }
+  while (!uri.empty() &&
+         (uri.front() == ' ' || uri.front() == '\t' || uri.front() == '\r' ||
+          uri.front() == '\n')) {
+    uri.remove_prefix(1);
+  }
+  while (!uri.empty() &&
+         (uri.back() == ' ' || uri.back() == '\t' || uri.back() == '\r' ||
+          uri.back() == '\n')) {
+    uri.remove_suffix(1);
+  }
+
+  const size_t scheme_colon = uri.find(':');
+  if (scheme_colon == std::string_view::npos || scheme_colon == 0) {
+    return false;
+  }
+  std::string scheme(uri.substr(0, scheme_colon));
+  std::transform(scheme.begin(), scheme.end(), scheme.begin(),
+                 [](unsigned char c) {
+                   return static_cast<char>((c >= 'A' && c <= 'Z')
+                                                ? (c - 'A' + 'a')
+                                                : c);
+                 });
+
+  bool is_turn = false;
+  uint16_t default_port = 3478;
+  if (scheme == "stun") {
+    is_turn = false;
+    default_port = 3478;
+  } else if (scheme == "stuns") {
+    is_turn = false;
+    default_port = 5349;
+  } else if (scheme == "turn") {
+    is_turn = true;
+    default_port = 3478;
+  } else if (scheme == "turns") {
+    is_turn = true;
+    default_port = 5349;
+  } else {
+    return false;
+  }
+
+  std::string_view rest = uri.substr(scheme_colon + 1);
+  if (rest.substr(0, 2) == "//") {
+    rest.remove_prefix(2);
+  }
+
+  const size_t q = rest.find('?');
+  if (q != std::string_view::npos) {
+    std::string query(rest.substr(q + 1));
+    std::transform(query.begin(), query.end(), query.begin(),
+                   [](unsigned char c) {
+                     return static_cast<char>((c >= 'A' && c <= 'Z')
+                                                  ? (c - 'A' + 'a')
+                                                  : c);
+                   });
+    const size_t tpos = query.find("transport=");
+    if (tpos != std::string::npos) {
+      std::string_view tval = std::string_view(query).substr(tpos + 10);
+      const size_t amp = tval.find('&');
+      if (amp != std::string_view::npos) {
+        tval = tval.substr(0, amp);
+      }
+      if (tval != "udp") {
+        return false;
+      }
+    }
+    rest = rest.substr(0, q);
+  }
+
+  if (rest.empty()) {
+    return false;
+  }
+
+  std::string host;
+  uint16_t port = default_port;
+  auto parse_port_strict = [](std::string_view pstr, uint16_t* out_p) -> bool {
+    if (pstr.empty() || pstr.size() > 5) {
+      return false;
+    }
+    uint32_t acc = 0;
+    for (char ch : pstr) {
+      if (ch < '0' || ch > '9') {
+        return false;
+      }
+      acc = acc * 10 + static_cast<uint32_t>(ch - '0');
+    }
+    if (acc == 0 || acc > 65535) {
+      return false;
+    }
+    *out_p = static_cast<uint16_t>(acc);
+    return true;
+  };
+
+  if (rest.front() == '[') {
+    const size_t rbr = rest.find(']');
+    if (rbr == std::string_view::npos || rbr <= 1) {
+      return false;
+    }
+    host = std::string(rest.substr(1, rbr - 1));
+    const std::string_view tail = rest.substr(rbr + 1);
+    if (!tail.empty()) {
+      if (tail.front() != ':' || !parse_port_strict(tail.substr(1), &port)) {
+        return false;
+      }
+    }
+  } else {
+    const size_t first_colon = rest.find(':');
+    const size_t last_colon = rest.rfind(':');
+    if (first_colon != last_colon) {
+      // 未加方括号的多冒号字符串非法（IPv6 字面量必须使用方括号包裹）。
+      return false;
+    }
+    if (last_colon != std::string_view::npos) {
+      host = std::string(rest.substr(0, last_colon));
+      if (!parse_port_strict(rest.substr(last_colon + 1), &port)) {
+        return false;
+      }
+    } else {
+      host = std::string(rest);
+    }
+  }
+
+  if (host.empty()) {
+    return false;
+  }
+  for (unsigned char ch : host) {
+    if (ch <= 0x20 || ch == '/' || ch == '\\' || ch == '@' || ch == '#') {
+      return false;
+    }
+  }
+
+  TurnServerSpec spec;
+  spec.host = host;
+  spec.port = port;
+  spec.username = std::string(username);
+  spec.password = std::string(password);
+  spec.is_turn = is_turn;
+
+  boost::system::error_code ec;
+  const auto ip = boost::asio::ip::make_address(host, ec);
+  if (!ec) {
+    spec.server_endpoint = boost::asio::ip::udp::endpoint(ip, port);
+  }
+  *out_spec = std::move(spec);
+  return true;
+}
+
 IceTransportChannel::IceTransportChannel(Clock* clock,
                                          TaskQueueBoost* network_queue,
                                          IceTransportObserver* observer,
@@ -520,14 +718,25 @@ IceTransportChannel::IceTransportChannel(Clock* clock,
 }
 
 IceTransportChannel::~IceTransportChannel() {
-  network_queue_->Invoke([this]() {
-    RTC_DCHECK_RUN_ON(&net_checker_);
+  auto cleanup = [this]() {
     safety_.flag()->SetNotAlive();
+    if (resolver_) {
+      resolver_->cancel();
+      resolver_.reset();
+    }
     if (socket_ && socket_->is_open()) {
       boost::system::error_code ec;
       socket_->close(ec);
     }
-  });
+  };
+  if (!network_queue_->IsStopped()) {
+    network_queue_->Invoke([this, &cleanup]() {
+      RTC_DCHECK_RUN_ON(&net_checker_);
+      cleanup();
+    });
+  } else {
+    cleanup();
+  }
 }
 
 void IceTransportChannel::SetIceControlling(bool controlling) {
@@ -631,23 +840,181 @@ bool IceTransportChannel::StartGatheringAndBind(uint16_t preferred_local_port) {
     RTC_LOG(kInfo) << "ICE socket bound on UDP port=" << bound_port_
                    << " gathered_host_candidates=" << local_candidates_.size();
 
+    resolver_ = std::make_unique<boost::asio::ip::udp::resolver>(
+        network_queue_->io_context());
+    resolved_servers_.clear();
+    resolved_servers_.reserve(servers_.size());
     for (const auto& srv : servers_) {
-      if (!srv.is_turn) {
-        StunMessage req(StunMessageType::kBindingRequest);
-        auto bytes = req.Serialize("", true);
-        boost::system::error_code send_ec;
-        socket_->send_to(boost::asio::buffer(bytes), srv.server_endpoint, 0,
-                         send_ec);
-      } else {
-        StartTurnAllocation(srv);
+      ResolvedServerEntry entry;
+      entry.spec = srv;
+      if (srv.server_endpoint.port() != 0 &&
+          srv.server_endpoint.address().is_v4()) {
+        entry.resolved_endpoints.push_back(srv.server_endpoint);
+      }
+      resolved_servers_.push_back(std::move(entry));
+    }
+    NotifyServerGatheringProgress();
+
+    DoAsyncReceive();
+    const Timestamp now = clock_->CurrentTime();
+    for (size_t i = 0; i < resolved_servers_.size(); ++i) {
+      auto& entry = resolved_servers_[i];
+      if (!entry.resolved_endpoints.empty()) {
+        if (!entry.spec.is_turn) {
+          SendStunProbeToServer(i, now);
+        } else {
+          entry.spec.server_endpoint = entry.resolved_endpoints.front();
+          StartTurnAllocation(entry.spec);
+        }
+      } else if (!entry.spec.host.empty()) {
+        ResolveAndProbeServer(i);
       }
     }
 
-    DoAsyncReceive();
     RebuildCandidatePairs();
     OnPeriodicCheckTick();
     return true;
   });
+}
+
+void IceTransportChannel::ResolveAndProbeServer(size_t server_index) {
+  RTC_DCHECK_RUN_ON(&net_checker_);
+  if (!resolver_ || server_index >= resolved_servers_.size()) {
+    return;
+  }
+  auto& entry = resolved_servers_[server_index];
+  if (entry.resolving || entry.spec.host.empty()) {
+    return;
+  }
+  entry.resolving = true;
+  const std::string host = entry.spec.host;
+  const std::string service = std::to_string(entry.spec.port);
+
+  resolver_->async_resolve(
+      boost::asio::ip::udp::v4(), host, service,
+      SafeTask(safety_.flag(),
+               [this, server_index, host](
+                   const boost::system::error_code& ec,
+                   boost::asio::ip::udp::resolver::results_type results) {
+                 RTC_DCHECK_RUN_ON(&net_checker_);
+                 if (server_index >= resolved_servers_.size()) {
+                   return;
+                 }
+                 auto& ent = resolved_servers_[server_index];
+                 ent.resolving = false;
+                 if (ec) {
+                   ent.dns_failed = true;
+                   NotifyServerGatheringProgress();
+                   RTC_LOG(kWarning) << "STUN/TURN DNS resolve failed for '"
+                                     << host << "': " << ec.message();
+                   return;
+                 }
+                 for (const auto& r : results) {
+                   const auto ep = r.endpoint();
+                   if (ep.address().is_v4() && ep.port() != 0) {
+                     if (std::find(ent.resolved_endpoints.begin(),
+                                   ent.resolved_endpoints.end(),
+                                   ep) == ent.resolved_endpoints.end()) {
+                       ent.resolved_endpoints.push_back(ep);
+                     }
+                   }
+                 }
+                 if (ent.resolved_endpoints.empty()) {
+                   ent.dns_failed = true;
+                   NotifyServerGatheringProgress();
+                   RTC_LOG(kWarning)
+                       << "STUN/TURN DNS resolve returned no IPv4 address for '"
+                       << host << "'";
+                   return;
+                 }
+                 ent.spec.server_endpoint = ent.resolved_endpoints.front();
+                 RTC_LOG(kInfo)
+                     << "Resolved " << (ent.spec.is_turn ? "TURN" : "STUN")
+                     << " domain '" << host << ":" << ent.spec.port << "' -> "
+                     << ent.spec.server_endpoint.address().to_string() << ":"
+                     << ent.spec.server_endpoint.port();
+
+                 if (!ent.spec.is_turn) {
+                   SendStunProbeToServer(server_index, clock_->CurrentTime());
+                 } else if (!turn_state_.has_value()) {
+                   StartTurnAllocation(ent.spec);
+                 }
+               }));
+}
+
+void IceTransportChannel::SendStunProbeToServer(size_t server_index,
+                                                Timestamp now) {
+  RTC_DCHECK_RUN_ON(&net_checker_);
+  if (!socket_ || !socket_->is_open() ||
+      server_index >= resolved_servers_.size()) {
+    return;
+  }
+  auto& entry = resolved_servers_[server_index];
+  if (entry.spec.is_turn || entry.resolved_endpoints.empty()) {
+    return;
+  }
+  entry.last_stun_tx = now;
+  ++entry.stun_tx_count;
+
+  const size_t max_eps = std::min<size_t>(entry.resolved_endpoints.size(), 2);
+  for (size_t k = 0; k < max_eps; ++k) {
+    StunMessage req(StunMessageType::kBindingRequest);
+    auto bytes = req.Serialize("", true);
+    boost::system::error_code send_ec;
+    socket_->send_to(boost::asio::buffer(bytes), entry.resolved_endpoints[k], 0,
+                     send_ec);
+  }
+}
+
+void IceTransportChannel::NotifyServerGatheringProgress() {
+  RTC_DCHECK_RUN_ON(&net_checker_);
+  bool has_stun = false;
+  bool any_srflx = false;
+  bool all_stun_failed = true;
+  bool has_turn = false;
+  bool turn_ready = false;
+  bool all_turn_failed = true;
+
+  for (const auto& ent : resolved_servers_) {
+    if (!ent.spec.is_turn) {
+      has_stun = true;
+      if (ent.srflx_gathered) {
+        any_srflx = true;
+      }
+      if (!ent.dns_failed && ent.stun_tx_count < 4) {
+        all_stun_failed = false;
+      }
+    } else {
+      has_turn = true;
+      if (turn_state_.has_value() && turn_state_->allocated) {
+        turn_ready = true;
+      }
+      if (!ent.dns_failed) {
+        all_turn_failed = false;
+      }
+    }
+  }
+
+  const bool stun_settled = !has_stun || any_srflx || all_stun_failed;
+  const bool turn_settled = !has_turn || turn_ready || all_turn_failed;
+  const bool all_done = stun_settled && turn_settled;
+  {
+    std::lock_guard<std::mutex> lock(gather_cv_mu_);
+    all_servers_settled_ = all_done;
+  }
+  if (all_done) {
+    gather_cv_.notify_all();
+  }
+}
+
+bool IceTransportChannel::WaitForServerReflexiveGathering(TimeDelta max_wait) {
+  std::unique_lock<std::mutex> lock(gather_cv_mu_);
+  if (all_servers_settled_ || max_wait <= TimeDelta::Zero()) {
+    return all_servers_settled_;
+  }
+  return gather_cv_.wait_for(
+      lock, std::chrono::microseconds(max_wait.us()),
+      [this]() { return all_servers_settled_; });
 }
 
 void IceTransportChannel::StartTurnAllocation(const TurnServerSpec& turn) {
@@ -659,16 +1026,92 @@ void IceTransportChannel::StartTurnAllocation(const TurnServerSpec& turn) {
                  << turn.server_endpoint.address().to_string() << ":"
                  << turn.server_endpoint.port();
   StunMessage alloc(StunMessageType::kAllocateRequest);
+  alloc.set_requested_transport(17);  // IANA UDP 传输协议号 = 17
   auto bytes = alloc.Serialize("", true);
   boost::system::error_code send_ec;
   socket_->send_to(boost::asio::buffer(bytes), turn.server_endpoint, 0,
                    send_ec);
 }
 
+void IceTransportChannel::EnsureTurnPeerBound(
+    const boost::asio::ip::udp::endpoint& peer_ep) {
+  RTC_DCHECK_RUN_ON(&net_checker_);
+  if (!socket_ || !turn_state_.has_value() || !turn_state_->allocated ||
+      !peer_ep.address().is_v4() || peer_ep.port() == 0) {
+    return;
+  }
+
+  uint16_t ch = 0;
+  const auto existing = turn_state_->peer_to_channel.find(peer_ep);
+  if (existing != turn_state_->peer_to_channel.end()) {
+    if (turn_state_->confirmed_channels.count(existing->second) > 0) {
+      return;
+    }
+    ch = existing->second;
+  } else {
+    if (turn_state_->next_channel > 0x7FFEu) {
+      return;
+    }
+    ch = turn_state_->next_channel++;
+    turn_state_->peer_to_channel[peer_ep] = ch;
+    turn_state_->channel_to_peer[ch] = peer_ep;
+  }
+
+  // 同时下发 CreatePermission 与 ChannelBind，确保在 ChannelBind 确认前即可通过 Send/Data Indication 立即收发。
+  StunMessage perm(StunMessageType::kCreatePermissionRequest);
+  perm.set_username(turn_state_->spec.username);
+  perm.set_realm(turn_state_->realm);
+  perm.set_nonce(turn_state_->nonce);
+  perm.set_xor_peer_address(peer_ep);
+  auto perm_wire = perm.Serialize(turn_state_->integrity_key, true);
+  boost::system::error_code ec;
+  socket_->send_to(boost::asio::buffer(perm_wire),
+                   turn_state_->spec.server_endpoint, 0, ec);
+
+  StunMessage ch_bind(StunMessageType::kChannelBindRequest);
+  ch_bind.set_username(turn_state_->spec.username);
+  ch_bind.set_realm(turn_state_->realm);
+  ch_bind.set_nonce(turn_state_->nonce);
+  ch_bind.set_channel_number(ch);
+  ch_bind.set_xor_peer_address(peer_ep);
+  auto ch_wire = ch_bind.Serialize(turn_state_->integrity_key, true);
+  socket_->send_to(boost::asio::buffer(ch_wire),
+                   turn_state_->spec.server_endpoint, 0, ec);
+}
+
+int IceTransportChannel::SendViaTurnRelay(
+    const boost::asio::ip::udp::endpoint& peer_ep,
+    ArrayView<const uint8_t> payload) {
+  RTC_DCHECK_RUN_ON(&net_checker_);
+  if (!socket_ || !turn_state_.has_value() || !turn_state_->allocated) {
+    return -1;
+  }
+  EnsureTurnPeerBound(peer_ep);
+  boost::system::error_code ec;
+  const auto ch_it = turn_state_->peer_to_channel.find(peer_ep);
+  if (ch_it != turn_state_->peer_to_channel.end() &&
+      turn_state_->confirmed_channels.count(ch_it->second) > 0) {
+    const auto ch_wire = TurnChannelDataCodec::Wrap(ch_it->second, payload);
+    socket_->send_to(boost::asio::buffer(ch_wire),
+                     turn_state_->spec.server_endpoint, 0, ec);
+  } else {
+    StunMessage send_ind(StunMessageType::kSendIndication);
+    send_ind.set_xor_peer_address(peer_ep);
+    send_ind.set_data(payload);
+    const auto ind_wire = send_ind.Serialize("", true);
+    socket_->send_to(boost::asio::buffer(ind_wire),
+                     turn_state_->spec.server_endpoint, 0, ec);
+  }
+  return ec ? -1 : static_cast<int>(payload.size());
+}
+
 void IceTransportChannel::AddRemoteCandidate(const IceCandidate& remote) {
   network_queue_->PostTask(SafeTask(safety_.flag(), [this, remote]() {
     RTC_DCHECK_RUN_ON(&net_checker_);
     remote_candidates_.push_back(remote);
+    if (turn_state_.has_value() && turn_state_->allocated) {
+      EnsureTurnPeerBound(remote.address);
+    }
     RebuildCandidatePairs();
     if (state_.load(std::memory_order_relaxed) == IceTransportState::kNew) {
       SetState(IceTransportState::kChecking);
@@ -689,6 +1132,19 @@ void IceTransportChannel::RestartIce(const IceParameters& new_local_params) {
     pairs_.clear();
     selected_pair_idx_.reset();
     pending_pings_.clear();
+    const Timestamp now = clock_->CurrentTime();
+    for (size_t i = 0; i < resolved_servers_.size(); ++i) {
+      auto& entry = resolved_servers_[i];
+      if (!entry.spec.is_turn) {
+        entry.srflx_gathered = false;
+        entry.stun_tx_count = 0;
+        if (!entry.resolved_endpoints.empty()) {
+          SendStunProbeToServer(i, now);
+        } else if (!entry.spec.host.empty()) {
+          ResolveAndProbeServer(i);
+        }
+      }
+    }
     SetState(IceTransportState::kChecking);
   }));
 }
@@ -707,8 +1163,10 @@ void IceTransportChannel::RebuildCandidatePairs() {
       if (lc.address.address().is_v4() != rc.address.address().is_v4()) {
         continue;
       }
-      if (lc.address.address().is_loopback() !=
-          rc.address.address().is_loopback()) {
+      if (lc.type != IceCandidateType::kRelay &&
+          rc.type != IceCandidateType::kRelay &&
+          lc.address.address().is_loopback() !=
+              rc.address.address().is_loopback()) {
         continue;
       }
       CandidatePair pair;
@@ -756,13 +1214,10 @@ void IceTransportChannel::SendConnectivityCheck(size_t pair_index) {
   }
 
   auto wire = req.Serialize(remote_params_.pwd, true);
-  boost::system::error_code send_ec;
-  if (pair.via_turn_relay && turn_state_.has_value() &&
-      turn_state_->channel_bound) {
-    auto ch_wire = TurnChannelDataCodec::Wrap(turn_state_->bound_channel, wire);
-    socket_->send_to(boost::asio::buffer(ch_wire),
-                     turn_state_->spec.server_endpoint, 0, send_ec);
+  if (pair.via_turn_relay) {
+    SendViaTurnRelay(pair.remote.address, wire);
   } else {
+    boost::system::error_code send_ec;
     socket_->send_to(boost::asio::buffer(wire), pair.remote.address, 0,
                      send_ec);
   }
@@ -771,6 +1226,35 @@ void IceTransportChannel::SendConnectivityCheck(size_t pair_index) {
 void IceTransportChannel::OnPeriodicCheckTick() {
   RTC_DCHECK_RUN_ON(&net_checker_);
   const Timestamp now = clock_->CurrentTime();
+
+  // TURN 分配保活刷新（在有效期过半时自动发送 RefreshRequest）。
+  if (turn_state_.has_value() && turn_state_->allocated &&
+      turn_state_->lifetime_sec > 0 &&
+      (turn_state_->last_refresh_sent.IsMinusInfinity() ||
+       (now - turn_state_->last_refresh_sent) >=
+           TimeDelta::Seconds(std::max<int64_t>(30, turn_state_->lifetime_sec / 2)))) {
+    turn_state_->last_refresh_sent = now;
+    StunMessage refresh(StunMessageType::kRefreshRequest);
+    refresh.set_username(turn_state_->spec.username);
+    refresh.set_realm(turn_state_->realm);
+    refresh.set_nonce(turn_state_->nonce);
+    refresh.set_lifetime(turn_state_->lifetime_sec);
+    const auto rwire = refresh.Serialize(turn_state_->integrity_key, true);
+    boost::system::error_code ec;
+    socket_->send_to(boost::asio::buffer(rwire),
+                     turn_state_->spec.server_endpoint, 0, ec);
+  }
+
+  // 对尚未收到反射响应的 STUN 服务器按 RFC 5389 执行最多 4 次超时重传探测。
+  for (size_t i = 0; i < resolved_servers_.size(); ++i) {
+    auto& entry = resolved_servers_[i];
+    if (!entry.spec.is_turn && !entry.srflx_gathered &&
+        !entry.resolved_endpoints.empty() && entry.stun_tx_count < 4 &&
+        (entry.last_stun_tx.IsMinusInfinity() ||
+         (now - entry.last_stun_tx) >= TimeDelta::Millis(250))) {
+      SendStunProbeToServer(i, now);
+    }
+  }
 
   if (selected_pair_idx_.has_value() && *selected_pair_idx_ < pairs_.size()) {
     auto& sel = pairs_[*selected_pair_idx_];
@@ -825,13 +1309,18 @@ void IceTransportChannel::DoAsyncReceive() {
 
 void IceTransportChannel::HandleUdpDatagram(
     ArrayView<const uint8_t> datagram,
-    const boost::asio::ip::udp::endpoint& from) {
-  if (turn_state_.has_value() && from == turn_state_->spec.server_endpoint &&
+    const boost::asio::ip::udp::endpoint& from,
+    bool via_turn_relay) {
+  if (!via_turn_relay && turn_state_.has_value() &&
+      from == turn_state_->spec.server_endpoint &&
       TurnChannelDataCodec::IsChannelData(datagram)) {
     uint16_t ch = 0;
     ArrayView<const uint8_t> inner;
     if (TurnChannelDataCodec::Unwrap(datagram, &ch, &inner)) {
-      HandleUdpDatagram(inner, turn_state_->bound_peer_ep);
+      const auto pit = turn_state_->channel_to_peer.find(ch);
+      if (pit != turn_state_->channel_to_peer.end()) {
+        HandleUdpDatagram(inner, pit->second, /*via_turn_relay=*/true);
+      }
     }
     return;
   }
@@ -850,7 +1339,7 @@ void IceTransportChannel::HandleUdpDatagram(
   }
 
   if (StunMessage::IsStunPacket(datagram)) {
-    HandleIncomingStun(datagram, from);
+    HandleIncomingStun(datagram, from, via_turn_relay);
     return;
   }
 
@@ -861,17 +1350,31 @@ void IceTransportChannel::HandleUdpDatagram(
 
 void IceTransportChannel::HandleIncomingStun(
     ArrayView<const uint8_t> datagram,
-    const boost::asio::ip::udp::endpoint& from) {
+    const boost::asio::ip::udp::endpoint& from,
+    bool via_turn_relay) {
   const Timestamp now = clock_->CurrentTime();
 
-  if (turn_state_.has_value() && from == turn_state_->spec.server_endpoint) {
+  if (!via_turn_relay && turn_state_.has_value() &&
+      from == turn_state_->spec.server_endpoint) {
     auto turn_msg = StunMessage::Parse(datagram, "");
     if (!turn_msg.has_value()) {
       return;
     }
 
-    if (turn_msg->type() == StunMessageType::kAllocateErrorResponse &&
-        turn_msg->error_code().value_or(0) == 401 &&
+    if (turn_msg->type() == StunMessageType::kDataIndication &&
+        turn_msg->xor_peer_address().has_value() &&
+        turn_msg->data().has_value()) {
+      HandleUdpDatagram(*turn_msg->data(), *turn_msg->xor_peer_address(),
+                        /*via_turn_relay=*/true);
+      return;
+    }
+
+    if ((turn_msg->type() == StunMessageType::kAllocateErrorResponse ||
+         turn_msg->type() == StunMessageType::kRefreshErrorResponse ||
+         turn_msg->type() == StunMessageType::kCreatePermissionErrorResponse ||
+         turn_msg->type() == StunMessageType::kChannelBindErrorResponse) &&
+        (turn_msg->error_code().value_or(0) == 401 ||
+         turn_msg->error_code().value_or(0) == 438) &&
         turn_msg->realm().has_value() && turn_msg->nonce().has_value()) {
       turn_state_->realm = *turn_msg->realm();
       turn_state_->nonce = *turn_msg->nonce();
@@ -879,19 +1382,24 @@ void IceTransportChannel::HandleIncomingStun(
           turn_state_->spec.username, turn_state_->realm,
           turn_state_->spec.password);
 
-      StunMessage auth_alloc(StunMessageType::kAllocateRequest);
-      auth_alloc.set_username(turn_state_->spec.username);
-      auth_alloc.set_realm(turn_state_->realm);
-      auth_alloc.set_nonce(turn_state_->nonce);
-      auto wire = auth_alloc.Serialize(turn_state_->integrity_key, true);
-      boost::system::error_code send_ec;
-      socket_->send_to(boost::asio::buffer(wire), from, 0, send_ec);
+      if (!turn_state_->allocated) {
+        StunMessage auth_alloc(StunMessageType::kAllocateRequest);
+        auth_alloc.set_requested_transport(17);
+        auth_alloc.set_username(turn_state_->spec.username);
+        auth_alloc.set_realm(turn_state_->realm);
+        auth_alloc.set_nonce(turn_state_->nonce);
+        auto wire = auth_alloc.Serialize(turn_state_->integrity_key, true);
+        boost::system::error_code send_ec;
+        socket_->send_to(boost::asio::buffer(wire), from, 0, send_ec);
+      }
       return;
     }
     if (turn_msg->type() == StunMessageType::kAllocateResponse &&
         turn_msg->xor_relayed_address().has_value()) {
       turn_state_->allocated = true;
       turn_state_->relayed_ep = *turn_msg->xor_relayed_address();
+      turn_state_->lifetime_sec = turn_msg->lifetime().value_or(600);
+      turn_state_->last_refresh_sent = now;
       RTC_LOG(kInfo) << "TURN relay allocated at "
                      << turn_state_->relayed_ep.address().to_string() << ":"
                      << turn_state_->relayed_ep.port();
@@ -906,25 +1414,27 @@ void IceTransportChannel::HandleIncomingStun(
         obs->OnLocalCandidateGathered(relay_cand);
       }
       RebuildCandidatePairs();
+      NotifyServerGatheringProgress();
 
-      if (!remote_candidates_.empty()) {
-        turn_state_->bound_peer_ep = remote_candidates_.front().address;
-        StunMessage ch_bind(StunMessageType::kChannelBindRequest);
-        ch_bind.set_username(turn_state_->spec.username);
-        ch_bind.set_realm(turn_state_->realm);
-        ch_bind.set_nonce(turn_state_->nonce);
-        ch_bind.set_channel_number(turn_state_->bound_channel);
-        ch_bind.set_xor_peer_address(turn_state_->bound_peer_ep);
-        auto wire = ch_bind.Serialize(turn_state_->integrity_key, true);
-        boost::system::error_code send_ec;
-        socket_->send_to(boost::asio::buffer(wire), from, 0, send_ec);
+      for (const auto& rc : remote_candidates_) {
+        EnsureTurnPeerBound(rc.address);
       }
       return;
     }
     if (turn_msg->type() == StunMessageType::kChannelBindResponse) {
-      turn_state_->channel_bound = true;
-      RTC_LOG(kInfo) << "TURN 4-byte ChannelData bound (channel=0x" << std::hex
-                     << turn_state_->bound_channel << std::dec << ")";
+      for (const auto& [ep, ch] : turn_state_->peer_to_channel) {
+        (void)ep;
+        turn_state_->confirmed_channels.insert(ch);
+      }
+      RTC_LOG(kInfo) << "TURN 4-byte ChannelData active ("
+                     << turn_state_->confirmed_channels.size() << " peer(s))";
+      return;
+    }
+    if (turn_msg->type() == StunMessageType::kCreatePermissionResponse ||
+        turn_msg->type() == StunMessageType::kRefreshResponse) {
+      if (turn_msg->lifetime().has_value()) {
+        turn_state_->lifetime_sec = *turn_msg->lifetime();
+      }
       return;
     }
   }
@@ -940,12 +1450,17 @@ void IceTransportChannel::HandleIncomingStun(
     resp.set_transaction_id(req->transaction_id());
     resp.set_xor_mapped_address(from);
     auto wire = resp.Serialize(local_params_.pwd, true);
-    boost::system::error_code send_ec;
-    socket_->send_to(boost::asio::buffer(wire), from, 0, send_ec);
+    if (via_turn_relay) {
+      SendViaTurnRelay(from, wire);
+    } else {
+      boost::system::error_code send_ec;
+      socket_->send_to(boost::asio::buffer(wire), from, 0, send_ec);
+    }
 
     size_t matched_idx = pairs_.size();
     for (size_t i = 0; i < pairs_.size(); ++i) {
-      if (pairs_[i].remote.address == from) {
+      if (pairs_[i].remote.address == from &&
+          pairs_[i].via_turn_relay == via_turn_relay) {
         matched_idx = i;
         break;
       }
@@ -957,8 +1472,17 @@ void IceTransportChannel::HandleIncomingStun(
           IceCandidate::ComputePriority(IceCandidateType::kPrflx));
       prflx.address = from;
       CandidatePair p;
-      p.local = local_candidates_.front();
+      p.local = (via_turn_relay && turn_state_.has_value())
+                    ? IceCandidate{"relay",
+                                   1,
+                                   "udp",
+                                   IceCandidate::ComputePriority(
+                                       IceCandidateType::kRelay),
+                                   turn_state_->relayed_ep,
+                                   IceCandidateType::kRelay}
+                    : local_candidates_.front();
       p.remote = prflx;
+      p.via_turn_relay = via_turn_relay;
       p.state = PairState::kSucceeded;
       p.last_response_received = now;
       pairs_.push_back(p);
@@ -989,24 +1513,38 @@ void IceTransportChannel::HandleIncomingStun(
   }
 
   if (raw_type == static_cast<uint16_t>(StunMessageType::kBindingResponse)) {
-    for (const auto& srv : servers_) {
-      if (!srv.is_turn && from == srv.server_endpoint) {
+    for (auto& entry : resolved_servers_) {
+      if (!entry.spec.is_turn &&
+          std::find(entry.resolved_endpoints.begin(),
+                    entry.resolved_endpoints.end(),
+                    from) != entry.resolved_endpoints.end()) {
         auto srflx_resp = StunMessage::Parse(datagram, "");
         if (srflx_resp.has_value() &&
             srflx_resp->xor_mapped_address().has_value()) {
-          IceCandidate srflx;
-          srflx.type = IceCandidateType::kSrflx;
-          srflx.priority =
-              IceCandidate::ComputePriority(IceCandidateType::kSrflx);
-          srflx.address = *srflx_resp->xor_mapped_address();
-          local_candidates_.push_back(srflx);
-          RTC_LOG(kInfo) << "STUN server-reflexive candidate gathered: "
-                         << srflx.address.address().to_string() << ":"
-                         << srflx.address.port();
-          if (auto* obs = observer_.load(std::memory_order_acquire)) {
-            obs->OnLocalCandidateGathered(srflx);
+          entry.srflx_gathered = true;
+          const auto mapped_ep = *srflx_resp->xor_mapped_address();
+          const bool already_present = std::any_of(
+              local_candidates_.begin(), local_candidates_.end(),
+              [&mapped_ep](const IceCandidate& c) {
+                return c.type == IceCandidateType::kSrflx &&
+                       c.address == mapped_ep;
+              });
+          if (!already_present) {
+            IceCandidate srflx;
+            srflx.type = IceCandidateType::kSrflx;
+            srflx.priority =
+                IceCandidate::ComputePriority(IceCandidateType::kSrflx);
+            srflx.address = mapped_ep;
+            local_candidates_.push_back(srflx);
+            RTC_LOG(kInfo) << "STUN server-reflexive candidate gathered: "
+                           << srflx.address.address().to_string() << ":"
+                           << srflx.address.port();
+            if (auto* obs = observer_.load(std::memory_order_acquire)) {
+              obs->OnLocalCandidateGathered(srflx);
+            }
+            RebuildCandidatePairs();
           }
-          RebuildCandidatePairs();
+          NotifyServerGatheringProgress();
         }
         return;
       }
@@ -1076,16 +1614,12 @@ int IceTransportChannel::SendPacket(ArrayView<const uint8_t> packet) {
     return -1;
   }
   const CandidatePair& sel = pairs_[*selected_pair_idx_];
-  boost::system::error_code ec;
-  if (sel.via_turn_relay && turn_state_.has_value() &&
-      turn_state_->channel_bound) {
-    auto ch_pkt = TurnChannelDataCodec::Wrap(turn_state_->bound_channel, packet);
-    socket_->send_to(boost::asio::buffer(ch_pkt),
-                     turn_state_->spec.server_endpoint, 0, ec);
-  } else {
-    socket_->send_to(boost::asio::buffer(packet.data(), packet.size()),
-                     sel.remote.address, 0, ec);
+  if (sel.via_turn_relay) {
+    return SendViaTurnRelay(sel.remote.address, packet);
   }
+  boost::system::error_code ec;
+  socket_->send_to(boost::asio::buffer(packet.data(), packet.size()),
+                   sel.remote.address, 0, ec);
   return ec ? -1 : static_cast<int>(packet.size());
 }
 

@@ -67,8 +67,11 @@ int main(int argc, char** argv) {
     }
   }
 
-  RTC_LOG(kInfo) << "IETF MoQ Multi-Stream Relay ready on moq://" << bind_ip
-                 << ":" << moq_relay.udp_port();
+  RTC_LOG(kInfo) << "IETF MoQ (draft-17) Relay ready on moqt://" << bind_ip
+                 << ":" << moq_relay.udp_port() << "/moq and WebTransport https://"
+                 << bind_ip << ":" << moq_relay.udp_port()
+                 << "/moq (W3C serverCertificateHashes sha-256="
+                 << moq_relay.certificate_sha256_hex() << ")";
 
   while (!g_stop.load()) {
     std::this_thread::sleep_for(std::chrono::milliseconds(100));

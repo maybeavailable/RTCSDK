@@ -5,10 +5,12 @@
 // RFC 9001（使用 TLS 保护 QUIC）与 RFC 9002（QUIC 丢包检测与拥塞控制），
 // 并在 TaskQueueBoost 上进行线程隔离。
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <deque>
 #include <map>
 #include <memory>
@@ -35,11 +37,50 @@ namespace rtc {
 
 inline constexpr uint32_t kQuicVersion1 = 0x00000001u;
 inline constexpr size_t kQuicCidLength = 8;
+inline constexpr size_t kQuicMaxCidLength = 20;
 inline constexpr size_t kQuicMaxDatagramSize = 1200;
 inline constexpr size_t kQuicMinClientInitialSize = 1200;
 inline constexpr size_t kQuicAeadTagLength = 16;
 
-using QuicCid = std::array<uint8_t, kQuicCidLength>;
+// 遵循 RFC 9000 第 17.2 节的 0..20 字节可变长度连接 ID（默认生成 8 字节本地连接 ID）。
+struct QuicCid {
+  std::array<uint8_t, kQuicMaxCidLength> bytes{};
+  uint8_t length = static_cast<uint8_t>(kQuicCidLength);
+
+  QuicCid() = default;
+  QuicCid(const uint8_t* src, size_t n) { Assign(src, n); }
+
+  void Assign(const uint8_t* src, size_t n) {
+    length = static_cast<uint8_t>(std::min(n, kQuicMaxCidLength));
+    bytes.fill(0);
+    if (length > 0 && src != nullptr) {
+      std::memcpy(bytes.data(), src, length);
+    }
+  }
+
+  uint8_t* data() { return bytes.data(); }
+  const uint8_t* data() const { return bytes.data(); }
+  size_t size() const { return length; }
+  bool empty() const { return length == 0; }
+  const uint8_t* begin() const { return bytes.data(); }
+  const uint8_t* end() const { return bytes.data() + length; }
+
+  operator ArrayView<const uint8_t>() const {
+    return ArrayView<const uint8_t>(bytes.data(), length);
+  }
+
+  bool operator==(const QuicCid& other) const {
+    return length == other.length &&
+           std::memcmp(bytes.data(), other.bytes.data(), length) == 0;
+  }
+  bool operator!=(const QuicCid& other) const { return !(*this == other); }
+  bool operator<(const QuicCid& other) const {
+    if (length != other.length) {
+      return length < other.length;
+    }
+    return std::memcmp(bytes.data(), other.bytes.data(), length) < 0;
+  }
+};
 
 enum class QuicEncryptionLevel : uint8_t {
   kInitial = 0,
@@ -61,8 +102,11 @@ struct QuicTransportParameters {
   uint64_t initial_max_stream_data_bidi_local = 2 * 1024 * 1024;
   uint64_t initial_max_stream_data_bidi_remote = 2 * 1024 * 1024;
   uint64_t initial_max_stream_data_uni = 4 * 1024 * 1024;
-  uint64_t initial_max_streams_bidi = 64;
+  uint64_t initial_max_streams_bidi = 256;
   uint64_t initial_max_streams_uni = 16384;
+  uint64_t active_connection_id_limit = 4;
+  uint64_t max_datagram_frame_size = kQuicMaxDatagramSize;
+  bool reset_stream_at_supported = true;
   QuicCid initial_source_cid{};
   QuicCid original_destination_cid{};
   bool has_original_destination_cid = false;
@@ -228,6 +272,10 @@ class AsioQuicClientEngine final
                   bool fin) override;
 
   void ResetStream(uint64_t stream_id, uint64_t app_error_code) override;
+  void StopSending(uint64_t stream_id, uint64_t app_error_code) override;
+  int SendDatagram(ArrayView<const uint8_t> data) override;
+  size_t max_datagram_size() const override;
+  std::string negotiated_alpn() const override;
 
   QuicCongestionSnapshot GetCongestionSnapshot() const override;
 
@@ -241,12 +289,13 @@ class AsioQuicClientEngine final
   std::shared_ptr<Impl> impl_;
 };
 
-// 面向 MoQ 中继（Relay）的服务端单连接句柄与访问者回调接口。
+// 面向 MoQ 中继（Relay）及 HTTP/3 WebTransport 的服务端单连接句柄与访问者回调接口。
 class QuicServerSessionHandle {
  public:
   virtual ~QuicServerSessionHandle() = default;
 
   virtual uint64_t session_id() const = 0;
+  virtual std::string negotiated_alpn() const { return {}; }
   virtual uint64_t OpenBidirectionalStream() = 0;
   virtual uint64_t OpenUnidirectionalStream(uint8_t publisher_priority,
                                             int64_t send_order) = 0;
@@ -254,6 +303,12 @@ class QuicServerSessionHandle {
                           ArrayView<const uint8_t> data,
                           bool fin) = 0;
   virtual void ResetStream(uint64_t stream_id, uint64_t app_error_code) = 0;
+  virtual void StopSending(uint64_t /*stream_id*/,
+                           uint64_t /*app_error_code*/) {}
+  virtual int SendDatagram(ArrayView<const uint8_t> /*data*/) {
+    return RTC_ERR_PROTOCOL;
+  }
+  virtual size_t max_datagram_size() const { return 0; }
   virtual void Close(uint64_t app_error_code) = 0;
   virtual QuicCongestionSnapshot GetCongestionSnapshot() const = 0;
 };
@@ -276,6 +331,11 @@ class IQuicServerVisitor {
   virtual void OnServerStreamReset(uint64_t session_id,
                                    uint64_t stream_id,
                                    uint64_t app_error_code) = 0;
+  virtual void OnServerStreamStopSending(uint64_t /*session_id*/,
+                                         uint64_t /*stream_id*/,
+                                         uint64_t /*app_error_code*/) {}
+  virtual void OnServerDatagramReceived(uint64_t /*session_id*/,
+                                        ArrayView<const uint8_t> /*data*/) {}
 };
 
 // 按连接 ID（Connection ID）多路复用的多会话 Boost.Asio UDP QUIC v1 服务端。
@@ -285,7 +345,12 @@ class AsioQuicServer {
                  TaskQueueBoost* network_queue,
                  IQuicServerVisitor* visitor,
                  std::string bind_ip = "0.0.0.0",
-                 std::string expected_alpn = "moq-00");
+                 std::string expected_alpn = "moqt-17");
+  AsioQuicServer(Clock* clock,
+                 TaskQueueBoost* network_queue,
+                 IQuicServerVisitor* visitor,
+                 std::string bind_ip,
+                 std::vector<std::string> supported_alpns);
   ~AsioQuicServer();
 
   AsioQuicServer(const AsioQuicServer&) = delete;
@@ -295,6 +360,8 @@ class AsioQuicServer {
   void Stop();
 
   uint16_t local_port() const { return local_port_; }
+  std::array<uint8_t, 32> certificate_sha256() const;
+  std::string certificate_sha256_hex() const;
   void SetSimulatedDropRates(double rx_drop_prob, double tx_drop_prob);
   void SetCongestionControllerFactory(
       std::shared_ptr<IQuicCongestionControllerFactory> factory);

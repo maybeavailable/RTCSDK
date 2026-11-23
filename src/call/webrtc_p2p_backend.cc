@@ -81,42 +81,8 @@ std::string WebRtcP2pBackend::GenerateRandomToken(size_t length) {
 
 bool WebRtcP2pBackend::ParseIceServerUri(const IceServerConfig& cfg,
                                          TurnServerSpec* out_spec) {
-  std::string_view uri = cfg.uri;
-  bool is_turn = false;
-  if (uri.rfind("turn:", 0) == 0 || uri.rfind("turns:", 0) == 0) {
-    is_turn = true;
-    uri.remove_prefix(uri.find(':') + 1);
-  } else if (uri.rfind("stun:", 0) == 0) {
-    uri.remove_prefix(5);
-  } else {
-    return false;
-  }
-
-  const size_t q = uri.find('?');
-  if (q != std::string_view::npos) {
-    uri = uri.substr(0, q);
-  }
-
-  const size_t colon = uri.rfind(':');
-  std::string host;
-  uint16_t port = 3478;
-  if (colon != std::string_view::npos) {
-    host = std::string(uri.substr(0, colon));
-    ParseUint16(uri.substr(colon + 1), &port);
-  } else {
-    host = std::string(uri);
-  }
-
-  boost::system::error_code ec;
-  const auto ip = boost::asio::ip::make_address(host, ec);
-  if (ec) {
-    return false;
-  }
-  out_spec->server_endpoint = boost::asio::ip::udp::endpoint(ip, port);
-  out_spec->username = cfg.username;
-  out_spec->password = cfg.password;
-  out_spec->is_turn = is_turn;
-  return true;
+  return IceTransportChannel::ParseIceServerUri(cfg.uri, cfg.username,
+                                                cfg.password, out_spec);
 }
 
 bool WebRtcP2pBackend::EnsureTransportInitializedOnSigQueue() {
@@ -283,6 +249,10 @@ PureVideoSdpDescription WebRtcP2pBackend::BuildLocalSdpOnSigQueue(
     bool direction_send,
     bool direction_recv) const {
   RTC_DCHECK_RUN_ON(&sig_checker_);
+  if (!config_.ice_servers.empty() && config_.signaling_or_moq_url.empty()) {
+    // 直连 W3C SDP 模式下无 Trickle ICE 后续增量通道，短暂等待异步 DNS 解析与 STUN 反射收集落盘。
+    ice_->WaitForServerReflexiveGathering(TimeDelta::Millis(300));
+  }
   PureVideoSdpDescription desc;
   desc.session_type = session_type;
   desc.ice_params = ice_->local_parameters();

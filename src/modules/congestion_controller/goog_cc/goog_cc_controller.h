@@ -206,6 +206,7 @@ class SendSideBandwidthEstimation {
                          int64_t number_of_packets,
                          Timestamp at_time);
   void UpdateDelayBasedEstimate(Timestamp at_time, DataRate bitrate);
+  void ApplyProbeBitrate(Timestamp at_time, DataRate bitrate);
   void SetAcknowledgedRate(std::optional<DataRate> acked_rate,
                            Timestamp at_time);
   void UpdateEstimate(Timestamp at_time);
@@ -375,6 +376,7 @@ class GoogCcNetworkController {
 
   bool previously_in_alr_ = false;
   BandwidthUsage prev_detector_state_ = BandwidthUsage::kBwNormal;
+  Timestamp last_probe_result_time_ = Timestamp::MinusInfinity();
   DataRate last_reported_target_rate_ = DataRate::Zero();
   uint8_t last_reported_fraction_loss_ = 0;
   TimeDelta last_reported_rtt_ = TimeDelta::Zero();

@@ -3,13 +3,20 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <iomanip>
 #include <limits>
 #include <random>
+#include <sstream>
 
+#include <openssl/bn.h>
+#include <openssl/crypto.h>
+#include <openssl/ec.h>
 #include <openssl/evp.h>
 #include <openssl/hmac.h>
 #include <openssl/kdf.h>
 #include <openssl/rand.h>
+#include <openssl/x509.h>
+#include <openssl/x509v3.h>
 
 #include "modules/rtp_rtcp/byte_io.h"
 #include "moq/moq_transport.h"
@@ -33,23 +40,54 @@ constexpr uint64_t kFrameAckEcn = 0x03;
 constexpr uint64_t kFrameResetStream = 0x04;
 constexpr uint64_t kFrameStopSending = 0x05;
 constexpr uint64_t kFrameCrypto = 0x06;
+constexpr uint64_t kFrameNewToken = 0x07;
 constexpr uint64_t kFrameStreamBase = 0x08;
 constexpr uint64_t kFrameStreamFinBit = 0x01;
 constexpr uint64_t kFrameStreamLenBit = 0x02;
 constexpr uint64_t kFrameStreamOffBit = 0x04;
 constexpr uint64_t kFrameMaxData = 0x10;
 constexpr uint64_t kFrameMaxStreamData = 0x11;
+constexpr uint64_t kFrameMaxStreamsBidi = 0x12;
+constexpr uint64_t kFrameMaxStreamsUni = 0x13;
+constexpr uint64_t kFrameDataBlocked = 0x14;
+constexpr uint64_t kFrameStreamDataBlocked = 0x15;
+constexpr uint64_t kFrameStreamsBlockedBidi = 0x16;
+constexpr uint64_t kFrameStreamsBlockedUni = 0x17;
+constexpr uint64_t kFrameNewConnectionId = 0x18;
+constexpr uint64_t kFrameRetireConnectionId = 0x19;
+constexpr uint64_t kFramePathChallenge = 0x1a;
+constexpr uint64_t kFramePathResponse = 0x1b;
 constexpr uint64_t kFrameConnectionCloseQuic = 0x1c;
 constexpr uint64_t kFrameConnectionCloseApp = 0x1d;
 constexpr uint64_t kFrameHandshakeDone = 0x1e;
+constexpr uint64_t kFrameResetStreamAt = 0x24;
+constexpr uint64_t kFrameDatagram = 0x30;
+constexpr uint64_t kFrameDatagramLen = 0x31;
 
-// QUIC CRYPTO 帧内承载的握手消息标签。
-constexpr uint8_t kCryptoMsgClientHello = 0x01;
-constexpr uint8_t kCryptoMsgServerHello = 0x02;
-constexpr uint8_t kCryptoMsgServerEncryptedExtFinished = 0x14;
-constexpr uint8_t kCryptoMsgClientFinished = 0x15;
+// RFC 8446 第 4 节定义的标准 TLS 1.3 握手消息类型与扩展常量。
+constexpr uint8_t kTlsHsClientHello = 0x01;
+constexpr uint8_t kTlsHsServerHello = 0x02;
+constexpr uint8_t kTlsHsEncryptedExtensions = 0x08;
+constexpr uint8_t kTlsHsCertificate = 0x0b;
+constexpr uint8_t kTlsHsCertificateVerify = 0x0f;
+constexpr uint8_t kTlsHsFinished = 0x14;
 
-// RFC 9000 第 18 节定义的传输参数 ID。
+constexpr uint16_t kTlsCipherAes128GcmSha256 = 0x1301;
+constexpr uint16_t kTlsGroupSecp256r1 = 0x0017;
+constexpr uint16_t kTlsGroupX25519 = 0x001d;
+constexpr uint16_t kTlsSigEcdsaSecp256r1Sha256 = 0x0403;
+constexpr uint16_t kTlsSigRsaPssRsaeSha256 = 0x0804;
+
+constexpr uint16_t kTlsExtServerName = 0x0000;
+constexpr uint16_t kTlsExtSupportedGroups = 0x000a;
+constexpr uint16_t kTlsExtSignatureAlgorithms = 0x000d;
+constexpr uint16_t kTlsExtAlpn = 0x0010;
+constexpr uint16_t kTlsExtPskKeyExchangeModes = 0x002d;
+constexpr uint16_t kTlsExtSupportedVersions = 0x002b;
+constexpr uint16_t kTlsExtKeyShare = 0x0033;
+constexpr uint16_t kTlsExtQuicTransportParams = 0x0039;
+
+// RFC 9000 第 18 节与 RFC 9221 第 3 节定义的传输参数 ID。
 constexpr uint64_t kTpOriginalDestinationCid = 0x00;
 constexpr uint64_t kTpMaxIdleTimeout = 0x01;
 constexpr uint64_t kTpInitialMaxData = 0x04;
@@ -58,7 +96,10 @@ constexpr uint64_t kTpInitialMaxStreamDataBidiRemote = 0x06;
 constexpr uint64_t kTpInitialMaxStreamDataUni = 0x07;
 constexpr uint64_t kTpInitialMaxStreamsBidi = 0x08;
 constexpr uint64_t kTpInitialMaxStreamsUni = 0x09;
+constexpr uint64_t kTpActiveConnectionIdLimit = 0x0e;
 constexpr uint64_t kTpInitialSourceCid = 0x0f;
+constexpr uint64_t kTpMaxDatagramFrameSize = 0x20;
+constexpr uint64_t kTpResetStreamAt = 0x17f7586d2cb570ULL;
 
 size_t LevelIndex(QuicEncryptionLevel level) {
   return static_cast<size_t>(level);
@@ -127,7 +168,7 @@ bool ShouldSimulateDrop(double prob) {
 
 std::vector<uint8_t> QuicTransportParameters::Encode() const {
   std::vector<uint8_t> out;
-  out.reserve(64);
+  out.reserve(80);
   if (has_original_destination_cid) {
     AppendTpBytes(kTpOriginalDestinationCid, original_destination_cid, &out);
   }
@@ -140,13 +181,23 @@ std::vector<uint8_t> QuicTransportParameters::Encode() const {
   AppendTpVarInt(kTpInitialMaxStreamDataUni, initial_max_stream_data_uni, &out);
   AppendTpVarInt(kTpInitialMaxStreamsBidi, initial_max_streams_bidi, &out);
   AppendTpVarInt(kTpInitialMaxStreamsUni, initial_max_streams_uni, &out);
+  AppendTpVarInt(kTpActiveConnectionIdLimit,
+                 std::max<uint64_t>(2, active_connection_id_limit), &out);
   AppendTpBytes(kTpInitialSourceCid, initial_source_cid, &out);
+  if (max_datagram_frame_size > 0) {
+    AppendTpVarInt(kTpMaxDatagramFrameSize, max_datagram_frame_size, &out);
+  }
+  if (reset_stream_at_supported) {
+    AppendTpBytes(kTpResetStreamAt, ArrayView<const uint8_t>(), &out);
+  }
   return out;
 }
 
 std::optional<QuicTransportParameters> QuicTransportParameters::Decode(
     ArrayView<const uint8_t> data) {
   QuicTransportParameters tp;
+  tp.max_datagram_frame_size = 0;
+  tp.reset_stream_at_supported = false;
   size_t off = 0;
   while (off < data.size()) {
     uint64_t id = 0;
@@ -160,9 +211,9 @@ std::optional<QuicTransportParameters> QuicTransportParameters::Decode(
     size_t voff = 0;
     switch (id) {
       case kTpOriginalDestinationCid:
-        if (val_slice.size() == kQuicCidLength) {
-          std::memcpy(tp.original_destination_cid.data(), val_slice.data(),
-                      kQuicCidLength);
+        if (val_slice.size() <= kQuicMaxCidLength) {
+          tp.original_destination_cid.Assign(val_slice.data(),
+                                             val_slice.size());
           tp.has_original_destination_cid = true;
         }
         break;
@@ -204,11 +255,27 @@ std::optional<QuicTransportParameters> QuicTransportParameters::Decode(
           return std::nullopt;
         }
         break;
-      case kTpInitialSourceCid:
-        if (val_slice.size() == kQuicCidLength) {
-          std::memcpy(tp.initial_source_cid.data(), val_slice.data(),
-                      kQuicCidLength);
+      case kTpActiveConnectionIdLimit:
+        if (!QuicVarInt::Read(val_slice, &voff,
+                              &tp.active_connection_id_limit)) {
+          return std::nullopt;
         }
+        break;
+      case kTpInitialSourceCid:
+        if (val_slice.size() <= kQuicMaxCidLength) {
+          tp.initial_source_cid.Assign(val_slice.data(), val_slice.size());
+        }
+        break;
+      case kTpMaxDatagramFrameSize:
+        if (!QuicVarInt::Read(val_slice, &voff, &tp.max_datagram_frame_size)) {
+          return std::nullopt;
+        }
+        break;
+      case kTpResetStreamAt:
+        if (!val_slice.empty()) {
+          return std::nullopt;
+        }
+        tp.reset_stream_at_supported = true;
         break;
       default:
         break;
@@ -522,7 +589,7 @@ QuicCryptoUtils::InspectHeaderIds(ArrayView<const uint8_t> datagram,
                                   QuicCid* out_dcid,
                                   QuicCid* out_scid,
                                   size_t* out_total_packet_len) {
-  if (datagram.size() < 1 + kQuicCidLength + 4 + kQuicAeadTagLength) {
+  if (datagram.size() < 1 + 4 + kQuicAeadTagLength) {
     return std::nullopt;
   }
   const uint8_t first = datagram[0];
@@ -534,9 +601,12 @@ QuicCryptoUtils::InspectHeaderIds(ArrayView<const uint8_t> datagram,
   *out_is_long_header = is_long;
   UnprotectedPacket info;
   if (!is_long) {
+    if (datagram.size() < 1 + kQuicCidLength + 4 + kQuicAeadTagLength) {
+      return std::nullopt;
+    }
     *out_level = QuicEncryptionLevel::kOneRtt;
-    std::memcpy(out_dcid->data(), datagram.data() + 1, kQuicCidLength);
-    *out_scid = QuicCid{};
+    out_dcid->Assign(datagram.data() + 1, kQuicCidLength);
+    out_scid->Assign(nullptr, 0);
     *out_total_packet_len = datagram.size();
     info.level = QuicEncryptionLevel::kOneRtt;
     info.dcid = *out_dcid;
@@ -562,18 +632,18 @@ QuicCryptoUtils::InspectHeaderIds(ArrayView<const uint8_t> datagram,
 
   size_t off = 5;
   const uint8_t dcid_len = datagram[off++];
-  if (dcid_len != kQuicCidLength || off + dcid_len + 1 > datagram.size()) {
+  if (dcid_len > kQuicMaxCidLength || off + dcid_len + 1 > datagram.size()) {
     return std::nullopt;
   }
-  std::memcpy(out_dcid->data(), datagram.data() + off, kQuicCidLength);
-  off += kQuicCidLength;
+  out_dcid->Assign(datagram.data() + off, dcid_len);
+  off += dcid_len;
 
   const uint8_t scid_len = datagram[off++];
-  if (scid_len != kQuicCidLength || off + scid_len > datagram.size()) {
+  if (scid_len > kQuicMaxCidLength || off + scid_len > datagram.size()) {
     return std::nullopt;
   }
-  std::memcpy(out_scid->data(), datagram.data() + off, kQuicCidLength);
-  off += kQuicCidLength;
+  out_scid->Assign(datagram.data() + off, scid_len);
+  off += scid_len;
 
   if (*out_level == QuicEncryptionLevel::kInitial) {
     uint64_t token_len = 0;
@@ -621,7 +691,7 @@ QuicCryptoUtils::UnprotectPacket(ArrayView<const uint8_t> datagram,
   if (!is_long) {
     pn_offset = 1 + kQuicCidLength;
   } else {
-    pn_offset = 5 + 1 + kQuicCidLength + 1 + kQuicCidLength;
+    pn_offset = 5 + 1 + dcid.size() + 1 + scid.size();
     if (level == QuicEncryptionLevel::kInitial) {
       uint64_t token_len = 0;
       if (!QuicVarInt::Read(pkt, &pn_offset, &token_len)) {
@@ -938,7 +1008,288 @@ class QuicSessionEvents {
                                 bool fin) = 0;
   virtual void OnPeerStreamReset(uint64_t stream_id,
                                  uint64_t app_error_code) = 0;
+  virtual void OnPeerStopSending(uint64_t stream_id,
+                                 uint64_t app_error_code) = 0;
+  virtual void OnPeerDatagramReceived(ArrayView<const uint8_t> data) = 0;
 };
+
+std::vector<std::string> SplitAlpnList(std::string_view csv) {
+  std::vector<std::string> out;
+  size_t pos = 0;
+  while (pos < csv.size()) {
+    const size_t comma = csv.find(',', pos);
+    const std::string_view tok =
+        (comma == std::string_view::npos) ? csv.substr(pos)
+                                          : csv.substr(pos, comma - pos);
+    if (!tok.empty()) {
+      out.emplace_back(tok);
+    }
+    if (comma == std::string_view::npos) {
+      break;
+    }
+    pos = comma + 1;
+  }
+  return out;
+}
+
+// 满足 W3C WebTransport `serverCertificateHashes` 规范要求的临时 ECDSA P-256 证书上下文
+// （有效期 <= 14 天、包含 SAN localhost/127.0.0.1、支持 TLS 1.3 CertificateVerify 签名与验签）。
+class QuicServerCertContext {
+ public:
+  static std::shared_ptr<QuicServerCertContext> GenerateEphemeralP256() {
+    EVP_PKEY* pkey = EVP_PKEY_Q_keygen(nullptr, nullptr, "EC", "P-256");
+    if (pkey == nullptr) {
+      RTC_LOG(kError) << "OpenSSL EVP_PKEY_Q_keygen(EC P-256) failed for QUIC";
+      return nullptr;
+    }
+
+    X509* x509 = X509_new();
+    if (x509 == nullptr) {
+      EVP_PKEY_free(pkey);
+      return nullptr;
+    }
+    X509_set_version(x509, 2);
+
+    uint64_t serial_rand = 1;
+    RAND_bytes(reinterpret_cast<uint8_t*>(&serial_rand), sizeof(serial_rand));
+    serial_rand = (serial_rand & 0x7FFFFFFFFFFFFFFFULL) | 1ULL;
+    ASN1_INTEGER_set_uint64(X509_get_serialNumber(x509), serial_rand);
+
+    // W3C WebTransport 规范强制要求自定义哈希证书总有效期不得超过 14 天（此处设为 10 天）。
+    X509_gmtime_adj(X509_getm_notBefore(x509), -3600);
+    X509_gmtime_adj(X509_getm_notAfter(x509), 10L * 24 * 3600);
+    X509_set_pubkey(x509, pkey);
+
+    X509_NAME* name = X509_get_subject_name(x509);
+    X509_NAME_add_entry_by_txt(
+        name, "CN", MBSTRING_ASC,
+        reinterpret_cast<const unsigned char*>("localhost"), -1, -1, 0);
+    X509_set_issuer_name(x509, name);
+
+    X509V3_CTX v3ctx;
+    X509V3_set_ctx_nodb(&v3ctx);
+    X509V3_set_ctx(&v3ctx, x509, x509, nullptr, nullptr, 0);
+    if (X509_EXTENSION* ext_bc = X509V3_EXT_conf_nid(
+            nullptr, &v3ctx, NID_basic_constraints, "critical,CA:FALSE")) {
+      X509_add_ext(x509, ext_bc, -1);
+      X509_EXTENSION_free(ext_bc);
+    }
+    if (X509_EXTENSION* ext_san = X509V3_EXT_conf_nid(
+            nullptr, &v3ctx, NID_subject_alt_name,
+            "DNS:localhost,IP:127.0.0.1")) {
+      X509_add_ext(x509, ext_san, -1);
+      X509_EXTENSION_free(ext_san);
+    }
+
+    if (X509_sign(x509, pkey, EVP_sha256()) == 0) {
+      X509_free(x509);
+      EVP_PKEY_free(pkey);
+      return nullptr;
+    }
+
+    unsigned char* der_ptr = nullptr;
+    const int der_len = i2d_X509(x509, &der_ptr);
+    X509_free(x509);
+    if (der_len <= 0 || der_ptr == nullptr) {
+      EVP_PKEY_free(pkey);
+      return nullptr;
+    }
+    std::vector<uint8_t> der(der_ptr, der_ptr + der_len);
+    OPENSSL_free(der_ptr);
+
+    const auto sha256 = QuicCryptoUtils::Sha256(der);
+    std::ostringstream hex_oss;
+    hex_oss << std::hex << std::setfill('0');
+    for (uint8_t b : sha256) {
+      hex_oss << std::setw(2) << static_cast<int>(b);
+    }
+
+    return std::shared_ptr<QuicServerCertContext>(new QuicServerCertContext(
+        pkey, std::move(der), sha256, hex_oss.str()));
+  }
+
+  ~QuicServerCertContext() {
+    if (pkey_ != nullptr) {
+      EVP_PKEY_free(pkey_);
+    }
+  }
+
+  QuicServerCertContext(const QuicServerCertContext&) = delete;
+  QuicServerCertContext& operator=(const QuicServerCertContext&) = delete;
+
+  const std::vector<uint8_t>& der_bytes() const { return der_bytes_; }
+  const std::array<uint8_t, 32>& sha256() const { return sha256_; }
+  const std::string& sha256_hex() const { return sha256_hex_; }
+
+  static std::array<uint8_t, 130> BuildServerCertVerifyInput(
+      const std::array<uint8_t, 32>& transcript_hash) {
+    static constexpr char kLabel[] = "TLS 1.3, server CertificateVerify";
+    std::array<uint8_t, 130> content{};
+    std::memset(content.data(), 0x20, 64);
+    std::memcpy(content.data() + 64, kLabel, 33);
+    content[97] = 0x00;
+    std::memcpy(content.data() + 98, transcript_hash.data(), 32);
+    return content;
+  }
+
+  bool SignServerCertVerify(const std::array<uint8_t, 32>& transcript_hash,
+                            std::vector<uint8_t>* out_sig) const {
+    if (pkey_ == nullptr || out_sig == nullptr) {
+      return false;
+    }
+    const auto content = BuildServerCertVerifyInput(transcript_hash);
+    EVP_MD_CTX* md_ctx = EVP_MD_CTX_new();
+    if (md_ctx == nullptr) {
+      return false;
+    }
+    size_t sig_len = 0;
+    bool ok = EVP_DigestSignInit(md_ctx, nullptr, EVP_sha256(), nullptr,
+                                 pkey_) == 1 &&
+              EVP_DigestSign(md_ctx, nullptr, &sig_len, content.data(),
+                             content.size()) == 1 &&
+              sig_len > 0;
+    if (ok) {
+      out_sig->resize(sig_len);
+      ok = EVP_DigestSign(md_ctx, out_sig->data(), &sig_len, content.data(),
+                          content.size()) == 1;
+      out_sig->resize(sig_len);
+    }
+    EVP_MD_CTX_free(md_ctx);
+    return ok;
+  }
+
+  static bool VerifyServerCertVerify(
+      ArrayView<const uint8_t> cert_der,
+      uint16_t sig_scheme,
+      ArrayView<const uint8_t> signature,
+      const std::array<uint8_t, 32>& transcript_hash) {
+    if (sig_scheme != kTlsSigEcdsaSecp256r1Sha256 || cert_der.empty() ||
+        signature.empty()) {
+      return false;
+    }
+    const unsigned char* p = cert_der.data();
+    X509* cert = d2i_X509(nullptr, &p, static_cast<long>(cert_der.size()));
+    if (cert == nullptr) {
+      return false;
+    }
+    EVP_PKEY* pub = X509_get0_pubkey(cert);
+    if (pub == nullptr) {
+      X509_free(cert);
+      return false;
+    }
+    const auto content = BuildServerCertVerifyInput(transcript_hash);
+    EVP_MD_CTX* md_ctx = EVP_MD_CTX_new();
+    const bool ok =
+        md_ctx != nullptr &&
+        EVP_DigestVerifyInit(md_ctx, nullptr, EVP_sha256(), nullptr, pub) ==
+            1 &&
+        EVP_DigestVerify(md_ctx, signature.data(), signature.size(),
+                         content.data(), content.size()) == 1;
+    if (md_ctx != nullptr) {
+      EVP_MD_CTX_free(md_ctx);
+    }
+    X509_free(cert);
+    return ok;
+  }
+
+ private:
+  QuicServerCertContext(EVP_PKEY* pkey,
+                        std::vector<uint8_t> der,
+                        std::array<uint8_t, 32> sha256,
+                        std::string sha256_hex)
+      : pkey_(pkey),
+        der_bytes_(std::move(der)),
+        sha256_(sha256),
+        sha256_hex_(std::move(sha256_hex)) {}
+
+  EVP_PKEY* pkey_ = nullptr;
+  std::vector<uint8_t> der_bytes_;
+  std::array<uint8_t, 32> sha256_{};
+  std::string sha256_hex_;
+};
+
+// RFC 5480 P-256 非压缩公钥 SubjectPublicKeyInfo ASN.1 DER 固定前缀，用于零弃用警告完成 P-256 ECDHE。
+bool ComputeServerP256KeyExchange(ArrayView<const uint8_t> peer_uncompressed_pt,
+                                  std::vector<uint8_t>* out_server_pub,
+                                  std::array<uint8_t, 32>* out_shared_secret) {
+  if (peer_uncompressed_pt.size() != 65 || peer_uncompressed_pt[0] != 0x04) {
+    return false;
+  }
+  static constexpr uint8_t kP256SpkiPrefix[26] = {
+      0x30, 0x59, 0x30, 0x13, 0x06, 0x07, 0x2a, 0x86, 0x48,
+      0xce, 0x3d, 0x02, 0x01, 0x06, 0x08, 0x2a, 0x86, 0x48,
+      0xce, 0x3d, 0x03, 0x01, 0x07, 0x03, 0x42, 0x00,
+  };
+  std::vector<uint8_t> peer_spki(kP256SpkiPrefix, kP256SpkiPrefix + 26);
+  peer_spki.insert(peer_spki.end(), peer_uncompressed_pt.begin(),
+                   peer_uncompressed_pt.end());
+  const unsigned char* pp = peer_spki.data();
+  EVP_PKEY* peer_key =
+      d2i_PUBKEY(nullptr, &pp, static_cast<long>(peer_spki.size()));
+  if (peer_key == nullptr) {
+    return false;
+  }
+
+  EVP_PKEY* local_key = EVP_PKEY_Q_keygen(nullptr, nullptr, "EC", "P-256");
+  if (local_key == nullptr) {
+    EVP_PKEY_free(peer_key);
+    return false;
+  }
+
+  unsigned char* local_spki = nullptr;
+  const int spki_len = i2d_PUBKEY(local_key, &local_spki);
+  bool ok = (spki_len == 91 && local_spki != nullptr && local_spki[26] == 0x04);
+  if (ok) {
+    out_server_pub->assign(local_spki + 26, local_spki + 91);
+  }
+  if (local_spki != nullptr) {
+    OPENSSL_free(local_spki);
+  }
+
+  if (ok) {
+    EVP_PKEY_CTX* dctx = EVP_PKEY_CTX_new(local_key, nullptr);
+    size_t secret_len = out_shared_secret->size();
+    ok = dctx != nullptr && EVP_PKEY_derive_init(dctx) > 0 &&
+         EVP_PKEY_derive_set_peer(dctx, peer_key) > 0 &&
+         EVP_PKEY_derive(dctx, out_shared_secret->data(), &secret_len) > 0 &&
+         secret_len == 32;
+    if (dctx != nullptr) {
+      EVP_PKEY_CTX_free(dctx);
+    }
+  }
+  EVP_PKEY_free(local_key);
+  EVP_PKEY_free(peer_key);
+  return ok;
+}
+
+void AppendUint16BE(uint16_t v, std::vector<uint8_t>* out) {
+  out->push_back(static_cast<uint8_t>((v >> 8) & 0xFFu));
+  out->push_back(static_cast<uint8_t>(v & 0xFFu));
+}
+
+void AppendUint24BE(size_t v, std::vector<uint8_t>* out) {
+  out->push_back(static_cast<uint8_t>((v >> 16) & 0xFFu));
+  out->push_back(static_cast<uint8_t>((v >> 8) & 0xFFu));
+  out->push_back(static_cast<uint8_t>(v & 0xFFu));
+}
+
+void AppendTlsExt(uint16_t ext_type,
+                  ArrayView<const uint8_t> ext_body,
+                  std::vector<uint8_t>* out) {
+  AppendUint16BE(ext_type, out);
+  AppendUint16BE(static_cast<uint16_t>(ext_body.size()), out);
+  out->insert(out->end(), ext_body.begin(), ext_body.end());
+}
+
+std::vector<uint8_t> WrapTlsHandshakeMsg(uint8_t hs_type,
+                                         ArrayView<const uint8_t> body) {
+  std::vector<uint8_t> msg;
+  msg.reserve(4 + body.size());
+  msg.push_back(hs_type);
+  AppendUint24BE(body.size(), &msg);
+  msg.insert(msg.end(), body.begin(), body.end());
+  return msg;
+}
 
 class QuicSessionCore {
  public:
@@ -947,19 +1298,28 @@ class QuicSessionCore {
       bool is_server,
       QuicCid local_scid,
       QuicCid initial_dcid,
-      std::string alpn,
+      std::vector<std::string> supported_alpns,
       QuicSessionEvents* events,
-      std::unique_ptr<IQuicCongestionController> initial_cc = nullptr)
+      std::unique_ptr<IQuicCongestionController> initial_cc = nullptr,
+      std::shared_ptr<QuicServerCertContext> server_cert = nullptr,
+      std::string client_sni_host = {})
       : clock_(clock),
         is_server_(is_server),
         local_scid_(local_scid),
         peer_dcid_(initial_dcid),
         initial_dcid_(initial_dcid),
-        alpn_(std::move(alpn)),
+        supported_alpns_(std::move(supported_alpns)),
+        negotiated_alpn_(supported_alpns_.empty() ? std::string()
+                                                  : supported_alpns_.front()),
         events_(events),
+        server_cert_(std::move(server_cert)),
+        client_sni_host_(std::move(client_sni_host)),
         cc_(initial_cc ? std::move(initial_cc)
                        : CreateBuiltinQuicCongestionController(
                              RTC_QUIC_CC_BBR, kQuicMaxDatagramSize)) {
+    if (is_server_ && !server_cert_) {
+      server_cert_ = QuicServerCertContext::GenerateEphemeralP256();
+    }
     local_tp_.initial_source_cid = local_scid_;
     if (is_server_) {
       local_tp_.original_destination_cid = initial_dcid_;
@@ -1061,6 +1421,49 @@ class QuicSessionCore {
     pending_resets_.push_back(rst);
     FlushPackets(clock_->CurrentTime(), false);
   }
+
+  void StopSending(uint64_t stream_id, uint64_t app_error_code) {
+    if (closed_) {
+      return;
+    }
+    inbound_streams_[stream_id].Reset();
+    PendingStopSending ss;
+    ss.stream_id = stream_id;
+    ss.app_error_code = app_error_code;
+    pending_stop_sendings_.push_back(ss);
+    FlushPackets(clock_->CurrentTime(), false);
+  }
+
+  int SendDatagram(ArrayView<const uint8_t> data) {
+    if (closed_) {
+      return RTC_ERR_NOT_CONNECTED;
+    }
+    const size_t max_payload = max_datagram_payload_size();
+    if (data.size() > max_payload) {
+      return RTC_ERR_INVALID_ARG;
+    }
+    if (pending_datagrams_.size() >= 512) {
+      pending_datagrams_.pop_front();
+    }
+    pending_datagrams_.emplace_back(data.begin(), data.end());
+    FlushPackets(clock_->CurrentTime(), false);
+    return RTC_OK;
+  }
+
+  size_t max_datagram_payload_size() const {
+    const size_t peer_max =
+        (handshake_established_ && peer_tp_.max_datagram_frame_size > 0)
+            ? static_cast<size_t>(peer_tp_.max_datagram_frame_size)
+            : kQuicMaxDatagramSize;
+    const size_t wire_cap = std::min(peer_max, kQuicMaxDatagramSize);
+    constexpr size_t kShortHdrAndFrameOverhead =
+        1 + kQuicCidLength + 4 + kQuicAeadTagLength + 4;
+    return wire_cap > kShortHdrAndFrameOverhead
+               ? (wire_cap - kShortHdrAndFrameOverhead)
+               : 0;
+  }
+
+  const std::string& negotiated_alpn() const { return negotiated_alpn_; }
 
   void ProcessUdpDatagram(ArrayView<const uint8_t> datagram, Timestamp now) {
     if (closed_) {
@@ -1252,11 +1655,17 @@ class QuicSessionCore {
     uint64_t final_size = 0;
   };
 
+  struct PendingStopSending {
+    uint64_t stream_id = 0;
+    uint64_t app_error_code = 0;
+  };
+
   struct SentRetransmittable {
     enum class Kind : uint8_t {
       kCrypto,
       kStream,
       kResetStream,
+      kStopSending,
       kHandshakeDone,
     };
     Kind kind = Kind::kStream;
@@ -1265,6 +1674,7 @@ class QuicSessionCore {
     std::vector<uint8_t> data;
     StreamChunk stream_chunk;
     PendingReset reset_info;
+    PendingStopSending stop_sending_info;
   };
 
   struct SentPacketInfo {
@@ -1293,77 +1703,169 @@ class QuicSessionCore {
     std::deque<StreamChunk> retransmit_chunks;
   };
 
-  // ---------------- 握手消息构造与解析 ----------------
+  // ---------------- 标准 RFC 8446 TLS 1.3 握手消息构造与解析 ----------------
 
   std::vector<uint8_t> BuildClientHello() const {
-    const auto tp_bytes = local_tp_.Encode();
-    std::vector<uint8_t> body;
-    body.insert(body.end(), local_random_.begin(), local_random_.end());
-    body.insert(body.end(), local_x25519_pub_.begin(), local_x25519_pub_.end());
-    QuicVarInt::AppendString(alpn_, &body);
-    QuicVarInt::Append(tp_bytes.size(), &body);
-    body.insert(body.end(), tp_bytes.begin(), tp_bytes.end());
+    std::vector<uint8_t> exts;
+    exts.reserve(256);
 
-    std::vector<uint8_t> msg;
-    msg.push_back(kCryptoMsgClientHello);
-    QuicVarInt::Append(body.size(), &msg);
-    msg.insert(msg.end(), body.begin(), body.end());
-    return msg;
-  }
-
-  std::vector<uint8_t> BuildServerHello() const {
-    std::vector<uint8_t> body;
-    body.insert(body.end(), local_random_.begin(), local_random_.end());
-    body.insert(body.end(), local_x25519_pub_.begin(), local_x25519_pub_.end());
-
-    std::vector<uint8_t> msg;
-    msg.push_back(kCryptoMsgServerHello);
-    QuicVarInt::Append(body.size(), &msg);
-    msg.insert(msg.end(), body.begin(), body.end());
-    return msg;
-  }
-
-  std::vector<uint8_t> BuildServerEncryptedExtAndFinished(
-      ArrayView<const uint8_t> hello_transcript) {
-    const auto tp_bytes = local_tp_.Encode();
-    std::vector<uint8_t> ee_part;
-    QuicVarInt::AppendString(alpn_, &ee_part);
-    QuicVarInt::Append(tp_bytes.size(), &ee_part);
-    ee_part.insert(ee_part.end(), tp_bytes.begin(), tp_bytes.end());
-
-    std::vector<uint8_t> transcript(hello_transcript.begin(),
-                                    hello_transcript.end());
-    transcript.insert(transcript.end(), ee_part.begin(), ee_part.end());
-    const auto thash = QuicCryptoUtils::Sha256(transcript);
-
-    std::array<uint8_t, 32> fin_key{};
-    QuicCryptoUtils::HkdfExpandLabel(
-        tx_keys_[LevelIndex(QuicEncryptionLevel::kHandshake)].secret,
-        "finished", ArrayView<const uint8_t>(), fin_key.data(), fin_key.size());
-    std::array<uint8_t, 32> verify_data{};
-    QuicCryptoUtils::HmacSha256(fin_key, thash, &verify_data);
-
-    std::vector<uint8_t> body = std::move(ee_part);
-    body.insert(body.end(), verify_data.begin(), verify_data.end());
-
-    std::vector<uint8_t> msg;
-    msg.push_back(kCryptoMsgServerEncryptedExtFinished);
-    QuicVarInt::Append(body.size(), &msg);
-    msg.insert(msg.end(), body.begin(), body.end());
-    return msg;
-  }
-
-  bool DeriveHandshakeSecrets(const std::array<uint8_t, 32>& peer_x25519_pub,
-                              ArrayView<const uint8_t> hello_transcript) {
-    std::array<uint8_t, 32> ecdhe_shared{};
-    if (!QuicCryptoUtils::ComputeX25519SharedSecret(
-            local_x25519_priv_, peer_x25519_pub, &ecdhe_shared)) {
-      return false;
+    // 1. SNI 扩展（0x0000）：仅对非 IP 字面量的域名填充。
+    if (!client_sni_host_.empty()) {
+      boost::system::error_code ip_ec;
+      boost::asio::ip::make_address(client_sni_host_, ip_ec);
+      if (ip_ec && client_sni_host_.size() <= 255) {
+        std::vector<uint8_t> sni;
+        AppendUint16BE(static_cast<uint16_t>(3 + client_sni_host_.size()), &sni);
+        sni.push_back(0x00);
+        AppendUint16BE(static_cast<uint16_t>(client_sni_host_.size()), &sni);
+        sni.insert(sni.end(), client_sni_host_.begin(), client_sni_host_.end());
+        AppendTlsExt(kTlsExtServerName, sni, &exts);
+      }
     }
-    if (!QuicCryptoUtils::HkdfExtract(initial_secret_, ecdhe_shared,
+
+    // 2. 支持的协议版本扩展 supported_versions (0x002b) = [TLS 1.3 (0x0304)]
+    const uint8_t sv_ext[] = {0x02, 0x03, 0x04};
+    AppendTlsExt(kTlsExtSupportedVersions, sv_ext, &exts);
+
+    // 3. 支持的椭圆曲线组扩展 supported_groups (0x000a) = [x25519 (0x001d), secp256r1 (0x0017)]
+    const uint8_t sg_ext[] = {0x00, 0x04, 0x00, 0x1d, 0x00, 0x17};
+    AppendTlsExt(kTlsExtSupportedGroups, sg_ext, &exts);
+
+    // 4. 签名算法扩展 signature_algorithms (0x000d) = [ecdsa_secp256r1_sha256, rsa_pss_rsae_sha256]
+    const uint8_t sig_ext[] = {0x00, 0x04, 0x04, 0x03, 0x08, 0x04};
+    AppendTlsExt(kTlsExtSignatureAlgorithms, sig_ext, &exts);
+
+    // 5. 预共享密钥交换模式扩展 psk_key_exchange_modes (0x002d) = [psk_dhe_ke (0x01)]
+    const uint8_t psk_ext[] = {0x01, 0x01};
+    AppendTlsExt(kTlsExtPskKeyExchangeModes, psk_ext, &exts);
+
+    // 6. ALPN 扩展（0x0010）
+    if (!supported_alpns_.empty()) {
+      std::vector<uint8_t> alpn_list;
+      for (const auto& proto : supported_alpns_) {
+        if (!proto.empty() && proto.size() <= 255) {
+          alpn_list.push_back(static_cast<uint8_t>(proto.size()));
+          alpn_list.insert(alpn_list.end(), proto.begin(), proto.end());
+        }
+      }
+      if (!alpn_list.empty()) {
+        std::vector<uint8_t> alpn_ext;
+        AppendUint16BE(static_cast<uint16_t>(alpn_list.size()), &alpn_ext);
+        alpn_ext.insert(alpn_ext.end(), alpn_list.begin(), alpn_list.end());
+        AppendTlsExt(kTlsExtAlpn, alpn_ext, &exts);
+      }
+    }
+
+    // 7. key_share 扩展（0x0033）：x25519 32 字节公钥
+    std::vector<uint8_t> ks_ext;
+    AppendUint16BE(36, &ks_ext);
+    AppendUint16BE(kTlsGroupX25519, &ks_ext);
+    AppendUint16BE(32, &ks_ext);
+    ks_ext.insert(ks_ext.end(), local_x25519_pub_.begin(),
+                  local_x25519_pub_.end());
+    AppendTlsExt(kTlsExtKeyShare, ks_ext, &exts);
+
+    // 8. quic_transport_parameters 扩展（0x0039）
+    const auto tp_bytes = local_tp_.Encode();
+    AppendTlsExt(kTlsExtQuicTransportParams, tp_bytes, &exts);
+
+    std::vector<uint8_t> body;
+    body.reserve(64 + exts.size());
+    AppendUint16BE(0x0303u, &body);  // 兼容层版本号 legacy_version = TLS 1.2
+    body.insert(body.end(), local_random_.begin(), local_random_.end());
+    body.push_back(0x00);            // legacy_session_id 长度 = 0
+    AppendUint16BE(2, &body);        // cipher_suites 字节长度 = 2
+    AppendUint16BE(kTlsCipherAes128GcmSha256, &body);
+    body.push_back(0x01);            // legacy_compression_methods 长度 = 1
+    body.push_back(0x00);            // null 压缩
+    AppendUint16BE(static_cast<uint16_t>(exts.size()), &body);
+    body.insert(body.end(), exts.begin(), exts.end());
+    return WrapTlsHandshakeMsg(kTlsHsClientHello, body);
+  }
+
+  std::vector<uint8_t> BuildServerHello(
+      ArrayView<const uint8_t> legacy_session_id_echo,
+      uint16_t selected_group,
+      ArrayView<const uint8_t> server_key_share) const {
+    std::vector<uint8_t> exts;
+    const uint8_t sv_val[] = {0x03, 0x04};
+    AppendTlsExt(kTlsExtSupportedVersions, sv_val, &exts);
+
+    std::vector<uint8_t> ks_val;
+    AppendUint16BE(selected_group, &ks_val);
+    AppendUint16BE(static_cast<uint16_t>(server_key_share.size()), &ks_val);
+    ks_val.insert(ks_val.end(), server_key_share.begin(),
+                  server_key_share.end());
+    AppendTlsExt(kTlsExtKeyShare, ks_val, &exts);
+
+    std::vector<uint8_t> body;
+    body.reserve(48 + legacy_session_id_echo.size() + exts.size());
+    AppendUint16BE(0x0303u, &body);
+    body.insert(body.end(), local_random_.begin(), local_random_.end());
+    body.push_back(static_cast<uint8_t>(legacy_session_id_echo.size()));
+    body.insert(body.end(), legacy_session_id_echo.begin(),
+                legacy_session_id_echo.end());
+    AppendUint16BE(kTlsCipherAes128GcmSha256, &body);
+    body.push_back(0x00);
+    AppendUint16BE(static_cast<uint16_t>(exts.size()), &body);
+    body.insert(body.end(), exts.begin(), exts.end());
+    return WrapTlsHandshakeMsg(kTlsHsServerHello, body);
+  }
+
+  std::vector<uint8_t> BuildServerEncryptedExtensions(
+      bool include_alpn) const {
+    std::vector<uint8_t> exts;
+    if (include_alpn && !negotiated_alpn_.empty() &&
+        negotiated_alpn_.size() <= 255) {
+      std::vector<uint8_t> alpn_ext;
+      AppendUint16BE(static_cast<uint16_t>(1 + negotiated_alpn_.size()),
+                     &alpn_ext);
+      alpn_ext.push_back(static_cast<uint8_t>(negotiated_alpn_.size()));
+      alpn_ext.insert(alpn_ext.end(), negotiated_alpn_.begin(),
+                      negotiated_alpn_.end());
+      AppendTlsExt(kTlsExtAlpn, alpn_ext, &exts);
+    }
+    const auto tp_bytes = local_tp_.Encode();
+    AppendTlsExt(kTlsExtQuicTransportParams, tp_bytes, &exts);
+
+    std::vector<uint8_t> body;
+    AppendUint16BE(static_cast<uint16_t>(exts.size()), &body);
+    body.insert(body.end(), exts.begin(), exts.end());
+    return WrapTlsHandshakeMsg(kTlsHsEncryptedExtensions, body);
+  }
+
+  std::vector<uint8_t> BuildServerCertificateMsg() const {
+    const auto& cert_der = server_cert_->der_bytes();
+    std::vector<uint8_t> entry;
+    entry.reserve(5 + cert_der.size());
+    AppendUint24BE(cert_der.size(), &entry);
+    entry.insert(entry.end(), cert_der.begin(), cert_der.end());
+    AppendUint16BE(0, &entry);  // 证书条目级扩展为空
+
+    std::vector<uint8_t> body;
+    body.reserve(4 + entry.size());
+    body.push_back(0x00);  // certificate_request_context 长度 = 0
+    AppendUint24BE(entry.size(), &body);
+    body.insert(body.end(), entry.begin(), entry.end());
+    return WrapTlsHandshakeMsg(kTlsHsCertificate, body);
+  }
+
+  bool DeriveTls13HandshakeKeys(const std::array<uint8_t, 32>& ecdhe_shared,
+                                ArrayView<const uint8_t> hello_transcript) {
+    const std::array<uint8_t, 32> zeros{};
+    const auto empty_hash =
+        QuicCryptoUtils::Sha256(ArrayView<const uint8_t>());
+    std::array<uint8_t, 32> early_secret{};
+    std::array<uint8_t, 32> derived_early{};
+    if (!QuicCryptoUtils::HkdfExtract(zeros, zeros, &early_secret) ||
+        !QuicCryptoUtils::HkdfExpandLabel(early_secret, "derived", empty_hash,
+                                          derived_early.data(),
+                                          derived_early.size()) ||
+        !QuicCryptoUtils::HkdfExtract(derived_early, ecdhe_shared,
                                       &handshake_root_secret_)) {
       return false;
     }
+
     const auto hello_hash = QuicCryptoUtils::Sha256(hello_transcript);
     std::array<uint8_t, 32> c_hs{};
     std::array<uint8_t, 32> s_hs{};
@@ -1391,11 +1893,17 @@ class QuicSessionCore {
     return true;
   }
 
-  bool DeriveApplicationSecrets(ArrayView<const uint8_t> full_server_transcript) {
+  bool DeriveApplicationSecrets(
+      ArrayView<const uint8_t> full_server_transcript) {
     const std::array<uint8_t, 32> zeros{};
+    const auto empty_hash =
+        QuicCryptoUtils::Sha256(ArrayView<const uint8_t>());
+    std::array<uint8_t, 32> derived_hs{};
     std::array<uint8_t, 32> master_root{};
-    if (!QuicCryptoUtils::HkdfExtract(handshake_root_secret_, zeros,
-                                      &master_root)) {
+    if (!QuicCryptoUtils::HkdfExpandLabel(
+            handshake_root_secret_, "derived", empty_hash, derived_hs.data(),
+            derived_hs.size()) ||
+        !QuicCryptoUtils::HkdfExtract(derived_hs, zeros, &master_root)) {
       return false;
     }
     const auto hs_hash = QuicCryptoUtils::Sha256(full_server_transcript);
@@ -1435,6 +1943,278 @@ class QuicSessionCore {
     crypto_tx_queue_[idx].push_back(std::move(item));
   }
 
+  bool HandleServerClientHello(ArrayView<const uint8_t> raw_msg,
+                               ArrayView<const uint8_t> body) {
+    if (body.size() < 42) {
+      return false;
+    }
+    size_t off = 2 + 32;  // 跳过 legacy_version(2) 与 random(32)
+    const uint8_t sid_len = body[off++];
+    if (sid_len > 32 || off + sid_len + 2 > body.size()) {
+      return false;
+    }
+    const ArrayView<const uint8_t> legacy_sid = body.subview(off, sid_len);
+    off += sid_len;
+
+    const uint16_t cs_len = ReadBigEndian16(body.data() + off);
+    off += 2;
+    if ((cs_len % 2) != 0 || off + cs_len + 1 > body.size()) {
+      return false;
+    }
+    bool supports_aes128_gcm = false;
+    for (size_t i = 0; i < cs_len; i += 2) {
+      if (ReadBigEndian16(body.data() + off + i) == kTlsCipherAes128GcmSha256) {
+        supports_aes128_gcm = true;
+      }
+    }
+    off += cs_len;
+    if (!supports_aes128_gcm) {
+      return false;
+    }
+
+    const uint8_t comp_len = body[off++];
+    if (off + comp_len + 2 > body.size()) {
+      return false;
+    }
+    off += comp_len;
+
+    const uint16_t exts_len = ReadBigEndian16(body.data() + off);
+    off += 2;
+    if (off + exts_len > body.size()) {
+      return false;
+    }
+
+    const size_t exts_end = off + exts_len;
+    bool saw_alpn_ext = false;
+    std::vector<std::string> client_alpns;
+    std::optional<QuicTransportParameters> parsed_tp;
+    std::optional<std::array<uint8_t, 32>> peer_x25519;
+    std::vector<uint8_t> peer_p256;
+
+    while (off + 4 <= exts_end) {
+      const uint16_t ext_type = ReadBigEndian16(body.data() + off);
+      const uint16_t ext_len = ReadBigEndian16(body.data() + off + 2);
+      off += 4;
+      if (off + ext_len > exts_end) {
+        return false;
+      }
+      const ArrayView<const uint8_t> edata = body.subview(off, ext_len);
+      off += ext_len;
+
+      if (ext_type == kTlsExtAlpn && edata.size() >= 2) {
+        const uint16_t list_len = ReadBigEndian16(edata.data());
+        if (2u + list_len <= edata.size()) {
+          saw_alpn_ext = true;
+          size_t aoff = 2;
+          while (aoff < 2u + list_len) {
+            const uint8_t plen = edata[aoff++];
+            if (plen == 0 || aoff + plen > 2u + list_len) {
+              break;
+            }
+            client_alpns.emplace_back(
+                reinterpret_cast<const char*>(edata.data() + aoff), plen);
+            aoff += plen;
+          }
+        }
+      } else if (ext_type == kTlsExtKeyShare && edata.size() >= 2) {
+        const uint16_t ks_len = ReadBigEndian16(edata.data());
+        if (2u + ks_len <= edata.size()) {
+          size_t koff = 2;
+          while (koff + 4 <= 2u + ks_len) {
+            const uint16_t grp = ReadBigEndian16(edata.data() + koff);
+            const uint16_t klen = ReadBigEndian16(edata.data() + koff + 2);
+            koff += 4;
+            if (koff + klen > 2u + ks_len) {
+              break;
+            }
+            if (grp == kTlsGroupX25519 && klen == 32 &&
+                !peer_x25519.has_value()) {
+              std::array<uint8_t, 32> pub{};
+              std::memcpy(pub.data(), edata.data() + koff, 32);
+              peer_x25519 = pub;
+            } else if (grp == kTlsGroupSecp256r1 && klen == 65 &&
+                       peer_p256.empty()) {
+              peer_p256.assign(edata.data() + koff, edata.data() + koff + 65);
+            }
+            koff += klen;
+          }
+        }
+      } else if (ext_type == kTlsExtQuicTransportParams) {
+        parsed_tp = QuicTransportParameters::Decode(edata);
+      }
+    }
+
+    if (!parsed_tp.has_value() || !server_cert_) {
+      return false;
+    }
+
+    std::string chosen_alpn;
+    if (supported_alpns_.empty()) {
+      if (!client_alpns.empty()) {
+        chosen_alpn = client_alpns.front();
+      }
+    } else {
+      for (const auto& offer : client_alpns) {
+        if (std::find(supported_alpns_.begin(), supported_alpns_.end(),
+                      offer) != supported_alpns_.end()) {
+          chosen_alpn = offer;
+          break;
+        }
+      }
+      if (chosen_alpn.empty()) {
+        RTC_LOG(kWarning) << "QUIC ALPN negotiation failed";
+        CloseConnection(0x0178u);
+        events_->OnConnectionClosed(-120);
+        return false;
+      }
+    }
+
+    uint16_t selected_group = 0;
+    std::vector<uint8_t> server_key_share;
+    std::array<uint8_t, 32> ecdhe_shared{};
+    if (peer_x25519.has_value()) {
+      if (!QuicCryptoUtils::ComputeX25519SharedSecret(
+              local_x25519_priv_, *peer_x25519, &ecdhe_shared)) {
+        return false;
+      }
+      selected_group = kTlsGroupX25519;
+      server_key_share.assign(local_x25519_pub_.begin(),
+                              local_x25519_pub_.end());
+    } else if (!peer_p256.empty()) {
+      if (!ComputeServerP256KeyExchange(peer_p256, &server_key_share,
+                                        &ecdhe_shared)) {
+        return false;
+      }
+      selected_group = kTlsGroupSecp256r1;
+    } else {
+      return false;
+    }
+
+    negotiated_alpn_ = chosen_alpn;
+    peer_tp_ = *parsed_tp;
+    client_hello_bytes_.assign(raw_msg.begin(), raw_msg.end());
+    server_hello_bytes_ =
+        BuildServerHello(legacy_sid, selected_group, server_key_share);
+
+    full_hs_transcript_ = client_hello_bytes_;
+    full_hs_transcript_.insert(full_hs_transcript_.end(),
+                               server_hello_bytes_.begin(),
+                               server_hello_bytes_.end());
+    if (!DeriveTls13HandshakeKeys(ecdhe_shared, full_hs_transcript_)) {
+      return false;
+    }
+
+    const auto ee_msg = BuildServerEncryptedExtensions(saw_alpn_ext);
+    const auto cert_msg = BuildServerCertificateMsg();
+    full_hs_transcript_.insert(full_hs_transcript_.end(), ee_msg.begin(),
+                               ee_msg.end());
+    full_hs_transcript_.insert(full_hs_transcript_.end(), cert_msg.begin(),
+                               cert_msg.end());
+
+    const auto cert_thash = QuicCryptoUtils::Sha256(full_hs_transcript_);
+    std::vector<uint8_t> cv_sig;
+    if (!server_cert_->SignServerCertVerify(cert_thash, &cv_sig)) {
+      return false;
+    }
+    std::vector<uint8_t> cv_body;
+    cv_body.reserve(4 + cv_sig.size());
+    AppendUint16BE(kTlsSigEcdsaSecp256r1Sha256, &cv_body);
+    AppendUint16BE(static_cast<uint16_t>(cv_sig.size()), &cv_body);
+    cv_body.insert(cv_body.end(), cv_sig.begin(), cv_sig.end());
+    const auto cv_msg = WrapTlsHandshakeMsg(kTlsHsCertificateVerify, cv_body);
+    full_hs_transcript_.insert(full_hs_transcript_.end(), cv_msg.begin(),
+                               cv_msg.end());
+
+    const auto cv_thash = QuicCryptoUtils::Sha256(full_hs_transcript_);
+    std::array<uint8_t, 32> s_fin_key{};
+    QuicCryptoUtils::HkdfExpandLabel(
+        tx_keys_[LevelIndex(QuicEncryptionLevel::kHandshake)].secret,
+        "finished", ArrayView<const uint8_t>(), s_fin_key.data(),
+        s_fin_key.size());
+    std::array<uint8_t, 32> s_verify{};
+    QuicCryptoUtils::HmacSha256(s_fin_key, cv_thash, &s_verify);
+    const auto sfin_msg = WrapTlsHandshakeMsg(kTlsHsFinished, s_verify);
+    full_hs_transcript_.insert(full_hs_transcript_.end(), sfin_msg.begin(),
+                               sfin_msg.end());
+
+    if (!DeriveApplicationSecrets(full_hs_transcript_)) {
+      return false;
+    }
+
+    std::vector<uint8_t> hs_flight;
+    hs_flight.reserve(ee_msg.size() + cert_msg.size() + cv_msg.size() +
+                      sfin_msg.size());
+    hs_flight.insert(hs_flight.end(), ee_msg.begin(), ee_msg.end());
+    hs_flight.insert(hs_flight.end(), cert_msg.begin(), cert_msg.end());
+    hs_flight.insert(hs_flight.end(), cv_msg.begin(), cv_msg.end());
+    hs_flight.insert(hs_flight.end(), sfin_msg.begin(), sfin_msg.end());
+
+    server_hello_sent_ = true;
+    QueueCryptoData(QuicEncryptionLevel::kInitial, server_hello_bytes_);
+    QueueCryptoData(QuicEncryptionLevel::kHandshake, hs_flight);
+    return true;
+  }
+
+  bool HandleClientServerHello(ArrayView<const uint8_t> raw_msg,
+                               ArrayView<const uint8_t> body) {
+    if (body.size() < 38) {
+      return false;
+    }
+    size_t off = 2 + 32;  // 跳过 legacy_version(2) 与 random(32)
+    const uint8_t sid_len = body[off++];
+    if (sid_len > 32 || off + sid_len + 3 + 2 > body.size()) {
+      return false;
+    }
+    off += sid_len;
+    const uint16_t cipher = ReadBigEndian16(body.data() + off);
+    off += 2;
+    const uint8_t comp = body[off++];
+    if (cipher != kTlsCipherAes128GcmSha256 || comp != 0x00) {
+      return false;
+    }
+
+    const uint16_t exts_len = ReadBigEndian16(body.data() + off);
+    off += 2;
+    if (off + exts_len > body.size()) {
+      return false;
+    }
+    const size_t exts_end = off + exts_len;
+    std::optional<std::array<uint8_t, 32>> server_x25519;
+    while (off + 4 <= exts_end) {
+      const uint16_t etype = ReadBigEndian16(body.data() + off);
+      const uint16_t elen = ReadBigEndian16(body.data() + off + 2);
+      off += 4;
+      if (off + elen > exts_end) {
+        return false;
+      }
+      const ArrayView<const uint8_t> edata = body.subview(off, elen);
+      off += elen;
+      if (etype == kTlsExtKeyShare && edata.size() == 36) {
+        const uint16_t grp = ReadBigEndian16(edata.data());
+        const uint16_t klen = ReadBigEndian16(edata.data() + 2);
+        if (grp == kTlsGroupX25519 && klen == 32) {
+          std::array<uint8_t, 32> pub{};
+          std::memcpy(pub.data(), edata.data() + 4, 32);
+          server_x25519 = pub;
+        }
+      }
+    }
+    if (!server_x25519.has_value()) {
+      return false;
+    }
+    std::array<uint8_t, 32> ecdhe_shared{};
+    if (!QuicCryptoUtils::ComputeX25519SharedSecret(
+            local_x25519_priv_, *server_x25519, &ecdhe_shared)) {
+      return false;
+    }
+    server_hello_bytes_.assign(raw_msg.begin(), raw_msg.end());
+    full_hs_transcript_ = client_hello_bytes_;
+    full_hs_transcript_.insert(full_hs_transcript_.end(),
+                               server_hello_bytes_.begin(),
+                               server_hello_bytes_.end());
+    return DeriveTls13HandshakeKeys(ecdhe_shared, full_hs_transcript_);
+  }
+
   void HandleCryptoBytes(QuicEncryptionLevel level) {
     const size_t idx = LevelIndex(level);
     std::vector<uint8_t> chunk;
@@ -1446,153 +2226,162 @@ class QuicSessionCore {
     }
 
     auto& buf = crypto_rx_buf_[idx];
-    while (buf.size() >= 2) {
+    while (buf.size() >= 4) {
       const uint8_t msg_type = buf[0];
-      size_t off = 1;
-      uint64_t body_len = 0;
-      if (!QuicVarInt::Read(buf, &off, &body_len) ||
-          off + body_len > buf.size()) {
+      const size_t body_len = (static_cast<size_t>(buf[1]) << 16) |
+                              (static_cast<size_t>(buf[2]) << 8) |
+                              static_cast<size_t>(buf[3]);
+      if (body_len > 65536) {
+        closed_ = true;
+        events_->OnConnectionClosed(-105);
+        return;
+      }
+      const size_t total_msg_len = 4 + body_len;
+      if (total_msg_len > buf.size()) {
         break;
       }
-      const size_t total_msg_len = off + static_cast<size_t>(body_len);
       const std::vector<uint8_t> raw_msg(
           buf.begin(), buf.begin() + static_cast<ptrdiff_t>(total_msg_len));
-      const ArrayView<const uint8_t> body(raw_msg.data() + off,
-                                           static_cast<size_t>(body_len));
+      const ArrayView<const uint8_t> body(raw_msg.data() + 4, body_len);
       buf.erase(buf.begin(),
                 buf.begin() + static_cast<ptrdiff_t>(total_msg_len));
 
       if (is_server_ && level == QuicEncryptionLevel::kInitial &&
-          msg_type == kCryptoMsgClientHello && !server_hello_sent_) {
-        if (body.size() < 64) {
-          continue;
-        }
-        std::array<uint8_t, 32> peer_pub{};
-        std::memcpy(peer_pub.data(), body.data() + 32, 32);
-        size_t boff = 64;
-        std::string client_alpn;
-        uint64_t tp_len = 0;
-        if (!QuicVarInt::ReadString(body, &boff, &client_alpn) ||
-            !QuicVarInt::Read(body, &boff, &tp_len) ||
-            boff + tp_len > body.size()) {
-          continue;
-        }
-        auto parsed_tp = QuicTransportParameters::Decode(
-            body.subview(boff, static_cast<size_t>(tp_len)));
-        if (!parsed_tp.has_value()) {
-          continue;
-        }
-        peer_tp_ = *parsed_tp;
-        client_hello_bytes_ = raw_msg;
-        server_hello_bytes_ = BuildServerHello();
-
-        std::vector<uint8_t> hello_transcript = client_hello_bytes_;
-        hello_transcript.insert(hello_transcript.end(),
-                                server_hello_bytes_.begin(),
-                                server_hello_bytes_.end());
-        if (!DeriveHandshakeSecrets(peer_pub, hello_transcript)) {
-          continue;
-        }
-        server_ee_fin_bytes_ =
-            BuildServerEncryptedExtAndFinished(hello_transcript);
-
-        full_hs_transcript_ = std::move(hello_transcript);
-        full_hs_transcript_.insert(full_hs_transcript_.end(),
-                                   server_ee_fin_bytes_.begin(),
-                                   server_ee_fin_bytes_.end());
-        if (!DeriveApplicationSecrets(full_hs_transcript_)) {
-          continue;
-        }
-
-        server_hello_sent_ = true;
-        QueueCryptoData(QuicEncryptionLevel::kInitial, server_hello_bytes_);
-        QueueCryptoData(QuicEncryptionLevel::kHandshake, server_ee_fin_bytes_);
+          msg_type == kTlsHsClientHello && !server_hello_sent_) {
+        HandleServerClientHello(raw_msg, body);
       } else if (!is_server_ && level == QuicEncryptionLevel::kInitial &&
-                 msg_type == kCryptoMsgServerHello &&
+                 msg_type == kTlsHsServerHello &&
                  !rx_keys_[LevelIndex(QuicEncryptionLevel::kHandshake)].valid) {
-        if (body.size() < 64) {
-          continue;
-        }
-        std::array<uint8_t, 32> peer_pub{};
-        std::memcpy(peer_pub.data(), body.data() + 32, 32);
-        server_hello_bytes_ = raw_msg;
-
-        std::vector<uint8_t> hello_transcript = client_hello_bytes_;
-        hello_transcript.insert(hello_transcript.end(),
-                                server_hello_bytes_.begin(),
-                                server_hello_bytes_.end());
-        DeriveHandshakeSecrets(peer_pub, hello_transcript);
+        HandleClientServerHello(raw_msg, body);
       } else if (!is_server_ && level == QuicEncryptionLevel::kHandshake &&
-                 msg_type == kCryptoMsgServerEncryptedExtFinished &&
                  !handshake_established_) {
-        size_t boff = 0;
-        std::string negotiated_alpn;
-        uint64_t tp_len = 0;
-        if (!QuicVarInt::ReadString(body, &boff, &negotiated_alpn) ||
-            !QuicVarInt::Read(body, &boff, &tp_len) ||
-            boff + tp_len + 32 > body.size()) {
-          continue;
+        if (msg_type == kTlsHsEncryptedExtensions) {
+          if (body.size() < 2) {
+            closed_ = true;
+            events_->OnConnectionClosed(-106);
+            return;
+          }
+          const uint16_t exts_len = ReadBigEndian16(body.data());
+          if (2u + exts_len > body.size()) {
+            closed_ = true;
+            events_->OnConnectionClosed(-106);
+            return;
+          }
+          size_t eoff = 2;
+          while (eoff + 4 <= 2u + exts_len) {
+            const uint16_t etype = ReadBigEndian16(body.data() + eoff);
+            const uint16_t elen = ReadBigEndian16(body.data() + eoff + 2);
+            eoff += 4;
+            if (eoff + elen > 2u + exts_len) {
+              break;
+            }
+            const ArrayView<const uint8_t> edata = body.subview(eoff, elen);
+            eoff += elen;
+            if (etype == kTlsExtAlpn && edata.size() >= 3) {
+              const uint8_t plen = edata[2];
+              if (3u + plen <= edata.size()) {
+                negotiated_alpn_.assign(
+                    reinterpret_cast<const char*>(edata.data() + 3), plen);
+              }
+            } else if (etype == kTlsExtQuicTransportParams) {
+              if (auto tp = QuicTransportParameters::Decode(edata)) {
+                peer_tp_ = *tp;
+              }
+            }
+          }
+          full_hs_transcript_.insert(full_hs_transcript_.end(), raw_msg.begin(),
+                                     raw_msg.end());
+        } else if (msg_type == kTlsHsCertificate) {
+          if (body.size() >= 4) {
+            const uint8_t ctx_len = body[0];
+            if (1u + ctx_len + 3u <= body.size()) {
+              size_t coff = 1u + ctx_len + 3u;
+              if (coff + 3u <= body.size()) {
+                const size_t cert_len =
+                    (static_cast<size_t>(body[coff]) << 16) |
+                    (static_cast<size_t>(body[coff + 1]) << 8) |
+                    static_cast<size_t>(body[coff + 2]);
+                coff += 3u;
+                if (coff + cert_len <= body.size()) {
+                  peer_leaf_cert_der_.assign(body.data() + coff,
+                                             body.data() + coff + cert_len);
+                }
+              }
+            }
+          }
+          full_hs_transcript_.insert(full_hs_transcript_.end(), raw_msg.begin(),
+                                     raw_msg.end());
+        } else if (msg_type == kTlsHsCertificateVerify) {
+          if (body.size() < 4) {
+            closed_ = true;
+            events_->OnConnectionClosed(-107);
+            return;
+          }
+          const uint16_t scheme = ReadBigEndian16(body.data());
+          const uint16_t sig_len = ReadBigEndian16(body.data() + 2);
+          if (4u + sig_len > body.size()) {
+            closed_ = true;
+            events_->OnConnectionClosed(-107);
+            return;
+          }
+          const auto thash = QuicCryptoUtils::Sha256(full_hs_transcript_);
+          if (!QuicServerCertContext::VerifyServerCertVerify(
+                  peer_leaf_cert_der_, scheme, body.subview(4, sig_len),
+                  thash)) {
+            RTC_LOG(kError) << "QUIC TLS 1.3 CertificateVerify failed";
+            closed_ = true;
+            events_->OnConnectionClosed(-107);
+            return;
+          }
+          full_hs_transcript_.insert(full_hs_transcript_.end(), raw_msg.begin(),
+                                     raw_msg.end());
+        } else if (msg_type == kTlsHsFinished) {
+          if (body.size() != 32) {
+            closed_ = true;
+            events_->OnConnectionClosed(-102);
+            return;
+          }
+          const auto thash = QuicCryptoUtils::Sha256(full_hs_transcript_);
+          std::array<uint8_t, 32> s_fin_key{};
+          QuicCryptoUtils::HkdfExpandLabel(
+              rx_keys_[LevelIndex(QuicEncryptionLevel::kHandshake)].secret,
+              "finished", ArrayView<const uint8_t>(), s_fin_key.data(),
+              s_fin_key.size());
+          std::array<uint8_t, 32> expected_mac{};
+          QuicCryptoUtils::HmacSha256(s_fin_key, thash, &expected_mac);
+          if (CRYPTO_memcmp(expected_mac.data(), body.data(), 32) != 0) {
+            RTC_LOG(kError) << "QUIC ServerFinished HMAC verification failed";
+            closed_ = true;
+            events_->OnConnectionClosed(-102);
+            return;
+          }
+          full_hs_transcript_.insert(full_hs_transcript_.end(), raw_msg.begin(),
+                                     raw_msg.end());
+          if (!DeriveApplicationSecrets(full_hs_transcript_)) {
+            continue;
+          }
+
+          const auto full_hash = QuicCryptoUtils::Sha256(full_hs_transcript_);
+          std::array<uint8_t, 32> c_fin_key{};
+          QuicCryptoUtils::HkdfExpandLabel(
+              tx_keys_[LevelIndex(QuicEncryptionLevel::kHandshake)].secret,
+              "finished", ArrayView<const uint8_t>(), c_fin_key.data(),
+              c_fin_key.size());
+          std::array<uint8_t, 32> client_verify{};
+          QuicCryptoUtils::HmacSha256(c_fin_key, full_hash, &client_verify);
+          const auto cfin_msg =
+              WrapTlsHandshakeMsg(kTlsHsFinished, client_verify);
+          QueueCryptoData(QuicEncryptionLevel::kHandshake, cfin_msg);
+
+          handshake_established_ = true;
+          events_->OnHandshakeEstablished();
+        } else {
+          // 兼容跳过其它可选服务端握手记录（如 CertificateRequest 等）。
+          full_hs_transcript_.insert(full_hs_transcript_.end(), raw_msg.begin(),
+                                     raw_msg.end());
         }
-        const size_t ee_len = boff + static_cast<size_t>(tp_len);
-        auto parsed_tp = QuicTransportParameters::Decode(
-            body.subview(boff, static_cast<size_t>(tp_len)));
-        if (!parsed_tp.has_value()) {
-          continue;
-        }
-
-        std::vector<uint8_t> transcript = client_hello_bytes_;
-        transcript.insert(transcript.end(), server_hello_bytes_.begin(),
-                          server_hello_bytes_.end());
-        transcript.insert(transcript.end(), body.data(), body.data() + ee_len);
-        const auto thash = QuicCryptoUtils::Sha256(transcript);
-
-        std::array<uint8_t, 32> s_fin_key{};
-        QuicCryptoUtils::HkdfExpandLabel(
-            rx_keys_[LevelIndex(QuicEncryptionLevel::kHandshake)].secret,
-            "finished", ArrayView<const uint8_t>(), s_fin_key.data(),
-            s_fin_key.size());
-        std::array<uint8_t, 32> expected_mac{};
-        QuicCryptoUtils::HmacSha256(s_fin_key, thash, &expected_mac);
-        if (CRYPTO_memcmp(expected_mac.data(), body.data() + ee_len, 32) != 0) {
-          RTC_LOG(kError) << "QUIC ServerFinished HMAC verification failed";
-          closed_ = true;
-          events_->OnConnectionClosed(-102);
-          return;
-        }
-
-        peer_tp_ = *parsed_tp;
-        full_hs_transcript_ = client_hello_bytes_;
-        full_hs_transcript_.insert(full_hs_transcript_.end(),
-                                   server_hello_bytes_.begin(),
-                                   server_hello_bytes_.end());
-        full_hs_transcript_.insert(full_hs_transcript_.end(), raw_msg.begin(),
-                                   raw_msg.end());
-        if (!DeriveApplicationSecrets(full_hs_transcript_)) {
-          continue;
-        }
-
-        // 在 Handshake 加密级别 CRYPTO 空间中构造并发送 ClientFinished 消息。
-        const auto full_hash = QuicCryptoUtils::Sha256(full_hs_transcript_);
-        std::array<uint8_t, 32> c_fin_key{};
-        QuicCryptoUtils::HkdfExpandLabel(
-            tx_keys_[LevelIndex(QuicEncryptionLevel::kHandshake)].secret,
-            "finished", ArrayView<const uint8_t>(), c_fin_key.data(),
-            c_fin_key.size());
-        std::array<uint8_t, 32> client_verify{};
-        QuicCryptoUtils::HmacSha256(c_fin_key, full_hash, &client_verify);
-
-        std::vector<uint8_t> cfin_msg;
-        cfin_msg.push_back(kCryptoMsgClientFinished);
-        QuicVarInt::Append(client_verify.size(), &cfin_msg);
-        cfin_msg.insert(cfin_msg.end(), client_verify.begin(),
-                        client_verify.end());
-        QueueCryptoData(QuicEncryptionLevel::kHandshake, cfin_msg);
-
-        handshake_established_ = true;
-        events_->OnHandshakeEstablished();
       } else if (is_server_ && level == QuicEncryptionLevel::kHandshake &&
-                 msg_type == kCryptoMsgClientFinished &&
-                 !handshake_established_) {
+                 msg_type == kTlsHsFinished && !handshake_established_) {
         if (body.size() != 32) {
           continue;
         }
@@ -1708,16 +2497,23 @@ class QuicSessionCore {
         if (rx_buf.ExtractContiguous(&ordered, &deliver_fin)) {
           events_->OnPeerStreamData(stream_id, ordered, deliver_fin);
         }
-      } else if (frame_type == kFrameResetStream) {
+      } else if (frame_type == kFrameResetStream ||
+                 frame_type == kFrameResetStreamAt) {
         *out_ack_eliciting = true;
         uint64_t stream_id = 0;
         uint64_t app_err = 0;
         uint64_t final_size = 0;
+        uint64_t reliable_size = 0;
         if (!QuicVarInt::Read(payload, &off, &stream_id) ||
             !QuicVarInt::Read(payload, &off, &app_err) ||
             !QuicVarInt::Read(payload, &off, &final_size)) {
           return false;
         }
+        if (frame_type == kFrameResetStreamAt &&
+            !QuicVarInt::Read(payload, &off, &reliable_size)) {
+          return false;
+        }
+        (void)reliable_size;
         auto& rx_buf = inbound_streams_[stream_id];
         if (!rx_buf.is_reset()) {
           rx_buf.Reset();
@@ -1732,13 +2528,43 @@ class QuicSessionCore {
           return false;
         }
         ResetStream(stream_id, app_err);
-      } else if (frame_type == kFrameMaxData) {
+        events_->OnPeerStopSending(stream_id, app_err);
+      } else if (frame_type == kFrameDatagram ||
+                 frame_type == kFrameDatagramLen) {
         *out_ack_eliciting = true;
-        uint64_t max_data = 0;
-        if (!QuicVarInt::Read(payload, &off, &max_data)) {
+        uint64_t dgram_len = payload.size() - off;
+        if (frame_type == kFrameDatagramLen) {
+          if (!QuicVarInt::Read(payload, &off, &dgram_len) ||
+              off + dgram_len > payload.size()) {
+            return false;
+          }
+        }
+        const ArrayView<const uint8_t> dgram_slice =
+            payload.subview(off, static_cast<size_t>(dgram_len));
+        off += static_cast<size_t>(dgram_len);
+        events_->OnPeerDatagramReceived(dgram_slice);
+      } else if (frame_type == kFrameNewToken) {
+        *out_ack_eliciting = true;
+        uint64_t tok_len = 0;
+        if (!QuicVarInt::Read(payload, &off, &tok_len) ||
+            off + tok_len > payload.size()) {
           return false;
         }
-      } else if (frame_type == kFrameMaxStreamData) {
+        off += static_cast<size_t>(tok_len);
+      } else if (frame_type == kFrameMaxData ||
+                 frame_type == kFrameMaxStreamsBidi ||
+                 frame_type == kFrameMaxStreamsUni ||
+                 frame_type == kFrameDataBlocked ||
+                 frame_type == kFrameStreamsBlockedBidi ||
+                 frame_type == kFrameStreamsBlockedUni ||
+                 frame_type == kFrameRetireConnectionId) {
+        *out_ack_eliciting = true;
+        uint64_t val = 0;
+        if (!QuicVarInt::Read(payload, &off, &val)) {
+          return false;
+        }
+      } else if (frame_type == kFrameMaxStreamData ||
+                 frame_type == kFrameStreamDataBlocked) {
         *out_ack_eliciting = true;
         uint64_t sid = 0;
         uint64_t max_sdata = 0;
@@ -1746,6 +2572,41 @@ class QuicSessionCore {
             !QuicVarInt::Read(payload, &off, &max_sdata)) {
           return false;
         }
+      } else if (frame_type == kFrameNewConnectionId) {
+        *out_ack_eliciting = true;
+        uint64_t seq_no = 0;
+        uint64_t retire_prior = 0;
+        if (!QuicVarInt::Read(payload, &off, &seq_no) ||
+            !QuicVarInt::Read(payload, &off, &retire_prior) ||
+            off + 1 > payload.size()) {
+          return false;
+        }
+        const uint8_t cid_len = payload[off++];
+        if (cid_len < 1 || cid_len > kQuicMaxCidLength ||
+            off + cid_len + 16 > payload.size()) {
+          return false;
+        }
+        if (peer_dcid_.empty()) {
+          peer_dcid_.Assign(payload.data() + off, cid_len);
+        }
+        off += cid_len + 16;
+      } else if (frame_type == kFramePathChallenge) {
+        *out_ack_eliciting = true;
+        if (off + 8 > payload.size()) {
+          return false;
+        }
+        std::array<uint8_t, 8> ch{};
+        std::memcpy(ch.data(), payload.data() + off, 8);
+        off += 8;
+        if (pending_path_responses_.size() < 16) {
+          pending_path_responses_.push_back(ch);
+        }
+      } else if (frame_type == kFramePathResponse) {
+        *out_ack_eliciting = true;
+        if (off + 8 > payload.size()) {
+          return false;
+        }
+        off += 8;
       } else if (frame_type == kFrameHandshakeDone) {
         *out_ack_eliciting = true;
       } else if (frame_type == kFrameConnectionCloseQuic ||
@@ -2030,6 +2891,9 @@ class QuicSessionCore {
         case SentRetransmittable::Kind::kResetStream:
           pending_resets_.push_front(item.reset_info);
           break;
+        case SentRetransmittable::Kind::kStopSending:
+          pending_stop_sendings_.push_front(item.stop_sending_info);
+          break;
         case SentRetransmittable::Kind::kHandshakeDone:
           pending_handshake_done_ = true;
           break;
@@ -2053,9 +2917,9 @@ class QuicSessionCore {
     uint8_t ver[4];
     WriteBigEndian32(ver, kQuicVersion1);
     prefix.insert(prefix.end(), ver, ver + 4);
-    prefix.push_back(static_cast<uint8_t>(kQuicCidLength));
+    prefix.push_back(static_cast<uint8_t>(peer_dcid_.size()));
     prefix.insert(prefix.end(), peer_dcid_.begin(), peer_dcid_.end());
-    prefix.push_back(static_cast<uint8_t>(kQuicCidLength));
+    prefix.push_back(static_cast<uint8_t>(local_scid_.size()));
     prefix.insert(prefix.end(), local_scid_.begin(), local_scid_.end());
     if (level == QuicEncryptionLevel::kInitial) {
       prefix.push_back(0x00u);  // 令牌长度（Token Length）= 0
@@ -2295,7 +3159,9 @@ class QuicSessionCore {
           can_send_in_flight ? SelectHighestPriorityReadyStream() : nullptr;
       const bool has_ctrl_frames =
           can_send_in_flight &&
-          (pending_handshake_done_ || !pending_resets_.empty());
+          (pending_handshake_done_ || !pending_path_responses_.empty() ||
+           !pending_resets_.empty() || !pending_stop_sendings_.empty() ||
+           !pending_datagrams_.empty());
 
       if (!need_ack && !has_ctrl_frames && ready_stream == nullptr &&
           !pto_probe) {
@@ -2306,8 +3172,9 @@ class QuicSessionCore {
       payload.reserve(kQuicMaxDatagramSize);
       std::vector<SentRetransmittable> tracked;
       bool ack_eliciting = false;
-      constexpr size_t kMaxPlaintextBudget =
-          kQuicMaxDatagramSize - (1 + kQuicCidLength + 4 + kQuicAeadTagLength);
+      const size_t kMaxPlaintextBudget =
+          kQuicMaxDatagramSize -
+          (1 + peer_dcid_.size() + 4 + kQuicAeadTagLength);
 
       if (need_ack) {
         const uint64_t delay_us =
@@ -2317,6 +3184,15 @@ class QuicSessionCore {
                 : 0;
         ack_sets_[idx].EncodeAckFrame(delay_us, &payload);
         ack_sets_[idx].ClearAckNeeded();
+      }
+
+      while (can_send_in_flight && !pending_path_responses_.empty() &&
+             payload.size() + 10 <= kMaxPlaintextBudget) {
+        const auto pr = pending_path_responses_.front();
+        pending_path_responses_.pop_front();
+        QuicVarInt::Append(kFramePathResponse, &payload);
+        payload.insert(payload.end(), pr.begin(), pr.end());
+        ack_eliciting = true;
       }
 
       if (can_send_in_flight && pending_handshake_done_ &&
@@ -2342,6 +3218,38 @@ class QuicSessionCore {
         item.kind = SentRetransmittable::Kind::kResetStream;
         item.reset_info = rst;
         tracked.push_back(std::move(item));
+        ack_eliciting = true;
+      }
+
+      while (can_send_in_flight && !pending_stop_sendings_.empty() &&
+             payload.size() + 20 <= kMaxPlaintextBudget) {
+        const PendingStopSending ss = pending_stop_sendings_.front();
+        pending_stop_sendings_.pop_front();
+        QuicVarInt::Append(kFrameStopSending, &payload);
+        QuicVarInt::Append(ss.stream_id, &payload);
+        QuicVarInt::Append(ss.app_error_code, &payload);
+
+        SentRetransmittable item;
+        item.kind = SentRetransmittable::Kind::kStopSending;
+        item.stop_sending_info = ss;
+        tracked.push_back(std::move(item));
+        ack_eliciting = true;
+      }
+
+      // RFC 9221 不可靠数据报帧（0x31）：参与拥塞控制与 RTT 采样，但丢包后绝不重传。
+      while (can_send_in_flight && !pending_datagrams_.empty()) {
+        const auto& dg = pending_datagrams_.front();
+        if (payload.size() + 4 + dg.size() > kMaxPlaintextBudget) {
+          if (payload.empty()) {
+            pending_datagrams_.pop_front();
+            continue;
+          }
+          break;
+        }
+        QuicVarInt::Append(kFrameDatagramLen, &payload);
+        QuicVarInt::Append(dg.size(), &payload);
+        payload.insert(payload.end(), dg.begin(), dg.end());
+        pending_datagrams_.pop_front();
         ack_eliciting = true;
       }
 
@@ -2430,8 +3338,11 @@ class QuicSessionCore {
   QuicCid peer_dcid_;
   const QuicCid initial_dcid_;
   bool peer_scid_learned_ = false;
-  const std::string alpn_;
+  const std::vector<std::string> supported_alpns_;
+  std::string negotiated_alpn_;
   QuicSessionEvents* const events_;
+  std::shared_ptr<QuicServerCertContext> server_cert_;
+  std::string client_sni_host_;
 
   QuicTransportParameters local_tp_;
   QuicTransportParameters peer_tp_;
@@ -2444,7 +3355,7 @@ class QuicSessionCore {
 
   std::vector<uint8_t> client_hello_bytes_;
   std::vector<uint8_t> server_hello_bytes_;
-  std::vector<uint8_t> server_ee_fin_bytes_;
+  std::vector<uint8_t> peer_leaf_cert_der_;
   std::vector<uint8_t> full_hs_transcript_;
 
   bool server_hello_sent_ = false;
@@ -2469,6 +3380,9 @@ class QuicSessionCore {
   std::map<uint64_t, SentPacketInfo> sent_packets_[3]{};
   std::map<uint64_t, OutboundStreamState> outbound_streams_;
   std::deque<PendingReset> pending_resets_;
+  std::deque<PendingStopSending> pending_stop_sendings_;
+  std::deque<std::array<uint8_t, 8>> pending_path_responses_;
+  std::deque<std::vector<uint8_t>> pending_datagrams_;
   std::map<uint64_t, QuicStreamReceiveBuffer> inbound_streams_;
   std::set<uint64_t> announced_inbound_streams_;
 
@@ -2601,8 +3515,9 @@ class AsioQuicClientEngine::Impl final
           const QuicCid local_scid = QuicCryptoUtils::GenerateRandomCid();
           const QuicCid init_dcid = QuicCryptoUtils::GenerateRandomCid();
           self->core_ = std::make_unique<QuicSessionCore>(
-              self->clock_, /*is_server=*/false, local_scid, init_dcid, alpn,
-              self.get(), std::move(self->pending_cc_));
+              self->clock_, /*is_server=*/false, local_scid, init_dcid,
+              SplitAlpnList(alpn), self.get(), std::move(self->pending_cc_),
+              nullptr, host);
 
           self->StartReceiveLoop();
           self->core_->StartClientHandshake();
@@ -2680,6 +3595,44 @@ class AsioQuicClientEngine::Impl final
         }));
   }
 
+  void StopSending(uint64_t stream_id, uint64_t app_error_code) {
+    auto self = shared_from_this();
+    network_queue_->PostTask(
+        SafeTask(safety_.flag(), [self, stream_id, app_error_code]() {
+          RTC_DCHECK_RUN_ON(&self->net_checker_);
+          if (self->core_) {
+            self->core_->StopSending(stream_id, app_error_code);
+          }
+        }));
+  }
+
+  int SendDatagram(ArrayView<const uint8_t> data) {
+    const size_t max_sz = max_datagram_size();
+    if (data.size() > max_sz) {
+      return RTC_ERR_INVALID_ARG;
+    }
+    std::vector<uint8_t> copy(data.begin(), data.end());
+    auto self = shared_from_this();
+    network_queue_->PostTask(
+        SafeTask(safety_.flag(), [self, buf = std::move(copy)]() {
+          RTC_DCHECK_RUN_ON(&self->net_checker_);
+          if (self->core_) {
+            self->core_->SendDatagram(buf);
+            self->UpdateCachedSnapshot();
+          }
+        }));
+    return RTC_OK;
+  }
+
+  size_t max_datagram_size() const {
+    return max_dgram_payload_.load(std::memory_order_acquire);
+  }
+
+  std::string negotiated_alpn() const {
+    std::lock_guard<std::mutex> lock(snap_mutex_);
+    return cached_alpn_;
+  }
+
   QuicCongestionSnapshot GetCongestionSnapshot() const {
     std::lock_guard<std::mutex> lock(snap_mutex_);
     return cached_snapshot_;
@@ -2734,6 +3687,18 @@ class AsioQuicClientEngine::Impl final
     }
   }
 
+  void OnPeerStopSending(uint64_t stream_id, uint64_t app_error_code) override {
+    if (auto* obs = observer_.load(std::memory_order_acquire)) {
+      obs->OnStreamStopSending(stream_id, app_error_code);
+    }
+  }
+
+  void OnPeerDatagramReceived(ArrayView<const uint8_t> data) override {
+    if (auto* obs = observer_.load(std::memory_order_acquire)) {
+      obs->OnDatagramReceived(data);
+    }
+  }
+
  private:
   void StartReceiveLoop() {
     if (!socket_.is_open()) {
@@ -2780,8 +3745,11 @@ class AsioQuicClientEngine::Impl final
     }
     const QuicCongestionSnapshot snap =
         core_->GetCongestionSnapshot(clock_->CurrentTime());
+    max_dgram_payload_.store(core_->max_datagram_payload_size(),
+                             std::memory_order_release);
     std::lock_guard<std::mutex> lock(snap_mutex_);
     cached_snapshot_ = snap;
+    cached_alpn_ = core_->negotiated_alpn();
   }
 
   Clock* const clock_;
@@ -2799,9 +3767,11 @@ class AsioQuicClientEngine::Impl final
   std::atomic<uint64_t> next_uni_id_{2};
   std::atomic<double> tx_drop_prob_{0.0};
   std::atomic<double> rx_drop_prob_{0.0};
+  std::atomic<size_t> max_dgram_payload_{kQuicMaxDatagramSize - 32};
 
   mutable std::mutex snap_mutex_;
   QuicCongestionSnapshot cached_snapshot_;
+  std::string cached_alpn_;
   ScopedTaskSafety safety_;
 };
 
@@ -2850,6 +3820,23 @@ void AsioQuicClientEngine::ResetStream(uint64_t stream_id,
   impl_->ResetStream(stream_id, app_error_code);
 }
 
+void AsioQuicClientEngine::StopSending(uint64_t stream_id,
+                                       uint64_t app_error_code) {
+  impl_->StopSending(stream_id, app_error_code);
+}
+
+int AsioQuicClientEngine::SendDatagram(ArrayView<const uint8_t> data) {
+  return impl_->SendDatagram(data);
+}
+
+size_t AsioQuicClientEngine::max_datagram_size() const {
+  return impl_->max_datagram_size();
+}
+
+std::string AsioQuicClientEngine::negotiated_alpn() const {
+  return impl_->negotiated_alpn();
+}
+
 QuicCongestionSnapshot AsioQuicClientEngine::GetCongestionSnapshot() const {
   return impl_->GetCongestionSnapshot();
 }
@@ -2873,15 +3860,24 @@ class AsioQuicServer::ServerImpl
              TaskQueueBoost* network_queue,
              IQuicServerVisitor* visitor,
              std::string bind_ip,
-             std::string expected_alpn)
+             std::vector<std::string> supported_alpns)
       : clock_(clock),
         network_queue_(network_queue),
         net_checker_(network_queue),
         visitor_(visitor),
         bind_ip_(std::move(bind_ip)),
-        expected_alpn_(std::move(expected_alpn)),
+        supported_alpns_(std::move(supported_alpns)),
+        server_cert_(QuicServerCertContext::GenerateEphemeralP256()),
         socket_(network_queue->io_context()),
         safety_(PendingTaskSafetyFlag::CreateDetached()) {}
+
+  std::array<uint8_t, 32> certificate_sha256() const {
+    return server_cert_ ? server_cert_->sha256() : std::array<uint8_t, 32>{};
+  }
+
+  std::string certificate_sha256_hex() const {
+    return server_cert_ ? server_cert_->sha256_hex() : std::string{};
+  }
 
   bool Start(uint16_t udp_port, uint16_t* out_bound_port) {
     bool ok = false;
@@ -2988,9 +3984,10 @@ class AsioQuicServer::ServerImpl
                 /*is_server=*/true,
                 server_scid,
                 client_initial_dcid,
-                parent->expected_alpn_,
+                parent->supported_alpns_,
                 this,
-                std::move(initial_cc)) {
+                std::move(initial_cc),
+                parent->server_cert_) {
       cached_snapshot_.timestamp = parent_->clock_->CurrentTime();
     }
 
@@ -3003,6 +4000,11 @@ class AsioQuicServer::ServerImpl
     }
 
     uint64_t session_id() const override { return id_; }
+
+    std::string negotiated_alpn() const override {
+      std::lock_guard<std::mutex> lock(snap_mutex_);
+      return cached_alpn_;
+    }
 
     uint64_t OpenBidirectionalStream() override {
       const uint64_t sid =
@@ -3063,6 +4065,39 @@ class AsioQuicServer::ServerImpl
           }));
     }
 
+    void StopSending(uint64_t stream_id, uint64_t app_error_code) override {
+      auto self = shared_from_this();
+      parent_->network_queue_->PostTask(SafeTask(
+          parent_->safety_.flag(), [self, stream_id, app_error_code]() {
+            RTC_DCHECK_RUN_ON(&self->parent_->net_checker_);
+            if (!self->core_.is_closed()) {
+              self->core_.StopSending(stream_id, app_error_code);
+            }
+          }));
+    }
+
+    int SendDatagram(ArrayView<const uint8_t> data) override {
+      const size_t max_sz = max_datagram_size();
+      if (data.size() > max_sz) {
+        return RTC_ERR_INVALID_ARG;
+      }
+      std::vector<uint8_t> copy(data.begin(), data.end());
+      auto self = shared_from_this();
+      parent_->network_queue_->PostTask(
+          SafeTask(parent_->safety_.flag(), [self, buf = std::move(copy)]() {
+            RTC_DCHECK_RUN_ON(&self->parent_->net_checker_);
+            if (!self->core_.is_closed()) {
+              self->core_.SendDatagram(buf);
+              self->UpdateCachedSnapshot();
+            }
+          }));
+      return RTC_OK;
+    }
+
+    size_t max_datagram_size() const override {
+      return max_dgram_payload_.load(std::memory_order_acquire);
+    }
+
     void Close(uint64_t app_error_code) override {
       auto self = shared_from_this();
       parent_->network_queue_->PostTask(
@@ -3106,8 +4141,10 @@ class AsioQuicServer::ServerImpl
     }
 
     void OnHandshakeEstablished() override {
+      UpdateCachedSnapshot();
       RTC_LOG(kInfo) << "AsioQuicServer session=" << id_
-                     << " QUIC v1 handshake established from "
+                     << " QUIC v1 handshake established (ALPN="
+                     << core_.negotiated_alpn() << ") from "
                      << peer_endpoint_.address().to_string() << ":"
                      << peer_endpoint_.port();
       if (parent_->visitor_ != nullptr) {
@@ -3143,12 +4180,29 @@ class AsioQuicServer::ServerImpl
       }
     }
 
+    void OnPeerStopSending(uint64_t stream_id,
+                           uint64_t app_error_code) override {
+      if (parent_->visitor_ != nullptr) {
+        parent_->visitor_->OnServerStreamStopSending(id_, stream_id,
+                                                     app_error_code);
+      }
+    }
+
+    void OnPeerDatagramReceived(ArrayView<const uint8_t> data) override {
+      if (parent_->visitor_ != nullptr) {
+        parent_->visitor_->OnServerDatagramReceived(id_, data);
+      }
+    }
+
    private:
     void UpdateCachedSnapshot() {
       const QuicCongestionSnapshot snap =
           core_.GetCongestionSnapshot(parent_->clock_->CurrentTime());
+      max_dgram_payload_.store(core_.max_datagram_payload_size(),
+                               std::memory_order_release);
       std::lock_guard<std::mutex> lock(snap_mutex_);
       cached_snapshot_ = snap;
+      cached_alpn_ = core_.negotiated_alpn();
     }
 
     const uint64_t id_;
@@ -3160,8 +4214,10 @@ class AsioQuicServer::ServerImpl
     bool disconnect_notified_ = false;
     std::atomic<uint64_t> next_bidi_id_{1};
     std::atomic<uint64_t> next_uni_id_{3};
+    std::atomic<size_t> max_dgram_payload_{kQuicMaxDatagramSize - 32};
     mutable std::mutex snap_mutex_;
     QuicCongestionSnapshot cached_snapshot_;
+    std::string cached_alpn_;
   };
 
   void StartReceiveLoop() {
@@ -3258,7 +4314,8 @@ class AsioQuicServer::ServerImpl
   SequenceChecker net_checker_;
   IQuicServerVisitor* const visitor_;
   const std::string bind_ip_;
-  const std::string expected_alpn_;
+  const std::vector<std::string> supported_alpns_;
+  std::shared_ptr<QuicServerCertContext> server_cert_;
   boost::asio::ip::udp::socket socket_;
   boost::asio::ip::udp::endpoint sender_endpoint_;
   std::array<uint8_t, 2048> rx_buf_{};
@@ -3277,11 +4334,23 @@ AsioQuicServer::AsioQuicServer(Clock* clock,
                                IQuicServerVisitor* visitor,
                                std::string bind_ip,
                                std::string expected_alpn)
+    : impl_(std::make_shared<ServerImpl>(
+          clock,
+          network_queue,
+          visitor,
+          std::move(bind_ip),
+          SplitAlpnList(expected_alpn))) {}
+
+AsioQuicServer::AsioQuicServer(Clock* clock,
+                               TaskQueueBoost* network_queue,
+                               IQuicServerVisitor* visitor,
+                               std::string bind_ip,
+                               std::vector<std::string> supported_alpns)
     : impl_(std::make_shared<ServerImpl>(clock,
                                          network_queue,
                                          visitor,
                                          std::move(bind_ip),
-                                         std::move(expected_alpn))) {}
+                                         std::move(supported_alpns))) {}
 
 AsioQuicServer::~AsioQuicServer() { Stop(); }
 
@@ -3290,6 +4359,14 @@ bool AsioQuicServer::Start(uint16_t udp_port) {
 }
 
 void AsioQuicServer::Stop() { impl_->Stop(); }
+
+std::array<uint8_t, 32> AsioQuicServer::certificate_sha256() const {
+  return impl_->certificate_sha256();
+}
+
+std::string AsioQuicServer::certificate_sha256_hex() const {
+  return impl_->certificate_sha256_hex();
+}
 
 void AsioQuicServer::SetSimulatedDropRates(double rx_drop_prob,
                                            double tx_drop_prob) {

@@ -9,11 +9,14 @@
 
 #include <array>
 #include <atomic>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
+#include <set>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -38,10 +41,17 @@ enum class StunMessageType : uint16_t {
   kAllocateRequest = 0x0003,
   kAllocateResponse = 0x0103,
   kAllocateErrorResponse = 0x0113,
+  kRefreshRequest = 0x0004,
+  kRefreshResponse = 0x0104,
+  kRefreshErrorResponse = 0x0114,
+  kSendIndication = 0x0016,
+  kDataIndication = 0x0017,
   kCreatePermissionRequest = 0x0008,
   kCreatePermissionResponse = 0x0108,
+  kCreatePermissionErrorResponse = 0x0118,
   kChannelBindRequest = 0x0009,
   kChannelBindResponse = 0x0109,
+  kChannelBindErrorResponse = 0x0119,
 };
 
 namespace stun_attr_type {
@@ -49,13 +59,17 @@ constexpr uint16_t kUsername = 0x0006;
 constexpr uint16_t kMessageIntegrity = 0x0008;
 constexpr uint16_t kErrorCode = 0x0009;
 constexpr uint16_t kChannelNumber = 0x000C;
+constexpr uint16_t kLifetime = 0x000D;
 constexpr uint16_t kXorPeerAddress = 0x0012;
+constexpr uint16_t kData = 0x0013;
 constexpr uint16_t kRealm = 0x0014;
 constexpr uint16_t kNonce = 0x0015;
 constexpr uint16_t kXorRelayedAddress = 0x0016;
+constexpr uint16_t kRequestedTransport = 0x0019;
 constexpr uint16_t kXorMappedAddress = 0x0020;
 constexpr uint16_t kPriority = 0x0024;
 constexpr uint16_t kUseCandidate = 0x0025;
+constexpr uint16_t kSoftware = 0x8022;
 constexpr uint16_t kFingerprint = 0x8028;
 constexpr uint16_t kIceControlled = 0x8029;
 constexpr uint16_t kIceControlling = 0x802A;
@@ -105,8 +119,30 @@ class StunMessage {
   void set_channel_number(uint16_t ch) { channel_number_ = ch; }
   std::optional<uint16_t> channel_number() const { return channel_number_; }
 
-  void set_error_code(int code) { error_code_ = code; }
+  void set_lifetime(uint32_t seconds) { lifetime_ = seconds; }
+  std::optional<uint32_t> lifetime() const { return lifetime_; }
+
+  void set_requested_transport(uint8_t proto) { requested_transport_ = proto; }
+  std::optional<uint8_t> requested_transport() const {
+    return requested_transport_;
+  }
+
+  void set_data(ArrayView<const uint8_t> payload) {
+    data_.emplace(payload.begin(), payload.end());
+  }
+  const std::optional<std::vector<uint8_t>>& data() const { return data_; }
+
+  void set_software(std::string s) { software_ = std::move(s); }
+  const std::optional<std::string>& software() const { return software_; }
+
+  void set_error_code(int code, std::string reason = {}) {
+    error_code_ = code;
+    error_reason_ = std::move(reason);
+  }
   std::optional<int> error_code() const { return error_code_; }
+  const std::string& error_reason() const { return error_reason_; }
+
+  bool has_message_integrity() const { return has_message_integrity_; }
 
   void set_xor_mapped_address(const boost::asio::ip::udp::endpoint& ep) {
     xor_mapped_ = ep;
@@ -123,10 +159,21 @@ class StunMessage {
   }
 
   void set_xor_peer_address(const boost::asio::ip::udp::endpoint& ep) {
-    xor_peer_ = ep;
+    xor_peers_.clear();
+    xor_peers_.push_back(ep);
+  }
+  void add_xor_peer_address(const boost::asio::ip::udp::endpoint& ep) {
+    xor_peers_.push_back(ep);
   }
   std::optional<boost::asio::ip::udp::endpoint> xor_peer_address() const {
-    return xor_peer_;
+    if (xor_peers_.empty()) {
+      return std::nullopt;
+    }
+    return xor_peers_.front();
+  }
+  const std::vector<boost::asio::ip::udp::endpoint>& xor_peer_addresses()
+      const {
+    return xor_peers_;
   }
 
   std::vector<uint8_t> Serialize(std::string_view integrity_key = "",
@@ -151,10 +198,16 @@ class StunMessage {
   std::optional<uint64_t> ice_controlling_;
   std::optional<uint64_t> ice_controlled_;
   std::optional<uint16_t> channel_number_;
+  std::optional<uint32_t> lifetime_;
+  std::optional<uint8_t> requested_transport_;
+  std::optional<std::vector<uint8_t>> data_;
+  std::optional<std::string> software_;
   std::optional<int> error_code_;
+  std::string error_reason_;
+  bool has_message_integrity_ = false;
   std::optional<boost::asio::ip::udp::endpoint> xor_mapped_;
   std::optional<boost::asio::ip::udp::endpoint> xor_relayed_;
-  std::optional<boost::asio::ip::udp::endpoint> xor_peer_;
+  std::vector<boost::asio::ip::udp::endpoint> xor_peers_;
 };
 
 class TurnChannelDataCodec {
@@ -219,6 +272,8 @@ class IceTransportObserver {
 
 struct TurnServerSpec {
   boost::asio::ip::udp::endpoint server_endpoint;
+  std::string host;
+  uint16_t port = 3478;
   std::string username;
   std::string password;
   bool is_turn = false;
@@ -226,6 +281,11 @@ struct TurnServerSpec {
 
 class IceTransportChannel {
  public:
+  static bool ParseIceServerUri(std::string_view uri,
+                                std::string_view username,
+                                std::string_view password,
+                                TurnServerSpec* out_spec);
+
   IceTransportChannel(Clock* clock,
                       TaskQueueBoost* network_queue,
                       IceTransportObserver* observer,
@@ -244,6 +304,7 @@ class IceTransportChannel {
   void ConfigureServers(const std::vector<TurnServerSpec>& servers);
 
   bool StartGatheringAndBind(uint16_t preferred_local_port = 0);
+  bool WaitForServerReflexiveGathering(TimeDelta max_wait);
   void AddRemoteCandidate(const IceCandidate& remote);
   void RestartIce(const IceParameters& new_local_params);
 
@@ -304,22 +365,43 @@ class IceTransportChannel {
     std::string realm;
     std::string nonce;
     std::string integrity_key;
-    uint16_t bound_channel = 0x4000;
+    uint16_t next_channel = 0x4000;
+    uint32_t lifetime_sec = 600;
     bool allocated = false;
-    bool channel_bound = false;
+    Timestamp last_refresh_sent = Timestamp::MinusInfinity();
     boost::asio::ip::udp::endpoint relayed_ep;
-    boost::asio::ip::udp::endpoint bound_peer_ep;
+    std::map<boost::asio::ip::udp::endpoint, uint16_t> peer_to_channel;
+    std::map<uint16_t, boost::asio::ip::udp::endpoint> channel_to_peer;
+    std::set<uint16_t> confirmed_channels;
+  };
+
+  struct ResolvedServerEntry {
+    TurnServerSpec spec;
+    std::vector<boost::asio::ip::udp::endpoint> resolved_endpoints;
+    bool resolving = false;
+    bool dns_failed = false;
+    bool srflx_gathered = false;
+    int stun_tx_count = 0;
+    Timestamp last_stun_tx = Timestamp::MinusInfinity();
   };
 
   void DoAsyncReceive();
+  void NotifyServerGatheringProgress();
+  void ResolveAndProbeServer(size_t server_index);
+  void SendStunProbeToServer(size_t server_index, Timestamp now);
   void HandleUdpDatagram(ArrayView<const uint8_t> datagram,
-                         const boost::asio::ip::udp::endpoint& from);
+                         const boost::asio::ip::udp::endpoint& from,
+                         bool via_turn_relay = false);
   void HandleIncomingStun(ArrayView<const uint8_t> datagram,
-                          const boost::asio::ip::udp::endpoint& from);
+                          const boost::asio::ip::udp::endpoint& from,
+                          bool via_turn_relay = false);
   void RebuildCandidatePairs();
   void OnPeriodicCheckTick();
   void SendConnectivityCheck(size_t pair_index);
   void StartTurnAllocation(const TurnServerSpec& turn);
+  void EnsureTurnPeerBound(const boost::asio::ip::udp::endpoint& peer_ep);
+  int SendViaTurnRelay(const boost::asio::ip::udp::endpoint& peer_ep,
+                       ArrayView<const uint8_t> payload);
   void SetState(IceTransportState new_state);
 
   Clock* const clock_;
@@ -331,6 +413,7 @@ class IceTransportChannel {
   std::atomic<double> rx_drop_prob_{0.0};
 
   std::unique_ptr<boost::asio::ip::udp::socket> socket_;
+  std::unique_ptr<boost::asio::ip::udp::resolver> resolver_;
   std::array<uint8_t, 2048> rx_buf_{};
   boost::asio::ip::udp::endpoint sender_ep_;
   uint16_t bound_port_ = 0;
@@ -338,6 +421,7 @@ class IceTransportChannel {
   IceParameters local_params_;
   IceParameters remote_params_;
   std::vector<TurnServerSpec> servers_;
+  std::vector<ResolvedServerEntry> resolved_servers_;
 
   std::vector<IceCandidate> local_candidates_;
   std::vector<IceCandidate> remote_candidates_;
@@ -348,6 +432,9 @@ class IceTransportChannel {
 
   std::atomic<IceTransportState> state_{IceTransportState::kNew};
   std::atomic<int64_t> smoothed_rtt_us_{30'000};
+  mutable std::mutex gather_cv_mu_;
+  std::condition_variable gather_cv_;
+  bool all_servers_settled_ = true;
   ScopedTaskSafety safety_;
 };
 

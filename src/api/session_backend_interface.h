@@ -27,6 +27,9 @@ class IMoqQuicEngineObserver {
                             ArrayView<const uint8_t> data,
                             bool fin) = 0;
   virtual void OnStreamReset(uint64_t stream_id, uint64_t app_error_code) = 0;
+  virtual void OnStreamStopSending(uint64_t /*stream_id*/,
+                                   uint64_t /*app_error_code*/) {}
+  virtual void OnDatagramReceived(ArrayView<const uint8_t> /*data*/) {}
 };
 
 struct QuicCongestionSnapshot {
@@ -68,6 +71,18 @@ class IMoqQuicEngine {
                           bool fin) = 0;
 
   virtual void ResetStream(uint64_t stream_id, uint64_t app_error_code) = 0;
+
+  virtual void StopSending(uint64_t /*stream_id*/, uint64_t /*app_error_code*/) {}
+
+  virtual int SendDatagram(ArrayView<const uint8_t> /*data*/) {
+    return RTC_ERR_PROTOCOL;
+  }
+
+  virtual size_t max_datagram_size() const { return 0; }
+
+  virtual std::string negotiated_alpn() const { return {}; }
+
+  virtual bool is_webtransport() const { return false; }
 
   virtual QuicCongestionSnapshot GetCongestionSnapshot() const = 0;
 

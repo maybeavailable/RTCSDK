@@ -18,6 +18,7 @@
 #include "modules/rtp_rtcp/rtp_video_packetizer.h"
 #include "modules/video_coding/video_coding_module.h"
 #include "moq/asio_quic_transport.h"
+#include "moq/http3_webtransport.h"
 #include "moq/moq_transport.h"
 #include "p2p/stun_turn_ice.h"
 #include "pc/dtls_srtp_transport.h"
@@ -434,20 +435,32 @@ TEST(MoqTransportTest, VarIntControlAndLocPackagerRoundTrip) {
 
   MoqControlMessage sub;
   sub.type = MoqControlMessageType::kSubscribe;
-  sub.subscribe_id = 42;
-  sub.track_alias = 142;
-  sub.track_namespace = "room1/cam_01";
+  sub.request_id = 42;
+  sub.required_request_id_delta = 1;
+  sub.track_namespace = MoqtTrackNamespace::MakePeerNamespace("room1", "cam_01");
   sub.track_name = "video/high";
-  sub.subscriber_priority = 64;
-  sub.filter_type = MoqFilterType::kLatestGroup;
+  sub.parameters.delivery_timeout_ms = 250;
+  sub.parameters.forward = 1;
+  sub.parameters.subscriber_priority = 64;
+  sub.parameters.subscription_filter =
+      MoqtSubscriptionFilter{MoqFilterType::kNextGroupStart, {}, 0};
+  sub.parameters.new_group_request = 0;
   const auto sub_wire = sub.Encode();
   size_t sub_consumed = 0;
-  const auto parsed_sub = MoqControlMessage::Decode(sub_wire, &sub_consumed);
+  bool sub_violation = false;
+  const auto parsed_sub =
+      MoqControlMessage::Decode(sub_wire, &sub_consumed, &sub_violation);
   ASSERT_TRUE(parsed_sub.has_value());
-  EXPECT_EQ(parsed_sub->subscribe_id, 42u);
-  EXPECT_EQ(parsed_sub->track_alias, 142u);
-  EXPECT_EQ(parsed_sub->track_namespace, "room1/cam_01");
+  EXPECT_FALSE(sub_violation);
+  EXPECT_EQ(parsed_sub->request_id, 42u);
+  EXPECT_EQ(parsed_sub->required_request_id_delta, 1u);
+  EXPECT_EQ(parsed_sub->track_namespace.ToSlashString(), "rtc/room1/cam_01");
   EXPECT_EQ(parsed_sub->track_name, "video/high");
+  EXPECT_EQ(parsed_sub->parameters.subscriber_priority, 64);
+  ASSERT_TRUE(parsed_sub->parameters.subscription_filter.has_value());
+  EXPECT_EQ(parsed_sub->parameters.subscription_filter->type,
+            MoqFilterType::kNextGroupStart);
+  EXPECT_EQ(parsed_sub->parameters.new_group_request, 0u);
 
   EncodedVideoFrame orig;
   orig.capture_time = Timestamp::Micros(1234567);
@@ -1355,6 +1368,482 @@ TEST(MoqDataChannelTest, MoqDataPackagerStreamingUnpackAndZeroLengthPayload) {
   EXPECT_TRUE(decoded[1].is_binary);
   EXPECT_FALSE(decoded[1].ordered);
   EXPECT_EQ(decoded[1].payload, obj_bin.payload);
+}
+
+// 21. 验证 IETF draft-ietf-moq-transport-17 官方 vi64 测试向量（表 2）、SETUP、SUBGROUP_HEADER 与 OBJECT_DATAGRAM
+TEST(MoqDraft17WireTest, Vi64Table2TestVectorsAndSubgroupAndDatagramCodec) {
+  // 校验 draft-17 第 1.4.1 节表 2 官方字节序列测试向量。
+  struct Vi64Vector {
+    std::vector<uint8_t> wire;
+    uint64_t expected;
+    bool canonical;
+  };
+  const std::vector<Vi64Vector> vectors = {
+      {{0x25}, 37ULL, true},
+      {{0x80, 0x25}, 37ULL, false},
+      {{0xbb, 0xbd}, 15293ULL, true},
+      {{0xfa, 0xa1, 0xa0, 0xe4, 0x03, 0xd8}, 2893212287960ULL, true},
+      {{0xfe, 0xfa, 0x31, 0x8f, 0xa8, 0xe3, 0xca, 0x11},
+       70423237261249041ULL,
+       true},
+      {{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff},
+       18446744073709551615ULL,
+       true},
+  };
+  for (const auto& vec : vectors) {
+    size_t off = 0;
+    uint64_t decoded_val = 0;
+    bool bad = false;
+    ASSERT_TRUE(MoqtVarInt::Read(vec.wire, &off, &decoded_val, &bad));
+    EXPECT_FALSE(bad);
+    EXPECT_EQ(off, vec.wire.size());
+    EXPECT_EQ(decoded_val, vec.expected);
+    if (vec.canonical) {
+      std::vector<uint8_t> reencoded;
+      MoqtVarInt::Append(vec.expected, &reencoded);
+      EXPECT_EQ(reencoded, vec.wire);
+    }
+  }
+
+  // 校验 0xFC 与 0xFD 非法编码点必须触发 PROTOCOL_VIOLATION。
+  for (uint8_t invalid_b : {uint8_t{0xFC}, uint8_t{0xFD}}) {
+    const std::vector<uint8_t> bad_wire = {invalid_b, 0x01, 0x02, 0x03,
+                                           0x04,      0x05, 0x06, 0x07};
+    size_t off = 0;
+    uint64_t val = 0;
+    bool bad_cp = false;
+    EXPECT_FALSE(MoqtVarInt::Read(bad_wire, &off, &val, &bad_cp));
+    EXPECT_TRUE(bad_cp);
+  }
+
+  // 校验 SETUP (0x2F00) 与 Key-Value-Pair 升序差分编码。
+  MoqControlMessage setup;
+  setup.type = MoqControlMessageType::kSetup;
+  setup.setup_options.push_back(
+      MoqtKeyValuePair::MakeString(kMoqtSetupOptionImplementation, "RTCSDK-17"));
+  setup.setup_options.push_back(
+      MoqtKeyValuePair::MakeString(kMoqtSetupOptionPath, "/moq"));
+  setup.setup_options.push_back(
+      MoqtKeyValuePair::MakeVarInt(kMoqtSetupOptionMaxAuthTokenCacheSize, 4096));
+  const auto setup_wire = setup.Encode();
+  size_t s_consumed = 0;
+  const auto parsed_setup = MoqControlMessage::Decode(setup_wire, &s_consumed);
+  ASSERT_TRUE(parsed_setup.has_value());
+  EXPECT_EQ(parsed_setup->type, MoqControlMessageType::kSetup);
+  ASSERT_EQ(parsed_setup->setup_options.size(), 3u);
+  EXPECT_EQ(parsed_setup->setup_options[0].type, kMoqtSetupOptionPath);
+  EXPECT_EQ(parsed_setup->setup_options[1].type,
+            kMoqtSetupOptionMaxAuthTokenCacheSize);
+  EXPECT_EQ(parsed_setup->setup_options[1].int_value, 4096u);
+  EXPECT_EQ(parsed_setup->setup_options[2].type,
+            kMoqtSetupOptionImplementation);
+
+  // 校验 SUBGROUP_HEADER (0x14) 与连续对象 Object ID Delta 等于 0 的紧凑编码。
+  MoqSubgroupHeader shdr;
+  shdr.track_alias = 2;
+  shdr.group_id = 9;
+  shdr.subgroup_id = 1;
+  shdr.publisher_priority = 32;
+  shdr.has_properties = true;
+  std::vector<uint8_t> sg_stream = shdr.Encode();
+
+  MoqtSubgroupObject obj0;
+  obj0.object_id = 0;
+  obj0.properties.push_back(MoqtKeyValuePair::MakeVarInt(0x02, 100));
+  obj0.payload = {'a', 'b', 'c', 'd'};
+  const auto w0 = obj0.Encode(std::nullopt, true);
+
+  MoqtSubgroupObject obj1;
+  obj1.object_id = 1;
+  obj1.payload = {'e', 'f', 'g', 'h'};
+  const auto w1 = obj1.Encode(0, true);
+  // 连续递增 Object ID (0 -> 1) 的首字节 Object ID Delta 必须为 0x00。
+  ASSERT_FALSE(w1.empty());
+  EXPECT_EQ(w1[0], 0x00u);
+
+  MoqtSubgroupObject obj_eog;
+  obj_eog.object_id = 2;
+  obj_eog.status = MoqtObjectStatus::kEndOfGroup;
+  const auto w2 = obj_eog.Encode(1, true);
+
+  sg_stream.insert(sg_stream.end(), w0.begin(), w0.end());
+  sg_stream.insert(sg_stream.end(), w1.begin(), w1.end());
+  sg_stream.insert(sg_stream.end(), w2.begin(), w2.end());
+
+  size_t off = 0;
+  auto dec_hdr = MoqSubgroupHeader::Decode(sg_stream, &off);
+  ASSERT_TRUE(dec_hdr.has_value());
+  EXPECT_EQ(dec_hdr->track_alias, 2u);
+  EXPECT_EQ(dec_hdr->group_id, 9u);
+  EXPECT_EQ(dec_hdr->subgroup_id, 1u);
+  EXPECT_TRUE(dec_hdr->has_properties);
+
+  size_t c0 = 0;
+  auto dec0 = MoqtSubgroupObject::Decode(
+      MakeArrayView(sg_stream.data() + off, sg_stream.size() - off),
+      std::nullopt, true, &c0);
+  ASSERT_TRUE(dec0.has_value());
+  EXPECT_EQ(dec0->object_id, 0u);
+  EXPECT_EQ(dec0->payload, obj0.payload);
+  off += c0;
+
+  size_t c1 = 0;
+  auto dec1 = MoqtSubgroupObject::Decode(
+      MakeArrayView(sg_stream.data() + off, sg_stream.size() - off),
+      dec0->object_id, true, &c1);
+  ASSERT_TRUE(dec1.has_value());
+  EXPECT_EQ(dec1->object_id, 1u);
+  EXPECT_EQ(dec1->payload, obj1.payload);
+  off += c1;
+
+  size_t c2 = 0;
+  auto dec2 = MoqtSubgroupObject::Decode(
+      MakeArrayView(sg_stream.data() + off, sg_stream.size() - off),
+      dec1->object_id, true, &c2);
+  ASSERT_TRUE(dec2.has_value());
+  EXPECT_EQ(dec2->object_id, 2u);
+  EXPECT_EQ(dec2->status, MoqtObjectStatus::kEndOfGroup);
+
+  // 校验非法 SUBGROUP_HEADER 类型 0x16（SUBGROUP_ID_MODE == 0b11）触发协议违规。
+  const std::vector<uint8_t> bad_sg = {0x16, 0x01, 0x01, 0x20};
+  size_t bad_c = 0;
+  bool sg_viol = false;
+  EXPECT_FALSE(MoqSubgroupHeader::Decode(bad_sg, &bad_c, &sg_viol).has_value());
+  EXPECT_TRUE(sg_viol);
+
+  // 校验 OBJECT_DATAGRAM 往返与非法组合（0x22 = STATUS | END_OF_GROUP）拒绝。
+  MoqtObjectDatagram dgram;
+  dgram.track_alias = 50;
+  dgram.group_id = 3;
+  dgram.object_id = 7;
+  dgram.publisher_priority = 10;
+  dgram.end_of_group = true;
+  dgram.payload = {0xDE, 0xAD, 0xBE, 0xEF};
+  const auto dg_wire = dgram.Encode();
+  const auto dg_dec = MoqtObjectDatagram::Decode(dg_wire);
+  ASSERT_TRUE(dg_dec.has_value());
+  EXPECT_EQ(dg_dec->track_alias, 50u);
+  EXPECT_EQ(dg_dec->group_id, 3u);
+  EXPECT_EQ(dg_dec->object_id, 7u);
+  EXPECT_TRUE(dg_dec->end_of_group);
+  EXPECT_EQ(dg_dec->payload, dgram.payload);
+
+  const std::vector<uint8_t> bad_dg = {0x22, 0x01, 0x00, 0x01, 0x10, 0x03};
+  bool dg_viol = false;
+  EXPECT_FALSE(MoqtObjectDatagram::Decode(bad_dg, &dg_viol).has_value());
+  EXPECT_TRUE(dg_viol);
+}
+
+// 22. 验证 HTTP/3 QPACK（静态表 + RFC 7541 Huffman）、SETTINGS、Capsule 与 WebTransport 错误码映射
+TEST(Http3WebTransportUnitTest,
+     QpackHuffmanSettingsCapsulesAndErrorCodeMapping) {
+  const std::string sample =
+      "https://rtc.example.com:4433/moq?room=alpha&token=xyz_123";
+  const auto huff = QpackCodec::HuffmanEncode(sample);
+  EXPECT_LT(huff.size(), sample.size());
+  std::string plain;
+  ASSERT_TRUE(QpackCodec::HuffmanDecode(huff, &plain));
+  EXPECT_EQ(plain, sample);
+
+  const std::vector<HttpHeaderField> req_headers = {
+      {":method", "CONNECT"},
+      {":scheme", "https"},
+      {":authority", "127.0.0.1:4433"},
+      {":path", "/moq"},
+      {":protocol", "webtransport"},
+      {"wt-available-protocols", FormatWtAvailableProtocols({"moqt-17", "h3"})},
+  };
+  const auto qpack_bytes = QpackCodec::EncodeFieldSection(req_headers, true);
+  std::vector<HttpHeaderField> decoded_headers;
+  ASSERT_TRUE(QpackCodec::DecodeFieldSection(qpack_bytes, &decoded_headers));
+  ASSERT_EQ(decoded_headers.size(), req_headers.size());
+  for (size_t i = 0; i < req_headers.size(); ++i) {
+    EXPECT_EQ(decoded_headers[i].name, req_headers[i].name);
+    EXPECT_EQ(decoded_headers[i].value, req_headers[i].value);
+  }
+  const auto parsed_protos =
+      ParseWtAvailableProtocols(decoded_headers[5].value);
+  ASSERT_EQ(parsed_protos.size(), 2u);
+  EXPECT_EQ(parsed_protos[0], "moqt-17");
+  EXPECT_EQ(parsed_protos[1], "h3");
+
+  // 校验 HTTP/3 SETTINGS 帧往返。
+  Http3Settings settings;
+  settings.wt_max_sessions = 8;
+  const auto settings_frame = settings.EncodeFrame();
+  size_t f_consumed = 0;
+  const auto parsed_frame = Http3Frame::Decode(settings_frame, &f_consumed);
+  ASSERT_TRUE(parsed_frame.has_value());
+  EXPECT_EQ(parsed_frame->type, kH3FrameSettings);
+  const auto parsed_settings =
+      Http3Settings::DecodePayload(parsed_frame->payload);
+  ASSERT_TRUE(parsed_settings.has_value());
+  EXPECT_TRUE(parsed_settings->enable_connect_protocol);
+  EXPECT_TRUE(parsed_settings->h3_datagram);
+  EXPECT_EQ(parsed_settings->wt_max_sessions, 8u);
+
+  // 校验 WT_CLOSE_SESSION Capsule 往返。
+  const auto close_cap =
+      WebTransportCapsule::EncodeCloseSession(42, "graceful shutdown");
+  size_t cap_consumed = 0;
+  const auto dec_cap = WebTransportCapsule::Decode(close_cap, &cap_consumed);
+  ASSERT_TRUE(dec_cap.has_value());
+  EXPECT_EQ(dec_cap->type, kWtCapsuleCloseSession);
+  uint32_t err_code = 0;
+  std::string err_msg;
+  ASSERT_TRUE(WebTransportCapsule::DecodeCloseSession(dec_cap->value, &err_code,
+                                                      &err_msg));
+  EXPECT_EQ(err_code, 42u);
+  EXPECT_EQ(err_msg, "graceful shutdown");
+
+  // 校验 draft-ietf-webtrans-http3-14 图 4 应用错误码首尾边界与跳过 grease 槽位映射。
+  EXPECT_EQ(WebTransportCodeToHttp3Code(0u), 0x52E4A40FA8DBULL);
+  EXPECT_EQ(WebTransportCodeToHttp3Code(0xFFFFFFFFu), 0x52E5AC983162ULL);
+  for (uint32_t code : {0u, 1u, 29u, 30u, 31u, 1024u, 0xFFFFFFFFu}) {
+    const uint64_t h3_code = WebTransportCodeToHttp3Code(code);
+    EXPECT_NE((h3_code - 0x21ULL) % 0x1FULL, 0u);
+    const auto back = Http3CodeToWebTransportCode(h3_code);
+    ASSERT_TRUE(back.has_value());
+    EXPECT_EQ(*back, code);
+  }
+}
+
+TEST(IceStunDnsResolutionTest, UriParsingAndAsyncDomainNameSrflxGathering) {
+  TurnServerSpec spec{};
+  ASSERT_TRUE(IceTransportChannel::ParseIceServerUri(
+      "stun:stun.l.google.com:19302", "", "", &spec));
+  EXPECT_FALSE(spec.is_turn);
+  EXPECT_EQ(spec.host, "stun.l.google.com");
+  EXPECT_EQ(spec.port, 19302);
+  EXPECT_EQ(spec.server_endpoint.port(), 0);
+
+  ASSERT_TRUE(IceTransportChannel::ParseIceServerUri(
+      "stun:stun.cloudflare.com", "", "", &spec));
+  EXPECT_FALSE(spec.is_turn);
+  EXPECT_EQ(spec.host, "stun.cloudflare.com");
+  EXPECT_EQ(spec.port, 3478);
+
+  ASSERT_TRUE(IceTransportChannel::ParseIceServerUri(
+      "stuns:stun.example.org", "", "", &spec));
+  EXPECT_FALSE(spec.is_turn);
+  EXPECT_EQ(spec.port, 5349);
+
+  ASSERT_TRUE(IceTransportChannel::ParseIceServerUri(
+      "turn:turn.example.com:3479?transport=udp", "alice", "secret", &spec));
+  EXPECT_TRUE(spec.is_turn);
+  EXPECT_EQ(spec.host, "turn.example.com");
+  EXPECT_EQ(spec.port, 3479);
+  EXPECT_EQ(spec.username, "alice");
+  EXPECT_EQ(spec.password, "secret");
+
+  ASSERT_TRUE(IceTransportChannel::ParseIceServerUri(
+      "stun://localhost:19302", "", "", &spec));
+  EXPECT_EQ(spec.host, "localhost");
+  EXPECT_EQ(spec.port, 19302);
+
+  ASSERT_TRUE(IceTransportChannel::ParseIceServerUri(
+      "stun:[2001:4860:4860::8888]:19302", "", "", &spec));
+  EXPECT_EQ(spec.host, "2001:4860:4860::8888");
+  EXPECT_EQ(spec.port, 19302);
+  EXPECT_TRUE(spec.server_endpoint.address().is_v6());
+
+  EXPECT_FALSE(IceTransportChannel::ParseIceServerUri(
+      "turn:turn.example.com:3478?transport=tcp", "u", "p", &spec));
+  EXPECT_FALSE(IceTransportChannel::ParseIceServerUri(
+      "http://example.com:3478", "", "", &spec));
+  EXPECT_FALSE(
+      IceTransportChannel::ParseIceServerUri("stun::3478", "", "", &spec));
+
+  // 启动本地真实 UDP STUN 反射服务，并通过域名 `stun:localhost:<port>` 验证异步 DNS 解析与 srflx 收集。
+  boost::asio::io_context stun_ioc;
+  boost::asio::ip::udp::socket stun_sock(
+      stun_ioc,
+      boost::asio::ip::udp::endpoint(
+          boost::asio::ip::make_address_v4("127.0.0.1"), 0));
+  const uint16_t stun_port = stun_sock.local_endpoint().port();
+  std::atomic<bool> stop_stun{false};
+  std::thread stun_thread([&]() {
+    std::array<uint8_t, 512> rx{};
+    boost::asio::ip::udp::endpoint cli_ep;
+    stun_sock.non_blocking(true);
+    while (!stop_stun.load(std::memory_order_acquire)) {
+      boost::system::error_code ec;
+      const size_t n =
+          stun_sock.receive_from(boost::asio::buffer(rx), cli_ep, 0, ec);
+      if (!ec && n >= 20) {
+        auto req = StunMessage::Parse(MakeArrayView(rx.data(), n), "");
+        if (req.has_value() &&
+            req->type() == StunMessageType::kBindingRequest) {
+          StunMessage resp(StunMessageType::kBindingResponse);
+          resp.set_transaction_id(req->transaction_id());
+          resp.set_xor_mapped_address(boost::asio::ip::udp::endpoint(
+              boost::asio::ip::make_address_v4("198.51.100.88"), 49152));
+          const auto wire = resp.Serialize("", true);
+          stun_sock.send_to(boost::asio::buffer(wire), cli_ep, 0, ec);
+        }
+      } else {
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+      }
+    }
+  });
+
+  TaskQueueBoost net_q("test-ice-dns", TaskQueuePriority::kHigh);
+  IceTransportChannel ice(Clock::GetRealTimeClock(), &net_q, nullptr, true);
+
+  TurnServerSpec bad_dns_spec{};
+  ASSERT_TRUE(IceTransportChannel::ParseIceServerUri(
+      "stun:nonexistent.invalid:3478", "", "", &bad_dns_spec));
+  TurnServerSpec localhost_spec{};
+  ASSERT_TRUE(IceTransportChannel::ParseIceServerUri(
+      "stun:localhost:" + std::to_string(stun_port), "", "", &localhost_spec));
+  EXPECT_EQ(localhost_spec.server_endpoint.port(), 0);
+
+  ice.ConfigureServers({bad_dns_spec, localhost_spec});
+  ASSERT_TRUE(ice.StartGatheringAndBind(0));
+  EXPECT_TRUE(ice.WaitForServerReflexiveGathering(TimeDelta::Millis(1500)));
+
+  const auto cands = ice.LocalCandidatesSnapshot();
+  bool found_srflx = false;
+  for (const auto& c : cands) {
+    if (c.type == IceCandidateType::kSrflx &&
+        c.address.address().to_string() == "198.51.100.88" &&
+        c.address.port() == 49152) {
+      found_srflx = true;
+    }
+  }
+  EXPECT_TRUE(found_srflx);
+
+  stop_stun.store(true, std::memory_order_release);
+  stun_thread.join();
+  net_q.Shutdown();
+}
+
+TEST(QuicTransportTest, VariableLengthCidAndW3cWebTransportCertHash) {
+  // 模拟浏览器发送 16 字节 DCID + 0 字节 SCID 的 QUIC Initial 数据包。
+  const uint8_t browser_dcid[16] = {0x10, 0x21, 0x32, 0x43, 0x54, 0x65,
+                                    0x76, 0x87, 0x98, 0xa9, 0xba, 0xcb,
+                                    0xdc, 0xed, 0xfe, 0x0f};
+  QuicTrafficKeys client_keys;
+  QuicTrafficKeys server_keys;
+  ASSERT_TRUE(QuicCryptoUtils::DeriveInitialKeys(
+      MakeArrayView(browser_dcid, 16), &client_keys, &server_keys, nullptr));
+
+  std::vector<uint8_t> hdr = {0xC3, 0x00, 0x00, 0x00, 0x01, 0x10};
+  hdr.insert(hdr.end(), browser_dcid, browser_dcid + 16);
+  hdr.push_back(0x00);  // SCID 长度 = 0（如 Firefox neqo 默认行为）
+  hdr.push_back(0x00);  // Token 长度 = 0
+
+  const uint8_t ping[] = {0x01};
+  const auto pkt = QuicCryptoUtils::ProtectPacket(
+      client_keys, 0, hdr, /*is_long_header=*/true, MakeArrayView(ping, 1),
+      kQuicMinClientInitialSize);
+  ASSERT_GE(pkt.size(), kQuicMinClientInitialSize);
+
+  const auto unprot = QuicCryptoUtils::UnprotectPacket(pkt, client_keys, -1);
+  ASSERT_TRUE(unprot.has_value());
+  EXPECT_EQ(unprot->dcid.size(), 16u);
+  EXPECT_TRUE(unprot->scid.empty());
+  EXPECT_EQ(0, std::memcmp(unprot->dcid.data(), browser_dcid, 16));
+
+  // 验证 QUIC 服务端生成的 W3C WebTransport 自定义证书指纹非空且格式合规。
+  TaskQueueBoost q("test-quic-cert", TaskQueuePriority::kNormal);
+  class DummyVisitor final : public IQuicServerVisitor {
+   public:
+    void OnServerSessionConnected(
+        std::shared_ptr<QuicServerSessionHandle>) override {}
+    void OnServerSessionDisconnected(uint64_t, int) override {}
+    void OnServerStreamOpened(uint64_t, uint64_t, bool) override {}
+    void OnServerStreamData(uint64_t,
+                            uint64_t,
+                            ArrayView<const uint8_t>,
+                            bool) override {}
+    void OnServerStreamReset(uint64_t, uint64_t, uint64_t) override {}
+  } dummy;
+  AsioQuicServer srv(Clock::GetRealTimeClock(), &q, &dummy, "127.0.0.1", "h3");
+  EXPECT_EQ(srv.certificate_sha256_hex().size(), 64u);
+  q.Shutdown();
+}
+
+TEST(StunTurnCodecUnitTest, Rfc5766AttributesMultiPeerDataAndChannelData) {
+  const std::string realm = "rtc.turn.local";
+  const std::string user = "device_01";
+  const std::string pass = "turn_secret_key";
+  const std::string key = StunMessage::ComputeLongTermKey(user, realm, pass);
+  ASSERT_EQ(key.size(), 16u);
+
+  // 1. 验证 TURN Allocate 请求属性（REQUESTED-TRANSPORT、LIFETIME、SOFTWARE、长期凭证完整性）。
+  StunMessage alloc_req(StunMessageType::kAllocateRequest);
+  alloc_req.set_requested_transport(17);
+  alloc_req.set_lifetime(1200);
+  alloc_req.set_username(user);
+  alloc_req.set_realm(realm);
+  alloc_req.set_nonce("1700000000:abcdef0123456789");
+  alloc_req.set_software("RTCSDK-UnitTest");
+
+  const auto alloc_wire = alloc_req.Serialize(key, true);
+  const auto parsed_alloc = StunMessage::Parse(alloc_wire, key);
+  ASSERT_TRUE(parsed_alloc.has_value());
+  EXPECT_EQ(parsed_alloc->type(), StunMessageType::kAllocateRequest);
+  EXPECT_TRUE(parsed_alloc->has_message_integrity());
+  ASSERT_TRUE(parsed_alloc->requested_transport().has_value());
+  EXPECT_EQ(*parsed_alloc->requested_transport(), 17u);
+  ASSERT_TRUE(parsed_alloc->lifetime().has_value());
+  EXPECT_EQ(*parsed_alloc->lifetime(), 1200u);
+  EXPECT_EQ(parsed_alloc->username().value_or(""), user);
+  EXPECT_EQ(parsed_alloc->realm().value_or(""), realm);
+  EXPECT_EQ(parsed_alloc->software().value_or(""), "RTCSDK-UnitTest");
+  // 使用错误密钥解析必须拒绝。
+  EXPECT_FALSE(StunMessage::Parse(alloc_wire, "wrong_16byte_key").has_value());
+
+  // 2. 验证 CreatePermission 携带多个 XOR-PEER-ADDRESS 属性的编解码保序性。
+  StunMessage perm_req(StunMessageType::kCreatePermissionRequest);
+  const boost::asio::ip::udp::endpoint peer1(
+      boost::asio::ip::make_address_v4("198.51.100.10"), 50000);
+  const boost::asio::ip::udp::endpoint peer2(
+      boost::asio::ip::make_address_v4("203.0.113.25"), 50002);
+  perm_req.add_xor_peer_address(peer1);
+  perm_req.add_xor_peer_address(peer2);
+  const auto perm_wire = perm_req.Serialize(key, true);
+  const auto parsed_perm = StunMessage::Parse(perm_wire, key);
+  ASSERT_TRUE(parsed_perm.has_value());
+  ASSERT_EQ(parsed_perm->xor_peer_addresses().size(), 2u);
+  EXPECT_EQ(parsed_perm->xor_peer_addresses()[0], peer1);
+  EXPECT_EQ(parsed_perm->xor_peer_addresses()[1], peer2);
+
+  // 3. 验证非 4 字节对齐负载的 Send Indication（DATA 属性 4 字节填充边界）与错误码原因短语。
+  StunMessage send_ind(StunMessageType::kSendIndication);
+  send_ind.set_xor_peer_address(peer1);
+  const std::vector<uint8_t> odd_payload = {0x01, 0x02, 0x03, 0x04, 0x05,
+                                            0x06, 0x07, 0x08, 0x09, 0x0A,
+                                            0x0B, 0x0C, 0x0D};
+  send_ind.set_data(odd_payload);
+  const auto ind_wire = send_ind.Serialize("", true);
+  const auto parsed_ind = StunMessage::Parse(ind_wire, "");
+  ASSERT_TRUE(parsed_ind.has_value());
+  EXPECT_EQ(parsed_ind->type(), StunMessageType::kSendIndication);
+  ASSERT_TRUE(parsed_ind->xor_peer_address().has_value());
+  EXPECT_EQ(*parsed_ind->xor_peer_address(), peer1);
+  ASSERT_TRUE(parsed_ind->data().has_value());
+  EXPECT_EQ(*parsed_ind->data(), odd_payload);
+
+  StunMessage err_resp(StunMessageType::kAllocateErrorResponse);
+  err_resp.set_error_code(438, "Stale Nonce");
+  const auto err_wire = err_resp.Serialize("", true);
+  const auto parsed_err = StunMessage::Parse(err_wire, "");
+  ASSERT_TRUE(parsed_err.has_value());
+  ASSERT_TRUE(parsed_err->error_code().has_value());
+  EXPECT_EQ(*parsed_err->error_code(), 438);
+  EXPECT_EQ(parsed_err->error_reason(), "Stale Nonce");
+
+  // 4. 验证 RFC 5766 4 字节 ChannelData 封装与解封装。
+  const auto ch_wire = TurnChannelDataCodec::Wrap(0x4003, odd_payload);
+  EXPECT_TRUE(TurnChannelDataCodec::IsChannelData(ch_wire));
+  uint16_t ch_num = 0;
+  ArrayView<const uint8_t> unwrapped;
+  ASSERT_TRUE(TurnChannelDataCodec::Unwrap(ch_wire, &ch_num, &unwrapped));
+  EXPECT_EQ(ch_num, 0x4003);
+  EXPECT_EQ(std::vector<uint8_t>(unwrapped.begin(), unwrapped.end()),
+            odd_payload);
 }
 
 }  // namespace

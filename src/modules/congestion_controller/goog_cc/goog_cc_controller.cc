@@ -578,6 +578,20 @@ void SendSideBandwidthEstimation::UpdateDelayBasedEstimate(Timestamp at_time,
   UpdateEstimate(at_time);
 }
 
+void SendSideBandwidthEstimation::ApplyProbeBitrate(Timestamp at_time,
+                                                    DataRate bitrate) {
+  delay_based_limit_ =
+      bitrate > DataRate::Zero() ? bitrate : DataRate::Infinity();
+  // 当主动探测簇在当前低丢包条件下实测到更高的可用带宽时，解除陈旧的丢包限速状态并对齐目标码率。
+  if (last_fraction_loss_ <= 12 && bitrate > current_target_) {
+    is_loss_limited_ = false;
+    current_target_ = std::clamp(bitrate, min_bitrate_, max_bitrate_);
+    time_last_loss_ramp_ = at_time;
+    return;
+  }
+  UpdateEstimate(at_time);
+}
+
 void SendSideBandwidthEstimation::SetAcknowledgedRate(
     std::optional<DataRate> acked_rate,
     Timestamp /*at_time*/) {
@@ -797,6 +811,14 @@ std::vector<ProbeClusterConfig> ProbeController::RequestProbe(
 }
 
 std::vector<ProbeClusterConfig> ProbeController::Process(Timestamp at_time) {
+  // 对齐上游 WebRTC kMaxWaitingTimeForProbingResult (1s)：防止探测包丢失或过载抑制导致状态永久卡在等待态。
+  if (state_ == State::kWaitingForProbingResult &&
+      time_last_probing_initiated_.IsFinite() &&
+      (at_time - time_last_probing_initiated_) >= TimeDelta::Seconds(1)) {
+    state_ = State::kProbingComplete;
+    min_bitrate_to_probe_further_ = DataRate::Infinity();
+  }
+
   if (alr_start_time_.has_value() && estimated_bitrate_ > DataRate::Zero() &&
       (time_last_probing_initiated_.IsMinusInfinity() ||
        (at_time - time_last_probing_initiated_) >= TimeDelta::Seconds(5))) {
@@ -806,13 +828,13 @@ std::vector<ProbeClusterConfig> ProbeController::Process(Timestamp at_time) {
       return InitiateProbing(at_time, {probe_rate}, true);
     }
   }
-  // 拥塞降码率后的周期性恢复探测：当估计码率显著低于最大允许码率时，每 2.5 秒发起一次短促 1.8x 探测簇，
+  // 拥塞降码率后的周期性恢复探测：当估计码率显著低于最大允许码率时，每 1.8 秒发起一次短促 1.8x 探测簇，
   // 以便在物理瓶颈带宽恢复后迅速探测到新增容量；若链路仍饱和则由 ProbeBitrateEstimator 自动截断。
   if (state_ == State::kProbingComplete &&
       estimated_bitrate_ > DataRate::Zero() &&
       estimated_bitrate_ < max_bitrate_ * 0.75 &&
       (time_last_probing_initiated_.IsMinusInfinity() ||
-       (at_time - time_last_probing_initiated_) >= TimeDelta::Millis(2500))) {
+       (at_time - time_last_probing_initiated_) >= TimeDelta::Millis(1800))) {
     const DataRate probe_rate =
         std::min(max_bitrate_, estimated_bitrate_ * 1.8);
     if (probe_rate > estimated_bitrate_ * 1.15) {
@@ -1077,9 +1099,14 @@ NetworkControlUpdate GoogCcNetworkController::OnTransportPacketsFeedback(
   bandwidth_estimation_.SetAcknowledgedRate(acked_bitrate, report.feedback_time);
 
   Timestamp latest_packet_send_time = Timestamp::MinusInfinity();
+  bool has_probe_feedback = false;
   for (const auto& fb : received) {
     latest_packet_send_time =
         std::max(latest_packet_send_time, fb.sent_packet.send_time);
+    if (fb.sent_packet.pacing_info.probe_cluster_id !=
+        PacedPacketInfo::kNotAProbe) {
+      has_probe_feedback = true;
+    }
     probe_bitrate_estimator_.HandleProbeAndEstimateBitrate(fb);
 
     TimeDelta send_delta = TimeDelta::Zero();
@@ -1104,33 +1131,48 @@ NetworkControlUpdate GoogCcNetworkController::OnTransportPacketsFeedback(
       probe_bitrate_estimator_.FetchAndResetLastEstimatedBitrate();
   BandwidthUsage state = trendline_estimator_.State();
 
-  // 拥塞窗口回推（CongestionWindowPushback）：若在途数据量顶满 BDP 拥塞窗口，
-  // 且实际吞吐量明显低于当前估计值，则触发过载信号以排空驻留队列，使 target_rate 收敛至真实容量。
+  // 拥塞窗口回推：若在途数据量顶满拥塞窗口，且实际吞吐量明显低于当前估计值，
+  // 则触发过载信号以排空驻留队列；但在主动探测刚提速后的吞吐量滑窗预热期内跳过回推，避免误杀新探测结果。
+  const bool in_probe_grace_window =
+      has_probe_feedback || probe_bitrate.has_value() ||
+      (last_probe_result_time_.IsFinite() &&
+       (report.feedback_time - last_probe_result_time_) <
+           TimeDelta::Millis(550));
   const DataSize current_cwnd = std::max(
       DataSize::Bytes(4800),
       bandwidth_estimation_.target_rate() *
           (bandwidth_estimation_.rtt() + TimeDelta::Millis(150)));
-  if (state == BandwidthUsage::kBwNormal && acked_bitrate.has_value() &&
+  if (!in_probe_grace_window && state == BandwidthUsage::kBwNormal &&
+      acked_bitrate.has_value() &&
       report.prior_in_flight.bytes() * 10 >= current_cwnd.bytes() * 8 &&
       *acked_bitrate < delay_based_bwe_.LatestEstimate() * 0.82) {
     state = BandwidthUsage::kBwOverusing;
   }
 
-  if (probe_bitrate.has_value() && state != BandwidthUsage::kBwOverusing) {
-    delay_based_bwe_.SetEstimate(*probe_bitrate, report.feedback_time);
-    if (probe_bitrate_estimator_.last_probe_saturated()) {
-      delay_based_bwe_.SetCapacityEstimate(*probe_bitrate * (1.0 / 0.95));
+  if (probe_bitrate.has_value()) {
+    if (state != BandwidthUsage::kBwOverusing) {
+      last_probe_result_time_ = report.feedback_time;
+      delay_based_bwe_.SetEstimate(*probe_bitrate, report.feedback_time);
+      if (probe_bitrate_estimator_.last_probe_saturated()) {
+        delay_based_bwe_.SetCapacityEstimate(*probe_bitrate * (1.0 / 0.95));
+      }
+      bandwidth_estimation_.ApplyProbeBitrate(
+          report.feedback_time, delay_based_bwe_.LatestEstimate());
+      const bool stop_further_probing =
+          (bandwidth_estimation_.target_rate() < *probe_bitrate) ||
+          probe_bitrate_estimator_.last_probe_saturated() ||
+          (*probe_bitrate < bandwidth_estimation_.target_rate());
+      auto probes = probe_controller_.SetEstimatedBitrate(
+          bandwidth_estimation_.target_rate(), stop_further_probing,
+          report.feedback_time);
+      update.probe_cluster_configs.insert(update.probe_cluster_configs.end(),
+                                          probes.begin(), probes.end());
+    } else {
+      // 探测簇期间处于过载状态，立即结束本轮探测等待，以便后续周期性恢复探测正常触发。
+      probe_controller_.SetEstimatedBitrate(bandwidth_estimation_.target_rate(),
+                                            /*bwe_limited_due_to_packet_loss=*/true,
+                                            report.feedback_time);
     }
-    bandwidth_estimation_.UpdateDelayBasedEstimate(
-        report.feedback_time, delay_based_bwe_.LatestEstimate());
-    const bool stop_further_probing =
-        (bandwidth_estimation_.target_rate() < *probe_bitrate) ||
-        probe_bitrate_estimator_.last_probe_saturated();
-    auto probes = probe_controller_.SetEstimatedBitrate(
-        bandwidth_estimation_.target_rate(), stop_further_probing,
-        report.feedback_time);
-    update.probe_cluster_configs.insert(update.probe_cluster_configs.end(),
-                                        probes.begin(), probes.end());
   }
 
   const bool fresh_packets_since_last_decrease =
