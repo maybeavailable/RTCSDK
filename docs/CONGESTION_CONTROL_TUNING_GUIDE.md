@@ -59,7 +59,7 @@
 
 | 参数名称 | 源码位置与当前默认值 | 作用机理与实战调优建议 |
 | :--- | :--- | :--- |
-| **拥塞控制算法模组选型** | [`include/rtc_video_sdk.h`](../include/rtc_video_sdk.h)（`rtc_quic_cc_algo_e`） | **选对模组优先于微调常数**：高丢包无线网（`5%~50%`）选 `BBRv1` / `BBRv2`；深队列低延迟选 `Copa`；常规有线共享瓶颈选 `CUBIC`。支持通过 `SetQuicCongestionControl` 根据实时丢包率/RTT 动态热切换。 |
+| **拥塞控制算法模组选型** | [`include/rtc_video_types.hpp`](../include/rtc_video_types.hpp)（`rtc_quic_cc_algo_e`） | **选对模组优先于微调常数**：高丢包无线网（`5%~50%`）选 `BBRv1` / `BBRv2`；深队列低延迟选 `Copa`；常规有线共享瓶颈选 `CUBIC`。支持通过 `SetQuicCongestionControl` 根据实时丢包率/RTT 动态热切换。 |
 | **`cwnd_gain_`**（BBRv1/v2 窗口增益） | [`src/moq/quic_congestion_control.cc#L296`](../src/moq/quic_congestion_control.cc#L296)（默认 `2.0`） | Wi-Fi 帧聚合（A-MPDU）和蜂窝网 ACK 压缩需保持 `2.0` 以跑满物理带宽；若工业内网极浅缓冲交换机出现尾丢包，可下调至 `1.5`。 |
 | **BBRv2 单轮丢包阈值 `2%`** | [`src/moq/quic_congestion_control.cc#L429`](../src/moq/quic_congestion_control.cc#L429) | 单轮丢包超过阈值会收缩 `inflight_hi/lo`。在 `5%~15%` 无线底噪环境若使用 `BBRv2`，建议放宽至 **`5% ~ 8%`**（或直接使用无视随机丢包的 `BBRv1`）。 |
 | **Copa 延迟权重 `delta_`** | [`src/moq/quic_congestion_control.cc#L1011-L1016`](../src/moq/quic_congestion_control.cc#L1011-L1016)（默认 `0.5`） | 目标速率与 `1 / (delta * queueing_delay)` 成正比。独占管道追求极致低延迟设为 `0.5 ~ 0.8`；需与后台大流量 TCP 流竞争带宽时调小至 `0.125 ~ 0.2`。 |

@@ -5,7 +5,7 @@
 // 核心特性：
 //   - 无锁原子快速路径日志级别检查（关闭时零格式化开销）
 //   - 自动解析当前 TaskQueue 名称（[rtc-sig]、[rtc-work]、[rtc-net] 等）
-//   - 可插拔 C++ LogSink 与 C99 回调接收器，并提供面向嵌入式 SoC 的 RingBufferLogSink
+//   - 可插拔 C++17 LogSink 日志接收器，并提供面向嵌入式 SoC 的 RingBufferLogSink
 //   - 通过 LogMessageVoidify 实现规避悬空 else 问题的安全三元宏
 
 #include <atomic>
@@ -75,8 +75,6 @@ class LogMessage {
   static void AddLogSink(LogSink* sink,
                          LoggingSeverity min_severity = LoggingSeverity::kInfo);
   static void RemoveLogSink(LogSink* sink);
-
-  static void SetCLogCallback(rtc_log_callback_fn callback, void* user_data);
 
  private:
   static void RecomputeEffectiveMinSeverityLocked();

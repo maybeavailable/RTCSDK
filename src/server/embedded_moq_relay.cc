@@ -211,7 +211,7 @@ void EmbeddedMoqRelayServer::OnServerStreamData(uint64_t session_id,
   }
   if (peer->upstream_sub_rx_bufs.find(stream_id) !=
       peer->upstream_sub_rx_bufs.end()) {
-    HandleUpstreamSubResponseBytes(peer, stream_id, data);
+    HandleUpstreamSubResponseBytes(peer, stream_id, data, fin);
     return;
   }
   HandleClientRequestBytes(peer, stream_id, data, fin);
@@ -387,7 +387,8 @@ void EmbeddedMoqRelayServer::ForwardNewGroupRequest(
 void EmbeddedMoqRelayServer::HandleUpstreamSubResponseBytes(
     PeerSession* peer,
     uint64_t stream_id,
-    ArrayView<const uint8_t> data) {
+    ArrayView<const uint8_t> data,
+    bool fin) {
   auto& buf = peer->upstream_sub_rx_bufs[stream_id];
   buf.insert(buf.end(), data.begin(), data.end());
   while (!buf.empty()) {
@@ -404,6 +405,9 @@ void EmbeddedMoqRelayServer::HandleUpstreamSubResponseBytes(
       break;
     }
     buf.erase(buf.begin(), buf.begin() + static_cast<ptrdiff_t>(consumed));
+  }
+  if (fin) {
+    peer->upstream_sub_rx_bufs.erase(stream_id);
   }
 }
 
@@ -462,6 +466,7 @@ void EmbeddedMoqRelayServer::RemoveClientRequestStream(PeerSession* peer,
   if (peer == nullptr) {
     return;
   }
+  peer->upstream_sub_rx_bufs.erase(stream_id);
   peer->subscribed_ns_prefixes.erase(stream_id);
 
   const auto pub_it = peer->published_namespaces.find(stream_id);
@@ -470,6 +475,20 @@ void EmbeddedMoqRelayServer::RemoveClientRequestStream(PeerSession* peer,
     peer->published_namespaces.erase(pub_it);
     if (ns.fields.size() >= 4 && ns.fields[3] == "video") {
       peer->is_video_publisher = false;
+      if (peer->upstream_low_sub_sid.has_value()) {
+        if (peer->quic) {
+          peer->quic->ResetStream(*peer->upstream_low_sub_sid, 0);
+        }
+        peer->upstream_sub_rx_bufs.erase(*peer->upstream_low_sub_sid);
+        peer->upstream_low_sub_sid.reset();
+      }
+      if (peer->upstream_high_sub_sid.has_value()) {
+        if (peer->quic) {
+          peer->quic->ResetStream(*peer->upstream_high_sub_sid, 0);
+        }
+        peer->upstream_sub_rx_bufs.erase(*peer->upstream_high_sub_sid);
+        peer->upstream_high_sub_sid.reset();
+      }
     }
     BroadcastNamespaceChange(peer->session_id, ns, /*is_done=*/true);
   }

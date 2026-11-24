@@ -274,6 +274,8 @@ PureVideoSdpDescription WebRtcP2pBackend::BuildLocalSdpOnSigQueue(
     m.flexfec_pt = negotiated_flexfec_pt_;
     m.has_rtx = negotiated_has_rtx_;
     m.has_flexfec = negotiated_has_flexfec_ && config_.enable_flexfec;
+    m.flexfec_subtype = negotiated_flexfec_subtype_;
+    m.flexfec_repair_window_us = negotiated_flexfec_rw_us_;
     m.primary_ssrc = outbound_.media_ssrc;
     m.primary_rtx_ssrc = m.has_rtx ? outbound_.rtx_ssrc : 0;
     m.flexfec_ssrc = m.has_flexfec ? outbound_.flexfec_ssrc : 0;
@@ -329,6 +331,7 @@ bool WebRtcP2pBackend::ApplyRemoteSdpOnSigQueue(
   std::string r_track = remote_peer_id_ + "_video0";
   uint32_t r_media_ssrc = 0;
   uint32_t r_rtx_ssrc = 0;
+  uint32_t r_fec_ssrc = 0;
   if (negotiated_has_video_) {
     const auto& rm = remote_desc.video_m_sections.front();
     negotiated_mid_ = rm.mid.empty() ? "0" : rm.mid;
@@ -341,6 +344,8 @@ bool WebRtcP2pBackend::ApplyRemoteSdpOnSigQueue(
     negotiated_has_flexfec_ = rm.has_flexfec && config_.enable_flexfec;
     if (negotiated_has_flexfec_) {
       negotiated_flexfec_pt_ = rm.flexfec_pt;
+      negotiated_flexfec_subtype_ = rm.flexfec_subtype;
+      negotiated_flexfec_rw_us_ = rm.flexfec_repair_window_us;
     }
     negotiated_ext_map_ = rm.ext_map;
     remote_sends = rm.direction_send;
@@ -355,6 +360,7 @@ bool WebRtcP2pBackend::ApplyRemoteSdpOnSigQueue(
     }
     r_media_ssrc = rm.primary_ssrc;
     r_rtx_ssrc = rm.primary_rtx_ssrc;
+    r_fec_ssrc = rm.flexfec_ssrc;
   }
 
   ice_->SetIceControlling(!remote_is_offer);
@@ -386,16 +392,18 @@ bool WebRtcP2pBackend::ApplyRemoteSdpOnSigQueue(
   const VideoCodec r_codec = negotiated_codec_;
   const std::string mid_copy = negotiated_mid_;
   const uint8_t f_pt = negotiated_flexfec_pt_;
+  const uint32_t f_rw_us = negotiated_flexfec_rw_us_;
   const bool has_fec = negotiated_has_flexfec_;
+  const RtpHeaderExtensionMap ext_map_copy = negotiated_ext_map_;
   const bool has_vid = negotiated_has_video_;
   const bool has_dc = negotiated_has_datachannel_;
   const uint16_t r_sctp_port = remote_sctp_port_;
 
   queues_->worker()->PostTask(SafeTask(
       work_safety_.flag(),
-      [this, r_peer, r_track, r_media_ssrc, r_rtx_ssrc, r_codec, mid_copy, f_pt,
-       has_fec, has_vid, remote_sends, has_dc, local_dtls_role,
-       r_sctp_port]() {
+      [this, r_peer, r_track, r_media_ssrc, r_rtx_ssrc, r_fec_ssrc, r_codec,
+       mid_copy, f_pt, f_rw_us, has_fec, ext_map_copy, has_vid, remote_sends,
+       has_dc, local_dtls_role, r_sctp_port]() {
         RTC_DCHECK_RUN_ON(&work_checker_);
         worker_dtls_role_ = local_dtls_role;
         worker_has_datachannel_ = has_dc;
@@ -408,7 +416,8 @@ bool WebRtcP2pBackend::ApplyRemoteSdpOnSigQueue(
         if (has_vid) {
           if (has_fec) {
             outbound_.flexfec = std::make_unique<FlexfecSender>(
-                f_pt, outbound_.flexfec_ssrc, outbound_.media_ssrc, mid_copy);
+                f_pt, outbound_.flexfec_ssrc, outbound_.media_ssrc, mid_copy,
+                f_rw_us);
           } else {
             outbound_.flexfec.reset();
           }
@@ -420,8 +429,9 @@ bool WebRtcP2pBackend::ApplyRemoteSdpOnSigQueue(
           inbound_->media_ssrc = r_media_ssrc;
           inbound_->rtx_ssrc = r_rtx_ssrc;
           if (r_media_ssrc != 0) {
-            inbound_->flexfec_rx =
-                std::make_unique<FlexfecReceiver>(0, r_media_ssrc);
+            inbound_->flexfec_rx = std::make_unique<FlexfecReceiver>(
+                r_fec_ssrc, r_media_ssrc, f_rw_us);
+            inbound_->flexfec_rx->set_extension_map(ext_map_copy);
           }
 
           demuxer_.RemoveSink(this);
@@ -432,6 +442,9 @@ bool WebRtcP2pBackend::ApplyRemoteSdpOnSigQueue(
           }
           if (r_rtx_ssrc != 0) {
             crit.ssrcs.push_back(r_rtx_ssrc);
+          }
+          if (r_fec_ssrc != 0) {
+            crit.ssrcs.push_back(r_fec_ssrc);
           }
           demuxer_.AddSink(crit, this);
           demuxer_.SetDefaultSink(this);
@@ -773,21 +786,9 @@ int WebRtcP2pBackend::SendEncodedFrame(EncodedVideoFrame frame) {
           }
 
           *pkt->mutable_payload() = std::move(payloads[i].bytes);
-
-          if (outbound_.flexfec) {
-            outbound_.flexfec->AddRtpPacketAndGenerateFec(*pkt);
-          }
           batch.emplace_back(detected_kf ? RtpPacketMediaType::kVideoKeyFrame
                                          : RtpPacketMediaType::kVideoDelta,
                              std::move(pkt));
-        }
-
-        if (outbound_.flexfec) {
-          for (auto& fec_pkt : outbound_.flexfec->GetFecPackets()) {
-            fec_pkt.set_extension_map(negotiated_ext_map_);
-            batch.emplace_back(RtpPacketMediaType::kForwardErrorCorrection,
-                               std::make_unique<RtpPacket>(std::move(fec_pkt)));
-          }
         }
 
         paced_sender_->EnqueuePackets(std::move(batch));
@@ -812,7 +813,8 @@ void WebRtcP2pBackend::SendPacedPacket(std::unique_ptr<RtpPacket> packet,
 
   const DataSize pkt_size = DataSize::Bytes(packet->SerializedSize());
   const bool is_video_media = (packet->ssrc() == outbound_.media_ssrc &&
-                               packet->payload_type() == negotiated_video_pt_);
+                               packet->payload_type() == negotiated_video_pt_ &&
+                               packet->payload_size() > 0);
   const bool is_rtx = (packet->ssrc() == outbound_.rtx_ssrc &&
                        packet->padding_size() == 0);
   const bool is_fec = (outbound_.flexfec_ssrc != 0 &&
@@ -840,6 +842,25 @@ void WebRtcP2pBackend::SendPacedPacket(std::unique_ptr<RtpPacket> packet,
         RTC_DCHECK_RUN_ON(&work_checker_);
         if (is_video_media) {
           outbound_.history.PutRtpPacket(raw_copy, send_time);
+          // 在 TWCC 与 AbsSendTime 扩展头均已最终打标后生成 RFC 8627 FlexFEC 校验包，
+          // 确保发送端异或输入的线速字节与接收端 SRTP 解密后的线速字节 100% 逐比特一致。
+          if (outbound_.flexfec) {
+            outbound_.flexfec->AddRtpPacketAndGenerateFec(raw_copy);
+            auto fec_pkts = outbound_.flexfec->GetFecPackets();
+            if (!fec_pkts.empty()) {
+              std::vector<
+                  std::pair<RtpPacketMediaType, std::unique_ptr<RtpPacket>>>
+                  fec_batch;
+              fec_batch.reserve(fec_pkts.size());
+              for (auto& fp : fec_pkts) {
+                fp.set_extension_map(negotiated_ext_map_);
+                fec_batch.emplace_back(
+                    RtpPacketMediaType::kForwardErrorCorrection,
+                    std::make_unique<RtpPacket>(std::move(fp)));
+              }
+              paced_sender_->EnqueuePackets(std::move(fec_batch));
+            }
+          }
         }
         twcc_adapter_.AddPacket(twcc_seq, pkt_size, cluster_info, send_time);
         if (auto sent = twcc_adapter_.ProcessSentPacket(twcc_seq, send_time)) {
@@ -856,9 +877,9 @@ std::vector<std::unique_ptr<RtpPacket>> WebRtcP2pBackend::GeneratePadding(
   while (rem > 24) {
     auto p = std::make_unique<RtpPacket>();
     p->set_extension_map(negotiated_ext_map_);
-    p->set_payload_type(negotiated_has_rtx_ ? negotiated_rtx_pt_
-                                            : negotiated_video_pt_);
-    p->set_ssrc(negotiated_has_rtx_ ? outbound_.rtx_ssrc : outbound_.media_ssrc);
+    // 探测填充包固定使用独立的 rtx_ssrc 与 next_rtx_seq，严禁在未协商 RTX 时借用 media_ssrc 发送乱序空包污染 SRTP 防重放窗口。
+    p->set_payload_type(negotiated_rtx_pt_);
+    p->set_ssrc(outbound_.rtx_ssrc);
     p->set_sequence_number(outbound_.next_rtx_seq++);
     p->set_timestamp(
         static_cast<uint32_t>((clock_->CurrentTime().us() * 90) / 1000));
@@ -890,12 +911,13 @@ void WebRtcP2pBackend::OnRtpPacket(const RtpPacket& packet,
     return;
   }
 
-  // 1. 处理 FlexFEC 前向纠错冗余包（`flexfec-03`）。
+  // 1. 处理符合 RFC 8627 的 FlexFEC 前向纠错修复包。
   if (negotiated_has_flexfec_ &&
       packet.payload_type() == negotiated_flexfec_pt_) {
     if (!inbound_->flexfec_rx && inbound_->media_ssrc != 0) {
-      inbound_->flexfec_rx =
-          std::make_unique<FlexfecReceiver>(packet.ssrc(), inbound_->media_ssrc);
+      inbound_->flexfec_rx = std::make_unique<FlexfecReceiver>(
+          packet.ssrc(), inbound_->media_ssrc, negotiated_flexfec_rw_us_);
+      inbound_->flexfec_rx->set_extension_map(negotiated_ext_map_);
     }
     if (inbound_->flexfec_rx) {
       for (const auto& rec : inbound_->flexfec_rx->OnRtpPacket(packet)) {
@@ -931,8 +953,9 @@ void WebRtcP2pBackend::OnRtpPacket(const RtpPacket& packet,
   // 3. 主视频媒体流 RTP 包（支持未在信令中预声明的浏览器动态 SSRC）。
   if (inbound_->media_ssrc == 0) {
     inbound_->media_ssrc = packet.ssrc();
-    inbound_->flexfec_rx =
-        std::make_unique<FlexfecReceiver>(0, inbound_->media_ssrc);
+    inbound_->flexfec_rx = std::make_unique<FlexfecReceiver>(
+        0, inbound_->media_ssrc, negotiated_flexfec_rw_us_);
+    inbound_->flexfec_rx->set_extension_map(negotiated_ext_map_);
     if (!inbound_->track_announced && observer_ != nullptr) {
       inbound_->track_announced = true;
       observer_->OnBackendRemoteTrackPublished(
@@ -1063,6 +1086,16 @@ void WebRtcP2pBackend::OnDecryptedRtcpPacket(
                 rtx_batch.emplace_back(
                     RtpPacketMediaType::kRetransmission,
                     std::make_unique<RtpPacket>(std::move(rtx)));
+              } else if (outbound_.flexfec) {
+                // 未协商 RFC 4588 RTX 时，遵循 RFC 8627 第 4.2.2.3 节使用 FlexFEC R=1,F=0 单包重传封装，
+                // 避免在原媒体 SSRC 上复用旧序列号破坏 SRTP 防重放窗口与接收端序列号单调性。
+                if (auto fec_rtx =
+                        outbound_.flexfec->BuildRetransmissionPacket(*orig)) {
+                  fec_rtx->set_extension_map(negotiated_ext_map_);
+                  rtx_batch.emplace_back(
+                      RtpPacketMediaType::kRetransmission,
+                      std::make_unique<RtpPacket>(std::move(*fec_rtx)));
+                }
               } else {
                 rtx_batch.emplace_back(
                     RtpPacketMediaType::kRetransmission,

@@ -36,7 +36,6 @@
 #include "rtc_base/logging.h"
 #include "rtc_quic_congestion_control.hpp"
 #include "rtc_video_engine.hpp"
-#include "rtc_video_sdk.h"
 #include "server/embedded_moq_relay.h"
 
 namespace rtc {

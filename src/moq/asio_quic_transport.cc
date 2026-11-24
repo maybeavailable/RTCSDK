@@ -1369,8 +1369,12 @@ class QuicSessionCore {
       QuicVarInt::Append(0, &close_frame);
     }
     QuicVarInt::Append(0, &close_frame);
-    EmitSinglePacket(lvl, close_frame, false, std::vector<SentRetransmittable>{},
-                     clock_->CurrentTime());
+    // 主动关闭立即释放底层套接字后无法再走 PTO 重传，连发 2 个递增包号的幂等 CONNECTION_CLOSE 以抵抗弱网随机丢包。
+    const Timestamp close_ts = clock_->CurrentTime();
+    for (int attempt = 0; attempt < 2; ++attempt) {
+      EmitSinglePacket(lvl, close_frame, false,
+                       std::vector<SentRetransmittable>{}, close_ts);
+    }
     closed_ = true;
   }
 
@@ -1411,6 +1415,7 @@ class QuicSessionCore {
       return;
     }
     st.reset = true;
+    st.reset_in_flight = true;
     st.unsent_data.clear();
     st.retransmit_chunks.clear();
 
@@ -1426,7 +1431,7 @@ class QuicSessionCore {
     if (closed_) {
       return;
     }
-    inbound_streams_[stream_id].Reset();
+    RetireInboundStream(stream_id);
     PendingStopSending ss;
     ss.stream_id = stream_id;
     ss.app_error_code = app_error_code;
@@ -1700,8 +1705,38 @@ class QuicSessionCore {
     bool fin_queued = false;
     bool fin_sent = false;
     bool reset = false;
+    bool reset_in_flight = false;
+    size_t in_flight_frames = 0;
     std::deque<StreamChunk> retransmit_chunks;
   };
+
+  void RetireInboundStream(uint64_t stream_id) {
+    inbound_streams_.erase(stream_id);
+    announced_inbound_streams_.erase(stream_id);
+    if (retired_inbound_streams_.insert(stream_id).second) {
+      retired_inbound_order_.push_back(stream_id);
+      while (retired_inbound_order_.size() > 512) {
+        retired_inbound_streams_.erase(retired_inbound_order_.front());
+        retired_inbound_order_.pop_front();
+      }
+    }
+  }
+
+  void MaybeEraseCompletedOutboundStream(uint64_t stream_id) {
+    const auto it = outbound_streams_.find(stream_id);
+    if (it == outbound_streams_.end()) {
+      return;
+    }
+    const OutboundStreamState& st = it->second;
+    const bool fin_complete =
+        st.fin_sent && st.unsent_data.empty() && st.retransmit_chunks.empty() &&
+        st.in_flight_frames == 0;
+    const bool reset_complete =
+        st.reset && !st.reset_in_flight && st.in_flight_frames == 0;
+    if (fin_complete || reset_complete) {
+      outbound_streams_.erase(it);
+    }
+  }
 
   // ---------------- 标准 RFC 8446 TLS 1.3 握手消息构造与解析 ----------------
 
@@ -2482,6 +2517,10 @@ class QuicSessionCore {
             payload.subview(off, static_cast<size_t>(stream_len));
         off += static_cast<size_t>(stream_len);
 
+        if (retired_inbound_streams_.count(stream_id) > 0) {
+          continue;
+        }
+
         const bool is_peer_initiated =
             ((stream_id & 0x01u) == (is_server_ ? 0u : 1u));
         if (is_peer_initiated &&
@@ -2496,6 +2535,9 @@ class QuicSessionCore {
         bool deliver_fin = false;
         if (rx_buf.ExtractContiguous(&ordered, &deliver_fin)) {
           events_->OnPeerStreamData(stream_id, ordered, deliver_fin);
+        }
+        if (deliver_fin) {
+          RetireInboundStream(stream_id);
         }
       } else if (frame_type == kFrameResetStream ||
                  frame_type == kFrameResetStreamAt) {
@@ -2514,9 +2556,8 @@ class QuicSessionCore {
           return false;
         }
         (void)reliable_size;
-        auto& rx_buf = inbound_streams_[stream_id];
-        if (!rx_buf.is_reset()) {
-          rx_buf.Reset();
+        if (retired_inbound_streams_.count(stream_id) == 0) {
+          RetireInboundStream(stream_id);
           events_->OnPeerStreamReset(stream_id, app_err);
         }
       } else if (frame_type == kFrameStopSending) {
@@ -2685,6 +2726,25 @@ class QuicSessionCore {
           ap.first_sent_time_us_at_send = it->second.first_sent_time_us_at_send;
           ap.is_app_limited = it->second.is_app_limited;
           acked_vec.push_back(ap);
+        }
+        for (const auto& frm : it->second.frames) {
+          if (frm.kind == SentRetransmittable::Kind::kStream) {
+            const auto st_it =
+                outbound_streams_.find(frm.stream_chunk.stream_id);
+            if (st_it != outbound_streams_.end()) {
+              if (st_it->second.in_flight_frames > 0) {
+                --st_it->second.in_flight_frames;
+              }
+              MaybeEraseCompletedOutboundStream(frm.stream_chunk.stream_id);
+            }
+          } else if (frm.kind == SentRetransmittable::Kind::kResetStream) {
+            const auto st_it =
+                outbound_streams_.find(frm.reset_info.stream_id);
+            if (st_it != outbound_streams_.end()) {
+              st_it->second.reset_in_flight = false;
+              MaybeEraseCompletedOutboundStream(frm.reset_info.stream_id);
+            }
+          }
         }
         it = sent_map.erase(it);
       }
@@ -2881,10 +2941,18 @@ class QuicSessionCore {
               std::move(item));
           break;
         case SentRetransmittable::Kind::kStream: {
-          const auto st_it = outbound_streams_.find(item.stream_chunk.stream_id);
-          if (st_it != outbound_streams_.end() && !st_it->second.reset) {
-            st_it->second.retransmit_chunks.push_front(
-                std::move(item.stream_chunk));
+          const uint64_t sid = item.stream_chunk.stream_id;
+          const auto st_it = outbound_streams_.find(sid);
+          if (st_it != outbound_streams_.end()) {
+            if (st_it->second.in_flight_frames > 0) {
+              --st_it->second.in_flight_frames;
+            }
+            if (!st_it->second.reset) {
+              st_it->second.retransmit_chunks.push_front(
+                  std::move(item.stream_chunk));
+            } else {
+              MaybeEraseCompletedOutboundStream(sid);
+            }
           }
           break;
         }
@@ -3295,6 +3363,7 @@ class QuicSessionCore {
         }
 
         EncodeStreamFrame(chunk, &payload);
+        ++st->in_flight_frames;
         SentRetransmittable item;
         item.kind = SentRetransmittable::Kind::kStream;
         item.stream_chunk = std::move(chunk);
@@ -3385,6 +3454,8 @@ class QuicSessionCore {
   std::deque<std::vector<uint8_t>> pending_datagrams_;
   std::map<uint64_t, QuicStreamReceiveBuffer> inbound_streams_;
   std::set<uint64_t> announced_inbound_streams_;
+  std::set<uint64_t> retired_inbound_streams_;
+  std::deque<uint64_t> retired_inbound_order_;
 
   // RFC 9002 RTT 测量、PTO 与拥塞控制器状态。
   bool has_rtt_sample_ = false;

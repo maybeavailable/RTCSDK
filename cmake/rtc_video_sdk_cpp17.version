@@ -1,0 +1,25 @@
+{
+  global:
+    extern "C++" {
+      rtc::RtcVideoEngine::*;
+      rtc::CreateBuiltinQuicCongestionController*;
+      rtc::CreateBuiltinQuicCcFactory*;
+      "vtable for rtc::RtcVideoEngine";
+      "typeinfo for rtc::RtcVideoEngine";
+      "typeinfo name for rtc::RtcVideoEngine";
+      "vtable for rtc::IRtcEventObserver";
+      "typeinfo for rtc::IRtcEventObserver";
+      "typeinfo name for rtc::IRtcEventObserver";
+      "vtable for rtc::LogSink";
+      "typeinfo for rtc::LogSink";
+      "typeinfo name for rtc::LogSink";
+      "vtable for rtc::IQuicCongestionController";
+      "typeinfo for rtc::IQuicCongestionController";
+      "typeinfo name for rtc::IQuicCongestionController";
+      "vtable for rtc::IQuicCongestionControllerFactory";
+      "typeinfo for rtc::IQuicCongestionControllerFactory";
+      "typeinfo name for rtc::IQuicCongestionControllerFactory";
+    };
+  local:
+    *;
+};

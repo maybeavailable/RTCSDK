@@ -5,7 +5,7 @@
 //   - 完整 ICE（Host / STUN srflx / TURN relay / prflx）+ Trickle ICE
 //   - 临时 ECDSA P-256 DTLS-SRTP 安全传输（`actpass` / `active` / `passive`）
 //   - 兼容浏览器的 RFC 3264 / RFC 8829 Unified Plan SDP Offer/Answer 协商
-//   - GoogCcNetworkController 拥塞控制 + TaskQueuePacedSender 平滑发送 + RTX 重传 + FlexFEC-03 前向纠错
+//   - GoogCcNetworkController 拥塞控制 + TaskQueuePacedSender 平滑发送 + RTX 重传 + RFC 8627 FlexFEC 前向纠错
 //   - PacketBuffer -> NackModule2 -> ReferenceFinder -> FrameBuffer3 接收重组流水线
 
 #include <atomic>
@@ -210,6 +210,8 @@ class WebRtcP2pBackend final : public ISessionBackend,
   uint8_t negotiated_flexfec_pt_ = 118;
   bool negotiated_has_rtx_ = true;
   bool negotiated_has_flexfec_ = true;
+  std::string negotiated_flexfec_subtype_ = "flexfec";
+  uint32_t negotiated_flexfec_rw_us_ = 10'000'000;
   RtpHeaderExtensionMap negotiated_ext_map_ =
       RtpHeaderExtensionMap::BrowserDefault();
 

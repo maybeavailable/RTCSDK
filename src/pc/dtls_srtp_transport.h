@@ -211,6 +211,9 @@ struct VideoMediaTrackDesc {
   uint8_t flexfec_pt = 118;
   bool has_rtx = true;
   bool has_flexfec = true;
+  // RFC 8627 第 5.1.2 节标准子类型 `flexfec`（对端若提供 `flexfec-03` 则自动回显兼容）。
+  std::string flexfec_subtype = "flexfec";
+  uint32_t flexfec_repair_window_us = 10'000'000;
 
   uint32_t primary_ssrc = 0;
   uint32_t primary_rtx_ssrc = 0;

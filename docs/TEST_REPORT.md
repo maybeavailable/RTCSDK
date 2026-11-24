@@ -3,7 +3,7 @@
 本文档记录 `RTCSDK`（嵌入式零音频纯视频双模通信 SDK：`WebRTC P2P` + `IETF MoQ`）的全量自动化测试、真实操作系统 UDP 瓶颈拥塞控制实测、IETF RFC 8868 / ITU-T G.1050 标准弱网评测及极限“地狱模式”弱网压力测试结果。
 
 原始控制台完整执行日志归档于 [`docs/test_logs/`](test_logs/) 目录：
-- [`01_unit_e2e_and_examples.log`](test_logs/01_unit_e2e_and_examples.log)：核心单元测试（16 项）、弱网端到端集成测试与全部 5 个 C99/C++17/浏览器网关示例自检原始日志。
+- [`01_unit_e2e_and_examples.log`](test_logs/01_unit_e2e_and_examples.log)：核心单元测试、端到端集成测试与全部 C++17 及浏览器网关/播放器示例自检原始日志。
 - [`02_real_cc_benchmark.log`](test_logs/02_real_cc_benchmark.log)：真实双端口 UDP 瓶颈路由器下的 WebRTC P2P（`GoogCC`）与 IETF MoQ（`QUIC v1 + Simulcast + 5 种可插拔拥塞控制`）0.5s 实时追踪日志。
 - [`03_industry_weaknet_canonical.log`](test_logs/03_industry_weaknet_canonical.log)：遵循 IETF RFC 8868 / ITU-T G.1050 / RFC 3550 / W3C WebRTC 标准的 6 大常规弱网场景 × 18 项全量指标原始日志。
 - [`04_industry_weaknet_extreme_hellmode.log`](test_logs/04_industry_weaknet_extreme_hellmode.log)：6 大极限地狱弱网场景（35% 丢包、50% 半数丢包、150k 超窄带、500ms 卫星时延、±60ms 重度乱序、1000ms 整秒断网）× 18 项指标原始日志。
@@ -14,15 +14,15 @@
 
 | 序号 | CTest 套件名称 | 可执行程序 | 覆盖范围 | 结果 |
 | :---: | :--- | :--- | :--- | :---: |
-| 1 | `RtcCoreUnitTests` | `rtc_core_unit_tests` | 异步队列安全令牌、零异常 JSON/内存池、RTP/RTCP/TWCC/NACK/FlexFEC/RTX、微秒级 Pacer、GoogCC、FrameBuffer3、DTLS-SRTP、QUIC v1 RFC 9001 向量、Chrome SDP 兼容、5 种可插拔 QUIC CC 单测（共 16 项） | **通过 (100%)** |
-| 2 | `RtcE2EIntegrationTests` | `rtc_e2e_integration_tests` | WebRTC P2P 信令配对推拉流、直连 SDP P2P、MoQ 多订阅者分层拉流、纯 C99 ABI 双模连接验证 | **通过 (100%)** |
-| 3 | `RtcRealCongestionControlTests` | `rtc_real_cc_benchmark_test` | TWCC 跨 6.21 天 24 位时间回绕验证、真实 UDP 限速路由器下 WebRTC P2P 三阶段拥塞控制、MoQ Simulcast 自动启停/热切换与 5 种 QUIC CC 横评、8% 无线随机丢包对比 | **通过 (100%)** |
-| 4 | `RtcIndustryWeakNetSuite` | `rtc_industry_weaknet_suite_test` | 6 大行业标准弱网模型 + 6 大极限地狱弱网模型（共 24 轮真实 UDP 测试 × 18 项传输层与视频 QoE 指标） | **通过 (100%)** |
-| 5 | `SdkExampleC99WebRtcP2pFull` | `rtc_example_c99_p2p` | 纯 C99 ABI 无信令直连 SDP 双向 P2P（H.264）+ WS 自动信令 P2P（H.265）全回调验证 | **通过 (100%)** |
-| 6 | `SdkExampleC99MoqMultiPullFull` | `rtc_example_c99_moq` | 纯 C99 ABI 双机位 Simulcast 推流 + 多路并发拉流、在线切流、热切换 QUIC CC 验证 | **通过 (100%)** |
-| 7 | `SdkExampleCpp17WebRtcP2pFull` | `rtc_example_cpp17_p2p` | 现代 C++17 直连 SDP + WS 信令双向 P2P 与统一日志接收器验证 | **通过 (100%)** |
-| 8 | `SdkExampleCpp17MoqMultiPullFull` | `rtc_example_cpp17_moq` | 现代 C++17 双机位 Simulcast 多路拉流 + 注入自定义 `IQuicCongestionControllerFactory` 插件验证 | **通过 (100%)** |
-| 9 | `SdkExampleBrowserHttpP2p` | `rtc_example_browser_p2p --self-test` | 浏览器 HTML5 `<video>` HTTP `/api/offer` 实时视频网关端到端自检 | **通过 (100%)** |
+| 1 | `RtcCoreUnitTests` | `rtc_core_unit_tests` | 异步队列安全令牌、零异常 JSON/内存池、RTP/RTCP/TWCC/NACK/RFC 8627 FlexFEC/RTX、微秒级 Pacer、GoogCC、FrameBuffer3、DTLS-SRTP、QUIC v1 RFC 9001 向量、Chrome SDP 兼容、5 种可插拔 QUIC CC 单测 | **通过 (100%)** |
+| 2 | `RtcCpp17SharedSdkTests` | `rtc_cpp17_shared_sdk_test` | 纯 C++17 动态库 `librtc_video_sdk.so` 公共头文件符号隔离、自定义 `LogSink`、5 种 QUIC CC 工厂与 WebRTC P2P DataChannel 验证 | **通过 (100%)** |
+| 3 | `RtcE2EIntegrationTests` | `rtc_e2e_integration_tests` | WebRTC P2P 信令配对推拉流、STUN/TURN 中继转发、直连 SDP P2P、MoQ draft-17 多订阅者分层拉流、HTTP/3 WebTransport 与双模数据通道验证 | **通过 (100%)** |
+| 4 | `RtcRealCongestionControlTests` | `rtc_real_cc_benchmark_test` | TWCC 跨 6.21 天 24 位时间回绕验证、真实 UDP 限速路由器下 WebRTC P2P 三阶段拥塞控制、MoQ Simulcast 自动启停/热切换与 5 种 QUIC CC 横评、8% 无线随机丢包对比 | **通过 (100%)** |
+| 5 | `RtcIndustryWeakNetSuite` | `rtc_industry_weaknet_suite_test` | 6 大行业标准弱网模型 + 6 大极限地狱弱网模型（共 24 轮真实 UDP 测试 × 18 项传输层与视频 QoE 指标） | **通过 (100%)** |
+| 6 | `SdkExampleCpp17WebRtcP2pFull` | `rtc_example_cpp17_p2p` | 现代 C++17 直连 SDP + WS 信令双向 P2P 与统一日志接收器验证 | **通过 (100%)** |
+| 7 | `SdkExampleCpp17MoqMultiPullFull` | `rtc_example_cpp17_moq` | 现代 C++17 双机位 Simulcast 多路拉流 + 注入自定义 `IQuicCongestionControllerFactory` 插件验证 | **通过 (100%)** |
+| 8 | `SdkExampleBrowserHttpP2p` | `rtc_example_browser_p2p --self-test` | 浏览器 HTML5 `<video>` HTTP `/api/offer` 实时视频网关端到端自检 | **通过 (100%)** |
+| 9 | `SdkExampleBrowserMoqPlayer` | `rtc_example_browser_moq --self-test` | 浏览器 HTML5 `<canvas>` WebTransport over HTTP/3 + MOQT draft-17 + WebCodecs 实时播放器自检 | **通过 (100%)** |
 
 ---
 

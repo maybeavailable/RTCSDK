@@ -8,16 +8,16 @@
 #include <vector>
 
 #include "rtc_quic_congestion_control.hpp"
-#include "rtc_video_sdk.h"
+#include "rtc_video_types.hpp"
 
 namespace rtc {
 
 enum class LoggingSeverity : int {
-  kVerbose = RTC_LOG_VERBOSE,
-  kInfo = RTC_LOG_INFO,
-  kWarning = RTC_LOG_WARNING,
-  kError = RTC_LOG_ERROR,
-  kNone = RTC_LOG_NONE,
+  kVerbose = 0,
+  kInfo = 1,
+  kWarning = 2,
+  kError = 3,
+  kNone = 4,
 };
 
 struct LogEntryView {
@@ -29,7 +29,7 @@ struct LogEntryView {
   std::string_view message;
 };
 
-class LogSink {
+class RTC_SDK_API LogSink {
  public:
   virtual ~LogSink() = default;
   virtual void OnLogMessage(const LogEntryView& entry,
@@ -77,7 +77,7 @@ struct EngineConfig {
   std::shared_ptr<IQuicCongestionControllerFactory> custom_quic_cc_factory;
 };
 
-class IRtcEventObserver {
+class RTC_SDK_API IRtcEventObserver {
  public:
   virtual ~IRtcEventObserver() = default;
 
@@ -122,7 +122,7 @@ class IRtcEventObserver {
 
 class IMoqQuicEngine;
 
-class RtcVideoEngine {
+class RTC_SDK_API RtcVideoEngine {
  public:
   static std::unique_ptr<RtcVideoEngine> Create(
       const EngineConfig& config,

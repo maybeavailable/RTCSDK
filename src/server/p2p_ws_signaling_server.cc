@@ -206,11 +206,13 @@ void P2pWsSignalingServer::OnClientDisconnected(uint64_t conn_id) {
   if (it == clients_.end()) {
     return;
   }
-  const std::string room = it->second->room_id;
-  const std::string peer = it->second->peer_id;
-  const bool should_notify = !it->second->left_notified && !peer.empty();
-  it->second->left_notified = true;
+  auto conn = it->second;
+  const std::string room = conn->room_id;
+  const std::string peer = conn->peer_id;
+  const bool should_notify = !conn->left_notified && !peer.empty();
+  conn->left_notified = true;
   clients_.erase(it);
+  conn->ForceClose();
 
   if (should_notify) {
     JsonObject left_msg;

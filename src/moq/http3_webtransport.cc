@@ -949,7 +949,7 @@ uint64_t WebTransportClientEngine::OpenBidirectionalStream() {
   bool write_now = false;
   {
     std::lock_guard<std::mutex> lock(mu_);
-    wt_local_streams_[sid] = false;
+    wt_local_streams_[sid] = LocalWtStreamState{false, false, false};
     if (wt_established_) {
       QuicVarInt::Append(kWtStreamSignalBidi, &prefix);
       QuicVarInt::Append(connect_stream_id_, &prefix);
@@ -972,7 +972,7 @@ uint64_t WebTransportClientEngine::OpenUnidirectionalStream(
   bool write_now = false;
   {
     std::lock_guard<std::mutex> lock(mu_);
-    wt_local_streams_[sid] = true;
+    wt_local_streams_[sid] = LocalWtStreamState{true, false, false};
     if (wt_established_) {
       QuicVarInt::Append(kH3StreamTypeWebTransportUni, &prefix);
       QuicVarInt::Append(connect_stream_id_, &prefix);
@@ -994,17 +994,26 @@ int WebTransportClientEngine::WriteStream(uint64_t stream_id,
     std::lock_guard<std::mutex> lock(mu_);
     const auto local_it = wt_local_streams_.find(stream_id);
     if (local_it != wt_local_streams_.end() && !wt_established_) {
+      local_it->second.local_fin = local_it->second.local_fin || fin;
       pending_wt_writes_[stream_id].push_back(
           PendingOutboundChunk{std::vector<uint8_t>(data.begin(), data.end()),
                                fin});
       return static_cast<int>(data.size());
     }
-    if (local_it != wt_local_streams_.end() &&
-        wt_prefix_written_.insert(stream_id).second) {
-      QuicVarInt::Append(local_it->second ? kH3StreamTypeWebTransportUni
-                                          : kWtStreamSignalBidi,
-                         &out_bytes);
-      QuicVarInt::Append(connect_stream_id_, &out_bytes);
+    if (local_it != wt_local_streams_.end()) {
+      if (wt_prefix_written_.insert(stream_id).second) {
+        QuicVarInt::Append(local_it->second.is_uni ? kH3StreamTypeWebTransportUni
+                                                   : kWtStreamSignalBidi,
+                           &out_bytes);
+        QuicVarInt::Append(connect_stream_id_, &out_bytes);
+      }
+      if (fin) {
+        local_it->second.local_fin = true;
+        if (local_it->second.is_uni || local_it->second.remote_fin) {
+          wt_local_streams_.erase(local_it);
+          wt_prefix_written_.erase(stream_id);
+        }
+      }
     }
   }
   out_bytes.insert(out_bytes.end(), data.begin(), data.end());
@@ -1014,6 +1023,12 @@ int WebTransportClientEngine::WriteStream(uint64_t stream_id,
 
 void WebTransportClientEngine::ResetStream(uint64_t stream_id,
                                            uint64_t app_error_code) {
+  {
+    std::lock_guard<std::mutex> lock(mu_);
+    wt_local_streams_.erase(stream_id);
+    wt_prefix_written_.erase(stream_id);
+    pending_wt_writes_.erase(stream_id);
+  }
   const uint64_t h3_err =
       WebTransportCodeToHttp3Code(static_cast<uint32_t>(app_error_code));
   inner_quic_->ResetStream(stream_id, h3_err);
@@ -1221,7 +1236,11 @@ void WebTransportClientEngine::OnStreamData(uint64_t stream_id,
           actions.push_back([obs]() { obs->OnQuicConnected(); });
         }
         // 冲刷握手完成前缓存的出站流、出站数据报以及提前到达的对端流/数据报。
-        for (auto& [sid, is_uni_local] : wt_local_streams_) {
+        for (auto it = wt_local_streams_.begin();
+             it != wt_local_streams_.end();) {
+          const uint64_t sid = it->first;
+          const bool is_uni_local = it->second.is_uni;
+          const bool fin_already = it->second.local_fin;
           std::vector<uint8_t> pfx;
           if (wt_prefix_written_.insert(sid).second) {
             QuicVarInt::Append(
@@ -1248,6 +1267,12 @@ void WebTransportClientEngine::OnStreamData(uint64_t stream_id,
                     inner_quic_->WriteStream(sid, c.data, c.fin);
                   }
                 });
+          }
+          if (fin_already && (is_uni_local || it->second.remote_fin)) {
+            wt_prefix_written_.erase(sid);
+            it = wt_local_streams_.erase(it);
+          } else {
+            ++it;
           }
         }
         for (auto& dg : pending_wt_datagrams_) {
@@ -1338,6 +1363,14 @@ void WebTransportClientEngine::OnStreamData(uint64_t stream_id,
       }
     } else if (wt_local_streams_.find(stream_id) != wt_local_streams_.end()) {
       // 本端发起的 WebTransport 双向流的响应方向数据直接透传给上层。
+      const auto local_it = wt_local_streams_.find(stream_id);
+      if (fin) {
+        local_it->second.remote_fin = true;
+        if (local_it->second.local_fin) {
+          wt_local_streams_.erase(local_it);
+          wt_prefix_written_.erase(stream_id);
+        }
+      }
       IMoqQuicEngineObserver* obs = observer_;
       if (obs != nullptr) {
         std::vector<uint8_t> copy(data.begin(), data.end());
@@ -1408,6 +1441,9 @@ void WebTransportClientEngine::OnStreamReset(uint64_t stream_id,
     }
     inbound_uni_.erase(stream_id);
     inbound_bidi_.erase(stream_id);
+    wt_local_streams_.erase(stream_id);
+    wt_prefix_written_.erase(stream_id);
+    pending_wt_writes_.erase(stream_id);
   }
   if (obs == nullptr) {
     return;
@@ -1616,10 +1652,22 @@ class Http3ServerConnection::WtSessionHandle final
   int WriteStream(uint64_t stream_id,
                   ArrayView<const uint8_t> data,
                   bool fin) override {
-    return raw_quic_ ? raw_quic_->WriteStream(stream_id, data, fin) : -1;
+    if (!raw_quic_) {
+      return -1;
+    }
+    const int rc = raw_quic_->WriteStream(stream_id, data, fin);
+    if (fin && (stream_id & 0x02u) != 0) {
+      if (auto p = owner_.lock()) {
+        p->server_stream_to_connect_sid_.erase(stream_id);
+      }
+    }
+    return rc;
   }
 
   void ResetStream(uint64_t stream_id, uint64_t app_error_code) override {
+    if (auto p = owner_.lock()) {
+      p->server_stream_to_connect_sid_.erase(stream_id);
+    }
     if (raw_quic_) {
       raw_quic_->ResetStream(
           stream_id,
@@ -1860,13 +1908,16 @@ void Http3ServerConnection::OnQuicStreamReset(uint64_t stream_id,
   } else {
     const auto bit = client_bidi_streams_.find(stream_id);
     if (bit != client_bidi_streams_.end()) {
-      const auto sit = wt_sessions_.find(bit->second.wt_connect_stream_id);
-      if (sit != wt_sessions_.end() && wt_visitor_ != nullptr) {
-        wt_visitor_->OnServerStreamReset(sit->second->session_id(), stream_id,
-                                         clean_err);
+      if (bit->second.kind == ClientBidiStream::Kind::kWebTransportBidiData) {
+        const auto sit = wt_sessions_.find(bit->second.wt_connect_stream_id);
+        if (sit != wt_sessions_.end() && wt_visitor_ != nullptr) {
+          wt_visitor_->OnServerStreamReset(sit->second->session_id(), stream_id,
+                                           clean_err);
+        }
       }
       client_bidi_streams_.erase(bit);
     }
+    server_stream_to_connect_sid_.erase(stream_id);
   }
 }
 
@@ -2130,6 +2181,33 @@ void Http3ServerConnection::TerminateWtSession(uint64_t connect_sid,
   }
   const uint64_t vsid = it->second->session_id();
   wt_sessions_.erase(it);
+  early_datagrams_.erase(connect_sid);
+  for (auto sit = server_stream_to_connect_sid_.begin();
+       sit != server_stream_to_connect_sid_.end();) {
+    if (sit->second == connect_sid) {
+      sit = server_stream_to_connect_sid_.erase(sit);
+    } else {
+      ++sit;
+    }
+  }
+  for (auto uit = client_uni_streams_.begin();
+       uit != client_uni_streams_.end();) {
+    if (uit->second.wt_session_parsed &&
+        uit->second.wt_connect_stream_id == connect_sid) {
+      uit = client_uni_streams_.erase(uit);
+    } else {
+      ++uit;
+    }
+  }
+  for (auto bit = client_bidi_streams_.begin();
+       bit != client_bidi_streams_.end();) {
+    if (bit->second.kind == ClientBidiStream::Kind::kWebTransportBidiData &&
+        bit->second.wt_connect_stream_id == connect_sid) {
+      bit = client_bidi_streams_.erase(bit);
+    } else {
+      ++bit;
+    }
+  }
   if (wt_visitor_ != nullptr) {
     wt_visitor_->OnServerSessionDisconnected(vsid, error_code);
   }

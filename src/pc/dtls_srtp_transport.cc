@@ -862,8 +862,12 @@ std::string PureVideoSdpDescription::Serialize() const {
     }
     if (m.has_flexfec) {
       const int fpt = static_cast<int>(m.flexfec_pt);
-      sdp << "a=rtpmap:" << fpt << " flexfec-03/90000\r\n"
-          << "a=fmtp:" << fpt << " repair-window=10000000\r\n";
+      const std::string& fec_name =
+          m.flexfec_subtype.empty() ? "flexfec" : m.flexfec_subtype;
+      const uint32_t rw_us =
+          m.flexfec_repair_window_us > 0 ? m.flexfec_repair_window_us : 10'000'000;
+      sdp << "a=rtpmap:" << fpt << " " << fec_name << "/90000\r\n"
+          << "a=fmtp:" << fpt << " repair-window=" << rw_us << "\r\n";
     }
 
     const std::string stream_id = m.stream_id.empty() ? "rtc_stream" : m.stream_id;
@@ -877,6 +881,10 @@ std::string PureVideoSdpDescription::Serialize() const {
       if (m.has_rtx && m.primary_rtx_ssrc != 0) {
         sdp << "a=ssrc-group:FID " << m.primary_ssrc << " "
             << m.primary_rtx_ssrc << "\r\n";
+      }
+      if (m.has_flexfec && m.flexfec_ssrc != 0) {
+        sdp << "a=ssrc-group:FEC-FR " << m.primary_ssrc << " "
+            << m.flexfec_ssrc << "\r\n";
       }
       sdp << "a=ssrc:" << m.primary_ssrc << " cname:" << cname << "\r\n"
           << "a=ssrc:" << m.primary_ssrc << " msid:" << stream_id << " "
@@ -910,6 +918,8 @@ std::optional<PureVideoSdpDescription> PureVideoSdpDescription::Parse(
     std::vector<uint8_t> h265_pts;
     std::map<uint8_t, uint8_t> apt_to_rtx_pt;
     std::optional<uint8_t> flexfec_pt;
+    std::string flexfec_subtype = "flexfec";
+    std::map<uint8_t, uint32_t> pt_to_repair_window_us;
     bool saw_extmap = false;
     RtpHeaderExtensionMap parsed_ext_map{0, 0, 0, 0, 0, 0, 0};
   };
@@ -1111,8 +1121,14 @@ std::optional<PureVideoSdpDescription> PureVideoSdpDescription::Parse(
           } else if (codec_part.rfind("H265/90000", 0) == 0 ||
                      codec_part.rfind("HEVC/90000", 0) == 0) {
             cur_scratch->h265_pts.push_back(static_cast<uint8_t>(pt));
-          } else if (codec_part.rfind("FLEXFEC-03/90000", 0) == 0) {
+          } else if (codec_part.rfind("FLEXFEC/90000", 0) == 0) {
             cur_scratch->flexfec_pt = static_cast<uint8_t>(pt);
+            cur_scratch->flexfec_subtype = "flexfec";
+          } else if (codec_part.rfind("FLEXFEC-03/90000", 0) == 0) {
+            if (!cur_scratch->flexfec_pt.has_value()) {
+              cur_scratch->flexfec_pt = static_cast<uint8_t>(pt);
+              cur_scratch->flexfec_subtype = "flexfec-03";
+            }
           }
         }
       } else if (line.rfind("a=fmtp:", 0) == 0) {
@@ -1135,6 +1151,19 @@ std::optional<PureVideoSdpDescription> PureVideoSdpDescription::Parse(
                   static_cast<uint8_t>(pt);
             }
           }
+          const size_t rw_pos = params.find("repair-window=");
+          if (rw_pos != std::string_view::npos) {
+            std::string_view rw_val = params.substr(rw_pos + 14);
+            const size_t semi = rw_val.find(';');
+            if (semi != std::string_view::npos) {
+              rw_val = rw_val.substr(0, semi);
+            }
+            uint32_t rw_us = 0;
+            if (ParseUint32(rw_val, &rw_us) && rw_us > 0) {
+              cur_scratch->pt_to_repair_window_us[static_cast<uint8_t>(pt)] =
+                  rw_us;
+            }
+          }
           std::string lower_params(params);
           std::transform(lower_params.begin(), lower_params.end(),
                          lower_params.begin(), [](unsigned char c) {
@@ -1155,6 +1184,16 @@ std::optional<PureVideoSdpDescription> PureVideoSdpDescription::Parse(
           if (cur_m->primary_ssrc == 0 || cur_m->primary_ssrc == s1) {
             cur_m->primary_ssrc = s1;
             cur_m->primary_rtx_ssrc = s2;
+          }
+        }
+      } else if (line.rfind("a=ssrc-group:FEC-FR ", 0) == 0) {
+        std::istringstream fg(line.substr(20));
+        uint32_t s1 = 0;
+        uint32_t s2 = 0;
+        if (fg >> s1 >> s2) {
+          if (cur_m->primary_ssrc == 0 || cur_m->primary_ssrc == s1) {
+            cur_m->primary_ssrc = s1;
+            cur_m->flexfec_ssrc = s2;
           }
         }
       } else if (line.rfind("a=ssrc:", 0) == 0 && cur_m->primary_ssrc == 0) {
@@ -1195,6 +1234,11 @@ std::optional<PureVideoSdpDescription> PureVideoSdpDescription::Parse(
     if (sc.flexfec_pt.has_value()) {
       m.has_flexfec = true;
       m.flexfec_pt = *sc.flexfec_pt;
+      m.flexfec_subtype = sc.flexfec_subtype;
+      const auto rw_it = sc.pt_to_repair_window_us.find(*sc.flexfec_pt);
+      if (rw_it != sc.pt_to_repair_window_us.end()) {
+        m.flexfec_repair_window_us = rw_it->second;
+      }
     } else {
       m.has_flexfec = false;
     }

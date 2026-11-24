@@ -1157,6 +1157,7 @@ void IceTransportChannel::RebuildCandidatePairs() {
 
   pairs_.clear();
   selected_pair_idx_.reset();
+  pending_pings_.clear();
 
   for (const auto& lc : local_candidates_) {
     for (const auto& rc : remote_candidates_) {
@@ -1206,6 +1207,17 @@ void IceTransportChannel::SendConnectivityCheck(size_t pair_index) {
   }
 
   const Timestamp now = clock_->CurrentTime();
+  // 定期清理超时未应答（如不可达内网候选或弱网丢包）的 STUN Binding 事务记录，防止 pending_pings_ 持续增长泄漏。
+  for (auto it = pending_pings_.begin(); it != pending_pings_.end();) {
+    if ((now - it->second.sent_time) > TimeDelta::Seconds(5)) {
+      it = pending_pings_.erase(it);
+    } else {
+      ++it;
+    }
+  }
+  while (pending_pings_.size() >= 256) {
+    pending_pings_.erase(pending_pings_.begin());
+  }
   pending_pings_[req.transaction_id()] = PendingPing{pair_index, now};
   pair.last_ping_sent = now;
   ++pair.unacked_pings;

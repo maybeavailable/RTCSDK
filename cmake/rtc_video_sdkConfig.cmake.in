@@ -1,0 +1,6 @@
+@PACKAGE_INIT@
+
+# 纯现代 C++17 双模实时视频与数据通道 SDK（`rtc::rtc_video_sdk`）CMake 包配置文件。
+include("${CMAKE_CURRENT_LIST_DIR}/rtc_video_sdkTargets.cmake")
+
+check_required_components(rtc_video_sdk)

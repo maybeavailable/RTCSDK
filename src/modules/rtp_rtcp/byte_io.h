@@ -20,6 +20,11 @@ constexpr uint32_t ReadBigEndian32(const uint8_t* data) {
          (static_cast<uint32_t>(data[2]) << 8) | static_cast<uint32_t>(data[3]);
 }
 
+constexpr uint64_t ReadBigEndian64(const uint8_t* data) {
+  return (static_cast<uint64_t>(ReadBigEndian32(data)) << 32) |
+         static_cast<uint64_t>(ReadBigEndian32(data + 4));
+}
+
 constexpr int16_t ReadBigEndianSigned16(const uint8_t* data) {
   return static_cast<int16_t>(ReadBigEndian16(data));
 }
@@ -40,6 +45,11 @@ inline void WriteBigEndian32(uint8_t* data, uint32_t val) {
   data[1] = static_cast<uint8_t>((val >> 16) & 0xFF);
   data[2] = static_cast<uint8_t>((val >> 8) & 0xFF);
   data[3] = static_cast<uint8_t>(val & 0xFF);
+}
+
+inline void WriteBigEndian64(uint8_t* data, uint64_t val) {
+  WriteBigEndian32(data, static_cast<uint32_t>(val >> 32));
+  WriteBigEndian32(data + 4, static_cast<uint32_t>(val & 0xFFFFFFFFULL));
 }
 
 }  // namespace rtc

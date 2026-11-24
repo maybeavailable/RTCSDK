@@ -7,7 +7,7 @@
 #include <vector>
 
 #include "api/units.h"
-#include "rtc_video_sdk.h"
+#include "rtc_video_types.hpp"
 
 namespace rtc {
 

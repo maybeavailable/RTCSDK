@@ -25,8 +25,6 @@ struct GlobalLogRegistry {
   std::mutex mutex;
   LoggingSeverity configured_min_severity = LoggingSeverity::kInfo;
   std::vector<RegisteredSink> sinks;
-  rtc_log_callback_fn c_callback = nullptr;
-  void* c_user_data = nullptr;
 };
 
 GlobalLogRegistry& GetLogRegistry() {
@@ -165,11 +163,6 @@ LogMessage::~LogMessage() {
       item.sink->OnLogMessage(view, formatted);
     }
   }
-  if (reg.c_callback != nullptr) {
-    reg.c_callback(reg.c_user_data,
-                   static_cast<rtc_log_severity_e>(severity_),
-                   queue_tag.c_str(), file_str.c_str(), line_, payload.c_str());
-  }
 }
 
 void LogMessage::RecomputeEffectiveMinSeverityLocked() {
@@ -229,14 +222,6 @@ void LogMessage::RemoveLogSink(LogSink* sink) {
                      [sink](const RegisteredSink& r) { return r.sink == sink; }),
       reg.sinks.end());
   RecomputeEffectiveMinSeverityLocked();
-}
-
-void LogMessage::SetCLogCallback(rtc_log_callback_fn callback,
-                                 void* user_data) {
-  GlobalLogRegistry& reg = GetLogRegistry();
-  std::lock_guard<std::mutex> lock(reg.mutex);
-  reg.c_callback = callback;
-  reg.c_user_data = user_data;
 }
 
 }  // namespace rtc

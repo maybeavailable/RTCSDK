@@ -296,8 +296,14 @@ class WebTransportClientEngine final
   std::vector<uint8_t> connect_rx_buf_;
   std::vector<uint8_t> capsule_rx_buf_;
 
+  struct LocalWtStreamState {
+    bool is_uni = false;
+    bool local_fin = false;
+    bool remote_fin = false;
+  };
+
   // 在 Extended CONNECT 完成前创建的流与待发送块暂存区。
-  std::map<uint64_t, bool> wt_local_streams_;  // 流 ID 到是否为单向流的映射
+  std::map<uint64_t, LocalWtStreamState> wt_local_streams_;
   std::set<uint64_t> wt_prefix_written_;
   std::map<uint64_t, std::vector<PendingOutboundChunk>> pending_wt_writes_;
   std::vector<std::vector<uint8_t>> pending_wt_datagrams_;

@@ -8,21 +8,39 @@
 
 namespace rtc {
 
+void RtpPacket::set_csrcs(std::vector<uint32_t> list) {
+  if (list.size() > 15) {
+    list.resize(15);
+  }
+  csrcs_ = std::move(list);
+  raw_wire_.clear();
+}
+
+void RtpPacket::add_csrc(uint32_t csrc) {
+  if (csrcs_.size() < 15) {
+    csrcs_.push_back(csrc);
+    raw_wire_.clear();
+  }
+}
+
 void RtpPacket::SetMid(std::string_view mid_value) {
   if (!mid_value.empty() && mid_value.size() <= 16) {
     mid_.emplace(mid_value);
+    raw_wire_.clear();
   }
 }
 
 void RtpPacket::SetRid(std::string_view rid_value) {
   if (!rid_value.empty() && rid_value.size() <= 16) {
     rid_.emplace(rid_value);
+    raw_wire_.clear();
   }
 }
 
 void RtpPacket::SetRepairedRid(std::string_view rrid_value) {
   if (!rrid_value.empty() && rrid_value.size() <= 16) {
     rrid_.emplace(rrid_value);
+    raw_wire_.clear();
   }
 }
 
@@ -32,6 +50,7 @@ void RtpPacket::SetPayload(ArrayView<const uint8_t> payload_bytes) {
   } else {
     payload_.clear();
   }
+  raw_wire_.clear();
 }
 
 void RtpPacket::CopyHeaderAndExtensionsFrom(const RtpPacket& other) {
@@ -41,6 +60,7 @@ void RtpPacket::CopyHeaderAndExtensionsFrom(const RtpPacket& other) {
   sequence_number_ = other.sequence_number_;
   timestamp_ = other.timestamp_;
   ssrc_ = other.ssrc_;
+  csrcs_ = other.csrcs_;
   transport_seq_ = other.transport_seq_;
   abs_send_time_ = other.abs_send_time_;
   mid_ = other.mid_;
@@ -48,6 +68,7 @@ void RtpPacket::CopyHeaderAndExtensionsFrom(const RtpPacket& other) {
   rrid_ = other.rrid_;
   playout_delay_ = other.playout_delay_;
   dep_ext_ = other.dep_ext_;
+  raw_wire_.clear();
 }
 
 bool RtpPacket::UsesTwoByteExtensionHeader() const {
@@ -92,7 +113,11 @@ size_t RtpPacket::ExtensionsContentBytes() const {
 }
 
 size_t RtpPacket::SerializedSize() const {
-  size_t total = kFixedHeaderSize;
+  if (!raw_wire_.empty()) {
+    return raw_wire_.size();
+  }
+  const size_t cc = std::min<size_t>(csrcs_.size(), 15);
+  size_t total = kFixedHeaderSize + cc * 4;
   const size_t ext_content = ExtensionsContentBytes();
   if (ext_content > 0) {
     const size_t padded_ext = (ext_content + 3) & ~size_t{3};
@@ -101,6 +126,13 @@ size_t RtpPacket::SerializedSize() const {
   total += payload_.size();
   total += padding_size_;
   return total;
+}
+
+std::vector<uint8_t> RtpPacket::WireBytes() const {
+  if (!raw_wire_.empty()) {
+    return raw_wire_;
+  }
+  return Serialize();
 }
 
 size_t RtpPacket::WriteExtensions(uint8_t* dst) const {
@@ -199,10 +231,15 @@ size_t RtpPacket::SerializeTo(uint8_t* dst, size_t capacity) const {
   if (dst == nullptr || capacity < needed) {
     return 0;
   }
+  if (!raw_wire_.empty()) {
+    std::memcpy(dst, raw_wire_.data(), raw_wire_.size());
+    return raw_wire_.size();
+  }
   const bool has_ext = ExtensionsContentBytes() > 0;
   const bool has_pad = padding_size_ > 0;
+  const uint8_t cc = static_cast<uint8_t>(std::min<size_t>(csrcs_.size(), 15));
 
-  uint8_t b0 = 0x80;
+  uint8_t b0 = static_cast<uint8_t>(0x80 | (cc & 0x0F));
   if (has_pad) {
     b0 |= 0x20;
   }
@@ -217,6 +254,10 @@ size_t RtpPacket::SerializeTo(uint8_t* dst, size_t capacity) const {
   WriteBigEndian32(dst + 8, ssrc_);
 
   size_t offset = kFixedHeaderSize;
+  for (uint8_t i = 0; i < cc; ++i) {
+    WriteBigEndian32(dst + offset, csrcs_[i]);
+    offset += 4;
+  }
   if (has_ext) {
     offset += WriteExtensions(dst + offset);
   }
@@ -318,6 +359,10 @@ bool RtpPacket::Parse(ArrayView<const uint8_t> buffer,
   if (offset > size) {
     return false;
   }
+  csrcs_.resize(csrc_count);
+  for (uint8_t i = 0; i < csrc_count; ++i) {
+    csrcs_[i] = ReadBigEndian32(raw + kFixedHeaderSize + static_cast<size_t>(i) * 4);
+  }
 
   transport_seq_.reset();
   abs_send_time_.reset();
@@ -397,6 +442,7 @@ bool RtpPacket::Parse(ArrayView<const uint8_t> buffer,
   } else {
     payload_.clear();
   }
+  raw_wire_.assign(raw, raw + size);
   return true;
 }
 

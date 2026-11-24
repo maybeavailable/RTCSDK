@@ -178,7 +178,8 @@ class EmbeddedMoqRelayServer final : public IQuicServerVisitor {
                                 bool fin);
   void HandleUpstreamSubResponseBytes(PeerSession* peer,
                                       uint64_t stream_id,
-                                      ArrayView<const uint8_t> data);
+                                      ArrayView<const uint8_t> data,
+                                      bool fin);
   void RemoveClientRequestStream(PeerSession* peer, uint64_t stream_id);
   void HandleUnidirectionalBytes(PeerSession* publisher,
                                  uint64_t stream_id,

@@ -11,6 +11,7 @@
 #include "api/units.h"
 #include "modules/congestion_controller/goog_cc/goog_cc_controller.h"
 #include "modules/pacing/pacing_module.h"
+#include "modules/rtp_rtcp/byte_io.h"
 #include "modules/rtp_rtcp/flexfec_codec.h"
 #include "modules/rtp_rtcp/rtcp_packets.h"
 #include "modules/rtp_rtcp/rtp_packet.h"
@@ -34,7 +35,7 @@
 namespace rtc {
 namespace {
 
-// 0. 验证统一日志类（TaskQueue 标签、RingBufferLogSink、C99 回调与级别过滤）
+// 0. 验证统一日志类（TaskQueue 标签、RingBufferLogSink、自定义 C++17 LogSink 与级别过滤）
 TEST(LoggingTest, UnifiedLoggerTaskQueueTagAndSinks) {
   LogMessage::SetLogToStderr(false);
   LogMessage::SetMinLogSeverity(LoggingSeverity::kInfo);
@@ -42,25 +43,25 @@ TEST(LoggingTest, UnifiedLoggerTaskQueueTagAndSinks) {
   RingBufferLogSink ring_sink(8);
   LogMessage::AddLogSink(&ring_sink, LoggingSeverity::kInfo);
 
-  struct CCallbackCapture {
+  class CustomSinkCapture final : public LogSink {
+   public:
+    void OnLogMessage(const LogEntryView& entry,
+                      std::string_view /*formatted_line*/) override {
+      ++count;
+      last_queue = std::string(entry.queue_name);
+      last_msg = std::string(entry.message);
+    }
     int count = 0;
     std::string last_queue;
     std::string last_msg;
-  } c_cap;
+  } custom_cap;
 
-  rtc_set_log_callback(
-      [](void* ud, rtc_log_severity_e /*sev*/, const char* queue_name,
-         const char* /*file*/, int /*line*/, const char* msg) {
-        auto* cap = static_cast<CCallbackCapture*>(ud);
-        ++cap->count;
-        cap->last_queue = queue_name;
-        cap->last_msg = msg;
-      },
-      &c_cap);
+  RtcVideoEngine::AddLogSink(&custom_cap, LoggingSeverity::kInfo);
 
   // 在 kInfo 阈值下，kVerbose 级别日志必须被过滤掉
   RTC_LOG(kVerbose) << "should_not_appear";
   EXPECT_EQ(ring_sink.Size(), 0u);
+  EXPECT_EQ(custom_cap.count, 0);
 
   SdkTaskQueues queues;
   queues.worker()->Invoke([]() {
@@ -72,10 +73,10 @@ TEST(LoggingTest, UnifiedLoggerTaskQueueTagAndSinks) {
   EXPECT_NE(lines.back().find("[rtc-work]"), std::string::npos);
   EXPECT_NE(lines.back().find("worker_pipeline_event=42"), std::string::npos);
 
-  EXPECT_EQ(c_cap.last_queue, "rtc-work");
-  EXPECT_EQ(c_cap.last_msg, "worker_pipeline_event=42");
+  EXPECT_EQ(custom_cap.last_queue, "rtc-work");
+  EXPECT_EQ(custom_cap.last_msg, "worker_pipeline_event=42");
 
-  rtc_set_log_callback(nullptr, nullptr);
+  RtcVideoEngine::RemoveLogSink(&custom_cap);
   LogMessage::RemoveLogSink(&ring_sink);
   LogMessage::SetLogToStderr(true);
 }
@@ -1844,6 +1845,184 @@ TEST(StunTurnCodecUnitTest, Rfc5766AttributesMultiPeerDataAndChannelData) {
   EXPECT_EQ(ch_num, 0x4003);
   EXPECT_EQ(std::vector<uint8_t>(unwrapped.begin(), unwrapped.end()),
             odd_payload);
+}
+
+// 验证 RFC 8627 全变体线速格式（15/46/110 位柔性掩码、F=1 2-D 矩阵剥离纠错、R=1 单包重传、R=1,F=1 忽略）及跨 65535->0 缓存淘汰无泄漏
+TEST(RtpRtcpTest, Rfc8627AllVariantsWrapAroundAnd2DPeeling) {
+  constexpr uint32_t kMediaSsrc = 0xAABBCCDDu;
+  constexpr uint32_t kFecSsrc = 0x11223344u;
+  constexpr uint8_t kMediaPt = 96;
+  constexpr uint8_t kFecPt = 118;
+
+  RtpHeaderExtensionMap ext_map = RtpHeaderExtensionMap::BrowserDefault();
+  FlexfecSender sender(kFecPt, kFecSsrc, kMediaSsrc, "0", 10'000'000);
+  FlexfecReceiver receiver(kFecSsrc, kMediaSsrc, 10'000'000);
+  receiver.set_extension_map(ext_map);
+
+  auto make_media_pkt = [&](uint16_t seq, uint32_t ts, size_t payload_len,
+                            bool marker, uint16_t twcc) {
+    RtpPacket p;
+    p.set_extension_map(ext_map);
+    p.set_payload_type(kMediaPt);
+    p.set_ssrc(kMediaSsrc);
+    p.set_sequence_number(seq);
+    p.set_timestamp(ts);
+    p.set_marker(marker);
+    p.SetMid("0");
+    p.set_transport_sequence_number(twcc);
+    p.SetAbsoluteSendTime(Timestamp::Millis(1000 + (seq % 500)));
+    std::vector<uint8_t> body(payload_len);
+    for (size_t i = 0; i < payload_len; ++i) {
+      body[i] = static_cast<uint8_t>((seq * 13u + i * 7u) & 0xFFu);
+    }
+    p.SetPayload(body);
+    return p;
+  };
+
+  // 1) 校验 RFC 8627 第 4.2.1 / 4.2.2.1 节（R=0, F=0）15 位掩码头部字段字节布局。
+  const RtpPacket p0 = make_media_pkt(500, 90000, 120, false, 10);
+  const RtpPacket p1 = make_media_pkt(501, 90000, 185, true, 11);
+  auto fec_15 = sender.BuildFlexibleMaskParityPacket({&p0, &p1});
+  ASSERT_TRUE(fec_15.has_value());
+  // Marker 必须为 false，且 RTP 头 CSRC[0] 等于受保护源 SSRC。
+  EXPECT_FALSE(fec_15->marker());
+  ASSERT_EQ(fec_15->csrcs().size(), 1u);
+  EXPECT_EQ(fec_15->csrcs()[0], kMediaSsrc);
+  ASSERT_GE(fec_15->payload_size(), 12u);
+  const uint8_t* f15 = fec_15->payload().data();
+  EXPECT_EQ(f15[0] & 0xC0u, 0x00u);  // R=0, F=0
+  const uint16_t expected_len_rec =
+      static_cast<uint16_t>((p0.SerializedSize() - 12) ^
+                            (p1.SerializedSize() - 12));
+  EXPECT_EQ(ReadBigEndian16(f15 + 2), expected_len_rec);
+  EXPECT_EQ(ReadBigEndian16(f15 + 8), 500u);
+  // j=0 (MSB bit14) 与 j=1 (bit13) 置 1，k0=0 -> 0x6000。
+  EXPECT_EQ(ReadBigEndian16(f15 + 10), 0x6000u);
+
+  // 2) 校验 46 位（偏移 30）与 110 位（偏移 95）级联 k-bit 掩码丢包精确恢复（含扩展头）。
+  const RtpPacket p_wide_a = make_media_pkt(1000, 180000, 140, false, 20);
+  const RtpPacket p_wide_b = make_media_pkt(1030, 183000, 210, false, 21);
+  const RtpPacket p_wide_c = make_media_pkt(1095, 189000, 95, true, 22);
+  auto fec_110 =
+      sender.BuildFlexibleMaskParityPacket({&p_wide_a, &p_wide_b, &p_wide_c});
+  ASSERT_TRUE(fec_110.has_value());
+  ASSERT_GE(fec_110->payload_size(), 24u);
+  // 首掩码字 k0=1 (0x8000)，次掩码字 k1=1 (0x80000000)。
+  EXPECT_NE(ReadBigEndian16(fec_110->payload().data() + 10) & 0x8000u, 0u);
+  EXPECT_NE(ReadBigEndian32(fec_110->payload().data() + 12) & 0x80000000u, 0u);
+
+  EXPECT_TRUE(receiver.OnRtpPacket(p_wide_a).empty());
+  EXPECT_TRUE(receiver.OnRtpPacket(*fec_110).empty());
+  auto rec_110 = receiver.OnRtpPacket(p_wide_c);
+  ASSERT_EQ(rec_110.size(), 1u);
+  EXPECT_EQ(rec_110[0].sequence_number(), 1030u);
+  EXPECT_EQ(rec_110[0].payload(), p_wide_b.payload());
+  EXPECT_EQ(rec_110[0].transport_sequence_number(),
+            p_wide_b.transport_sequence_number());
+  EXPECT_EQ(rec_110[0].mid(), p_wide_b.mid());
+
+  // 3) 校验 R=0, F=1（固定 2×2 矩阵）双丢包级联剥离纠错与非法 L=0,D=0 拒绝。
+  EXPECT_FALSE(
+      sender.BuildFixedMatrixParityPacket({&p0}, 500, 0, 0).has_value());
+  const RtpPacket m00 = make_media_pkt(2000, 270000, 100, false, 30);
+  const RtpPacket m01 = make_media_pkt(2001, 270000, 130, false, 31);
+  const RtpPacket m10 = make_media_pkt(2002, 273000, 110, false, 32);
+  const RtpPacket m11 = make_media_pkt(2003, 273000, 150, true, 33);
+  auto row0_fec = sender.BuildFixedMatrixParityPacket({&m00, &m01}, 2000, 2, 1);
+  auto col1_fec = sender.BuildFixedMatrixParityPacket({&m01, &m11}, 2001, 2, 2);
+  ASSERT_TRUE(row0_fec.has_value());
+  ASSERT_TRUE(col1_fec.has_value());
+  // 同时丢失 m01 (2001) 与 m11 (2003)：收到 m00、col1_fec、row0_fec 后应一次性级联恢复 m01 与 m11！
+  EXPECT_TRUE(receiver.OnRtpPacket(m00).empty());
+  EXPECT_TRUE(receiver.OnRtpPacket(m10).empty());
+  EXPECT_TRUE(receiver.OnRtpPacket(*col1_fec).empty());
+  auto peeled = receiver.OnRtpPacket(*row0_fec);
+  ASSERT_EQ(peeled.size(), 2u);
+  EXPECT_EQ(peeled[0].sequence_number(), 2001u);
+  EXPECT_EQ(peeled[0].payload(), m01.payload());
+  EXPECT_EQ(peeled[1].sequence_number(), 2003u);
+  EXPECT_EQ(peeled[1].payload(), m11.payload());
+  EXPECT_EQ(receiver.PendingFecCountForTest(), 0u);
+
+  // 4) 校验 R=1, F=0 单包重传恢复，以及 R=1, F=1 保留位严格忽略。
+  const RtpPacket lost_single = make_media_pkt(3000, 360000, 160, true, 40);
+  auto rtx_fec = sender.BuildRetransmissionPacket(lost_single);
+  ASSERT_TRUE(rtx_fec.has_value());
+  EXPECT_TRUE(rtx_fec->csrcs().empty());
+  EXPECT_EQ(rtx_fec->payload()[0] & 0xC0u, 0x80u);  // R=1, F=0
+
+  RtpPacket reserved_rf11 = *rtx_fec;
+  (*reserved_rf11.mutable_payload())[0] |= 0xC0u;  // R=1, F=1 必须被忽略
+  EXPECT_TRUE(receiver.OnRtpPacket(reserved_rf11).empty());
+
+  auto rec_single = receiver.OnRtpPacket(*rtx_fec);
+  ASSERT_EQ(rec_single.size(), 1u);
+  EXPECT_EQ(rec_single[0].sequence_number(), 3000u);
+  EXPECT_EQ(rec_single[0].payload(), lost_single.payload());
+
+  // 5) 校验跨 65535 -> 0 序列号回绕与超过 600 包后的缓存精确淘汰（无泄漏、无回绕误删）。
+  FlexfecReceiver wrap_rx(kFecSsrc, kMediaSsrc);
+  wrap_rx.set_extension_map(ext_map);
+  for (int step = 0; step < 620; ++step) {
+    const uint16_t seq = static_cast<uint16_t>(65200u + step);
+    const RtpPacket mp = make_media_pkt(seq, 400000 + step * 3000, 80, true,
+                                        static_cast<uint16_t>(step));
+    EXPECT_TRUE(wrap_rx.OnRtpPacket(mp).empty());
+  }
+  EXPECT_LE(wrap_rx.CachedMediaCountForTest(), 512u);
+
+  // 在回绕边界 65535 -> 0 构造一组 4 包（丢弃 seq=0），验证回绕后最新报文未被 begin() 误删！
+  FlexfecReceiver boundary_rx(kFecSsrc, kMediaSsrc);
+  boundary_rx.set_extension_map(ext_map);
+  for (int pre = 0; pre < 520; ++pre) {
+    const uint16_t seq = static_cast<uint16_t>(65014u + pre);
+    boundary_rx.OnRtpPacket(
+        make_media_pkt(seq, 500000 + pre * 90, 64, false, pre));
+  }
+  const RtpPacket w_65534 = make_media_pkt(65534, 600000, 90, false, 600);
+  const RtpPacket w_65535 = make_media_pkt(65535, 600000, 95, false, 601);
+  const RtpPacket w_0 = make_media_pkt(0, 600000, 100, false, 602);
+  const RtpPacket w_1 = make_media_pkt(1, 600000, 105, true, 603);
+  auto wrap_fec =
+      sender.BuildFlexibleMaskParityPacket({&w_65534, &w_65535, &w_0, &w_1});
+  ASSERT_TRUE(wrap_fec.has_value());
+  boundary_rx.OnRtpPacket(w_65534);
+  boundary_rx.OnRtpPacket(w_65535);
+  boundary_rx.OnRtpPacket(w_1);
+  auto rec_wrap = boundary_rx.OnRtpPacket(*wrap_fec);
+  ASSERT_EQ(rec_wrap.size(), 1u);
+  EXPECT_EQ(rec_wrap[0].sequence_number(), 0u);
+  EXPECT_EQ(rec_wrap[0].payload(), w_0.payload());
+  EXPECT_LE(boundary_rx.CachedMediaCountForTest(), 512u);
+  EXPECT_EQ(boundary_rx.PendingFecCountForTest(), 0u);
+
+  // 6) 验证 SDP 默认序列化标准 RFC 8627 `flexfec/90000` 与 `a=ssrc-group:FEC-FR` 往返解析。
+  PureVideoSdpDescription desc;
+  desc.ice_params = {"ufrag1", "pwd1234567890123456789012"};
+  desc.dtls_fingerprint_sha256 =
+      "00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:"
+      "00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF";
+  VideoMediaTrackDesc vm;
+  vm.has_flexfec = true;
+  vm.flexfec_pt = 118;
+  vm.flexfec_repair_window_us = 8'000'000;
+  vm.primary_ssrc = kMediaSsrc;
+  vm.primary_rtx_ssrc = kMediaSsrc + 1;
+  vm.flexfec_ssrc = kFecSsrc;
+  desc.video_m_sections.push_back(vm);
+  const std::string sdp_text = desc.Serialize();
+  EXPECT_NE(sdp_text.find("a=rtpmap:118 flexfec/90000\r\n"), std::string::npos);
+  EXPECT_NE(sdp_text.find("a=fmtp:118 repair-window=8000000\r\n"),
+            std::string::npos);
+  EXPECT_NE(sdp_text.find("a=ssrc-group:FEC-FR "), std::string::npos);
+  const auto reparsed =
+      PureVideoSdpDescription::Parse(sdp_text, VideoCodec::kH264);
+  ASSERT_TRUE(reparsed.has_value());
+  ASSERT_EQ(reparsed->video_m_sections.size(), 1u);
+  EXPECT_TRUE(reparsed->video_m_sections[0].has_flexfec);
+  EXPECT_EQ(reparsed->video_m_sections[0].flexfec_subtype, "flexfec");
+  EXPECT_EQ(reparsed->video_m_sections[0].flexfec_repair_window_us, 8'000'000u);
+  EXPECT_EQ(reparsed->video_m_sections[0].flexfec_ssrc, kFecSsrc);
 }
 
 }  // namespace

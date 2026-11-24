@@ -89,28 +89,52 @@ class RtpPacket {
   const RtpHeaderExtensionMap& extension_map() const { return ext_map_; }
 
   bool marker() const { return marker_; }
-  void set_marker(bool m) { marker_ = m; }
+  void set_marker(bool m) {
+    marker_ = m;
+    raw_wire_.clear();
+  }
 
   uint8_t payload_type() const { return payload_type_; }
-  void set_payload_type(uint8_t pt) { payload_type_ = pt & 0x7F; }
+  void set_payload_type(uint8_t pt) {
+    payload_type_ = pt & 0x7F;
+    raw_wire_.clear();
+  }
 
   uint16_t sequence_number() const { return sequence_number_; }
-  void set_sequence_number(uint16_t seq) { sequence_number_ = seq; }
+  void set_sequence_number(uint16_t seq) {
+    sequence_number_ = seq;
+    raw_wire_.clear();
+  }
 
   uint32_t timestamp() const { return timestamp_; }
-  void set_timestamp(uint32_t ts) { timestamp_ = ts; }
+  void set_timestamp(uint32_t ts) {
+    timestamp_ = ts;
+    raw_wire_.clear();
+  }
 
   uint32_t ssrc() const { return ssrc_; }
-  void set_ssrc(uint32_t ssrc) { ssrc_ = ssrc; }
+  void set_ssrc(uint32_t ssrc) {
+    ssrc_ = ssrc;
+    raw_wire_.clear();
+  }
+
+  // RFC 3550 / RFC 8627 第 4.2.1 节 CSRC 列表支持（最多 15 个贡献源 SSRC）。
+  const std::vector<uint32_t>& csrcs() const { return csrcs_; }
+  void set_csrcs(std::vector<uint32_t> list);
+  void add_csrc(uint32_t csrc);
 
   std::optional<uint16_t> transport_sequence_number() const {
     return transport_seq_;
   }
-  void set_transport_sequence_number(uint16_t seq) { transport_seq_ = seq; }
+  void set_transport_sequence_number(uint16_t seq) {
+    transport_seq_ = seq;
+    raw_wire_.clear();
+  }
 
   std::optional<uint32_t> absolute_send_time() const { return abs_send_time_; }
   void SetAbsoluteSendTime(Timestamp t) {
     abs_send_time_ = ToAbsoluteSendTime24(t);
+    raw_wire_.clear();
   }
 
   const std::optional<std::string>& mid() const { return mid_; }
@@ -125,28 +149,38 @@ class RtpPacket {
   std::optional<PlayoutDelayLimits> playout_delay() const {
     return playout_delay_;
   }
-  void set_playout_delay(PlayoutDelayLimits limits) { playout_delay_ = limits; }
+  void set_playout_delay(PlayoutDelayLimits limits) {
+    playout_delay_ = limits;
+    raw_wire_.clear();
+  }
 
   std::optional<CompactDependencyExtension> dependency_descriptor() const {
     return dep_ext_;
   }
   void set_dependency_descriptor(const CompactDependencyExtension& dep) {
     dep_ext_ = dep;
+    raw_wire_.clear();
   }
 
   void CopyHeaderAndExtensionsFrom(const RtpPacket& other);
 
   const std::vector<uint8_t>& payload() const { return payload_; }
-  std::vector<uint8_t>* mutable_payload() { return &payload_; }
+  std::vector<uint8_t>* mutable_payload() {
+    raw_wire_.clear();
+    return &payload_;
+  }
   void SetPayload(ArrayView<const uint8_t> payload_bytes);
   size_t payload_size() const { return payload_.size(); }
 
   size_t padding_size() const { return padding_size_; }
   void set_padding_size(size_t pad_bytes) {
     padding_size_ = (pad_bytes > 255) ? 255 : pad_bytes;
+    raw_wire_.clear();
   }
 
   size_t SerializedSize() const;
+  // 若报文来自网络 Parse 且未被修改，直接返回原始线速字节（保留对端未知扩展头以精确匹配 RFC 8627 异或校验）。
+  std::vector<uint8_t> WireBytes() const;
 
   static constexpr uint32_t ToAbsoluteSendTime24(Timestamp t) {
     const uint64_t us = static_cast<uint64_t>(t.us() >= 0 ? t.us() : 0);
@@ -168,6 +202,7 @@ class RtpPacket {
   uint16_t sequence_number_ = 0;
   uint32_t timestamp_ = 0;
   uint32_t ssrc_ = 0;
+  std::vector<uint32_t> csrcs_;
 
   std::optional<uint16_t> transport_seq_;
   std::optional<uint32_t> abs_send_time_;
@@ -179,6 +214,7 @@ class RtpPacket {
 
   std::vector<uint8_t> payload_;
   size_t padding_size_ = 0;
+  std::vector<uint8_t> raw_wire_;
 };
 
 constexpr bool IsRtcpPacketWire(ArrayView<const uint8_t> packet) {

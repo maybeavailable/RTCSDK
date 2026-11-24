@@ -2367,6 +2367,7 @@ int MoqRelayBackend::CloseDataChannel(int channel_id) {
       return;
     }
     MoqDataChannelState& dch = it->second;
+    const std::string label = dch.config.label;
     if (connected_ && quic_engine_) {
       TransmitMoqDataMessageOnWorker(channel_id, ArrayView<const uint8_t>(),
                                      /*is_binary=*/true, /*is_close=*/true);
@@ -2385,10 +2386,19 @@ int MoqRelayBackend::CloseDataChannel(int channel_id) {
     }
     dch.pending_messages.clear();
     dch.state = RTC_DATA_CHANNEL_CLOSED;
+    label_to_dc_id_.erase(label);
+    for (auto np_it = notified_remote_dc_peers_.begin();
+         np_it != notified_remote_dc_peers_.end();) {
+      if (np_it->second == channel_id) {
+        np_it = notified_remote_dc_peers_.erase(np_it);
+      } else {
+        ++np_it;
+      }
+    }
+    data_channels_.erase(it);
     if (observer_ != nullptr) {
-      observer_->OnBackendDataChannelState(
-          local_peer_id_, channel_id, dch.config.label,
-          RTC_DATA_CHANNEL_CLOSED);
+      observer_->OnBackendDataChannelState(local_peer_id_, channel_id, label,
+                                           RTC_DATA_CHANNEL_CLOSED);
     }
   });
   return RTC_OK;

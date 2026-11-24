@@ -34,7 +34,6 @@
 #include "rtc_base/logging.h"
 #include "rtc_quic_congestion_control.hpp"
 #include "rtc_video_engine.hpp"
-#include "rtc_video_sdk.h"
 #include "server/embedded_moq_relay.h"
 
 namespace rtc {
@@ -1167,7 +1166,7 @@ TEST(RtcRealCongestionControlTest,
     ClosedLoopCcObserver obs(/*初始高清码率=*/1'000'000);
     auto eng = RtcVideoEngine::Create(cfg, &obs);
     const std::string peer_name =
-        std::string("peer_") + rtc_quic_cc_algo_name(algo);
+        "peer_" + std::string(QuicCcAlgoName(algo));
     ASSERT_EQ(eng->JoinRoom("cc_matrix_room", peer_name), RTC_OK);
     ASSERT_TRUE(obs.WaitConnected(4000));
 
@@ -1223,16 +1222,16 @@ TEST(RtcRealCongestionControlTest,
     writer.join();
 
     std::cout << "  [" << std::left << std::setw(8)
-              << rtc_quic_cc_algo_name(algo) << std::right << "] "
+              << QuicCcAlgoName(algo) << std::right << "] "
               << "1600k阶段: 分配=" << std::setw(4) << hi_alloc_kbps
               << " kbps, 出站=" << std::setw(6) << hi_tel.uplink_egress_kbps
               << " kbps | 600k限速阶段: 分配=" << std::setw(4) << lo_alloc_kbps
               << " kbps, 出站=" << std::setw(6) << lo_tel.uplink_egress_kbps
               << " kbps, P50排队=" << lo_tel.queue_delay_p50_ms << " ms\n";
 
-    EXPECT_GE(hi_alloc_kbps, 950u) << rtc_quic_cc_algo_name(algo);
-    EXPECT_LE(lo_alloc_kbps, 680u) << rtc_quic_cc_algo_name(algo);
-    EXPECT_LT(lo_alloc_kbps, hi_alloc_kbps) << rtc_quic_cc_algo_name(algo);
+    EXPECT_GE(hi_alloc_kbps, 950u) << QuicCcAlgoName(algo);
+    EXPECT_LE(lo_alloc_kbps, 680u) << QuicCcAlgoName(algo);
+    EXPECT_LT(lo_alloc_kbps, hi_alloc_kbps) << QuicCcAlgoName(algo);
 
     eng->LeaveRoom();
     algo_proxy.Stop();

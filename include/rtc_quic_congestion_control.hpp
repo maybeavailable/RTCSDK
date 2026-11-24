@@ -17,7 +17,7 @@
 #include <string_view>
 #include <vector>
 
-#include "rtc_video_sdk.h"
+#include "rtc_video_types.hpp"
 
 namespace rtc {
 
@@ -57,7 +57,7 @@ struct QuicCcMigrationState {
   size_t bytes_in_flight = 0;
 };
 
-class IQuicCongestionController {
+class RTC_SDK_API IQuicCongestionController {
  public:
   IQuicCongestionController() = default;
   virtual ~IQuicCongestionController() = default;
@@ -94,7 +94,7 @@ class IQuicCongestionController {
                                     int64_t now_us) = 0;
 };
 
-class IQuicCongestionControllerFactory {
+class RTC_SDK_API IQuicCongestionControllerFactory {
  public:
   IQuicCongestionControllerFactory() = default;
   virtual ~IQuicCongestionControllerFactory() = default;

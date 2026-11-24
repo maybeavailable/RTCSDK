@@ -266,24 +266,29 @@ int SctpDataChannelManager::CloseDataChannel(int channel_id) {
     return RTC_OK;
   }
   const std::string label = ch.config.label;
-  if (ch.sctp_sid.has_value() && assoc_state_ == AssocState::kEstablished) {
-    // 发送 RFC 6525 Outgoing SSN Reset Request (0x000D) 通知远端关闭该流。
-    std::vector<uint8_t> chunk;
-    AppendChunkHeader(kChunkReconfig, 0, 4 + 18, &chunk);
-    uint8_t hdr[18]{};
-    WriteBigEndian16(hdr, kParamOutgoingSsnResetReq);
-    WriteBigEndian16(hdr + 2, 18);
-    WriteBigEndian32(hdr + 4, next_reconfig_seq_++);
-    WriteBigEndian32(hdr + 8, 0);
-    WriteBigEndian32(hdr + 12, next_tx_tsn_ - 1);
-    WriteBigEndian16(hdr + 16, *ch.sctp_sid);
-    chunk.insert(chunk.end(), hdr, hdr + sizeof(hdr));
-    PadTo4Bytes(&chunk);
-    SendChunksPacket(peer_vtag_, chunk);
-    sid_to_channel_id_.erase(*ch.sctp_sid);
+  if (ch.sctp_sid.has_value()) {
+    const uint16_t sid = *ch.sctp_sid;
+    if (assoc_state_ == AssocState::kEstablished) {
+      // 发送 RFC 6525 Outgoing SSN Reset Request (0x000D) 通知远端关闭该流。
+      std::vector<uint8_t> chunk;
+      AppendChunkHeader(kChunkReconfig, 0, 4 + 18, &chunk);
+      uint8_t hdr[18]{};
+      WriteBigEndian16(hdr, kParamOutgoingSsnResetReq);
+      WriteBigEndian16(hdr + 2, 18);
+      WriteBigEndian32(hdr + 4, next_reconfig_seq_++);
+      WriteBigEndian32(hdr + 8, 0);
+      WriteBigEndian32(hdr + 12, next_tx_tsn_ - 1);
+      WriteBigEndian16(hdr + 16, sid);
+      chunk.insert(chunk.end(), hdr, hdr + sizeof(hdr));
+      PadTo4Bytes(&chunk);
+      SendChunksPacket(peer_vtag_, chunk);
+    }
+    sid_to_channel_id_.erase(sid);
+    ordered_ready_.erase(sid);
+    next_expected_ssn_.erase(sid);
+    early_rx_messages_.erase(sid);
   }
-  ch.pending_messages.clear();
-  ch.state = RTC_DATA_CHANNEL_CLOSED;
+  channels_.erase(it);
   if (observer_ != nullptr) {
     observer_->OnSctpDataChannelState(channel_id, label,
                                       RTC_DATA_CHANNEL_CLOSED);
@@ -941,6 +946,9 @@ void SctpDataChannelManager::HandleDataChunk(
   frag.flags = chunk_flags;
   frag.payload.assign(user_data.begin(), user_data.end());
   rx_fragments_.emplace(tsn, std::move(frag));
+  while (rx_fragments_.size() > 2048) {
+    rx_fragments_.erase(rx_fragments_.begin());
+  }
 
   TryReassembleAround(tsn);
 }
@@ -1043,6 +1051,9 @@ void SctpDataChannelManager::DrainOrderedStream(uint16_t sid) {
       DeliverUserPayloadOnStream(sid, msg.ppid, std::move(msg.payload));
     }
   }
+  if (stream_map.empty()) {
+    ordered_ready_.erase(sid);
+  }
 }
 
 void SctpDataChannelManager::HandleDcepMessage(
@@ -1137,6 +1148,10 @@ void SctpDataChannelManager::DeliverUserPayloadOnStream(
 
   const auto cid_it = sid_to_channel_id_.find(sid);
   if (cid_it == sid_to_channel_id_.end()) {
+    if (early_rx_messages_.size() >= 64 &&
+        early_rx_messages_.find(sid) == early_rx_messages_.end()) {
+      early_rx_messages_.erase(early_rx_messages_.begin());
+    }
     auto& q = early_rx_messages_[sid];
     if (q.size() < 32) {
       q.emplace_back(is_binary, std::move(payload));
@@ -1209,7 +1224,9 @@ void SctpDataChannelManager::HandleReconfigChunk(
       const uint32_t req_seq = ReadBigEndian32(chunk_body.data() + off + 4);
       for (size_t s_off = off + 16; s_off + 2 <= off + plen; s_off += 2) {
         const uint16_t sid = ReadBigEndian16(chunk_body.data() + s_off);
-        next_expected_ssn_[sid] = 0;
+        ordered_ready_.erase(sid);
+        next_expected_ssn_.erase(sid);
+        early_rx_messages_.erase(sid);
         const auto cid_it = sid_to_channel_id_.find(sid);
         if (cid_it != sid_to_channel_id_.end()) {
           const int cid = cid_it->second;
@@ -1217,7 +1234,7 @@ void SctpDataChannelManager::HandleReconfigChunk(
           std::string label;
           if (ch_it != channels_.end()) {
             label = ch_it->second.config.label;
-            ch_it->second.state = RTC_DATA_CHANNEL_CLOSED;
+            channels_.erase(ch_it);
           }
           sid_to_channel_id_.erase(cid_it);
           if (observer_ != nullptr) {
