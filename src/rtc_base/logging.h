@@ -29,28 +29,6 @@ constexpr std::string_view StripDirectoryPath(std::string_view full_path) {
                                            : full_path.substr(slash + 1);
 }
 
-// 用于嵌入式事后故障诊断的有界内存环形日志接收器。
-class RingBufferLogSink final : public LogSink {
- public:
-  explicit RingBufferLogSink(size_t capacity = 256);
-  ~RingBufferLogSink() override = default;
-
-  RingBufferLogSink(const RingBufferLogSink&) = delete;
-  RingBufferLogSink& operator=(const RingBufferLogSink&) = delete;
-
-  void OnLogMessage(const LogEntryView& entry,
-                    std::string_view formatted_line) override;
-
-  std::vector<std::string> Snapshot() const;
-  void Clear();
-  size_t Size() const;
-
- private:
-  const size_t capacity_;
-  mutable std::mutex mutex_;
-  std::deque<std::string> lines_;
-};
-
 class LogMessage {
  public:
   LogMessage(std::string_view file, int line, LoggingSeverity severity);

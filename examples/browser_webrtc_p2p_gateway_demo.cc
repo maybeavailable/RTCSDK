@@ -38,6 +38,24 @@ namespace {
 namespace http = boost::beast::http;
 using tcp = boost::asio::ip::tcp;
 
+constexpr size_t kMaxConcurrentHttpClients = 64;
+
+bool IsAllowedLocalOrigin(std::string_view origin) {
+  if (origin.empty()) {
+    return true;
+  }
+  for (std::string_view pfx :
+       {"http://127.0.0.1", "https://127.0.0.1", "http://localhost",
+        "https://localhost", "http://[::1]", "https://[::1]"}) {
+    if (origin.size() >= pfx.size() &&
+        origin.substr(0, pfx.size()) == pfx &&
+        (origin.size() == pfx.size() || origin[pfx.size()] == ':')) {
+      return true;
+    }
+  }
+  return false;
+}
+
 std::atomic<bool> g_quit{false};
 void OnSignal(int /*sig*/) { g_quit.store(true); }
 
@@ -225,9 +243,10 @@ class BrowserP2pHttpGateway {
       if (ec) return;
       acceptor_.listen(boost::asio::socket_base::max_listen_connections, ec);
       if (ec) return;
-      bound_port_ = acceptor_.local_endpoint(ec).port();
+      const uint16_t p = acceptor_.local_endpoint(ec).port();
       ok = !ec;
       if (ok) {
+        bound_port_.store(p, std::memory_order_release);
         DoAccept();
       }
     });
@@ -243,6 +262,7 @@ class BrowserP2pHttpGateway {
     if (stopped_.exchange(true)) {
       return;
     }
+    bound_port_.store(0, std::memory_order_release);
     http_queue_.Invoke([this]() {
       boost::system::error_code ec;
       acceptor_.close(ec);
@@ -261,53 +281,98 @@ class BrowserP2pHttpGateway {
     }
   }
 
-  uint16_t port() const { return bound_port_; }
+  uint16_t port() const { return bound_port_.load(std::memory_order_acquire); }
 
  private:
   void DoAccept() {
     acceptor_.async_accept([this](boost::system::error_code ec,
                                   tcp::socket socket) {
-      if (ec) {
+      if (ec || stopped_.load(std::memory_order_acquire)) {
         return;
       }
-      HandleHttpClient(std::move(socket));
+      if (active_http_clients_.load(std::memory_order_acquire) >=
+          kMaxConcurrentHttpClients) {
+        boost::system::error_code close_ec;
+        socket.close(close_ec);
+        DoAccept();
+        return;
+      }
       DoAccept();
+      HandleHttpClientAsync(std::move(socket));
     });
   }
 
-  void HandleHttpClient(tcp::socket socket) {
-    boost::system::error_code ec;
-    boost::beast::flat_buffer buffer;
-    http::request<http::string_body> req;
-    http::read(socket, buffer, req, ec);
-    if (ec) {
-      return;
-    }
-
-    http::response<http::string_body> res{http::status::ok, req.version()};
-    res.set(http::field::access_control_allow_origin, "*");
-
-    if (req.method() == http::verb::get && req.target() == "/") {
-      res.set(http::field::content_type, "text/html; charset=utf-8");
-      res.body() = kBrowserHtmlPage;
-    } else if (req.method() == http::verb::post &&
-               req.target() == "/api/offer") {
-      std::string answer_sdp;
-      if (AcceptBrowserOffer(req.body(), &answer_sdp)) {
-        res.set(http::field::content_type, "application/sdp");
-        res.body() = std::move(answer_sdp);
-      } else {
-        res.result(http::status::bad_request);
-        res.body() = "Invalid WebRTC SDP Offer";
+  void HandleHttpClientAsync(tcp::socket socket) {
+    struct HttpConn {
+      HttpConn(tcp::socket s, std::atomic<size_t>* counter)
+          : stream(std::move(s)), active_counter(counter) {
+        active_counter->fetch_add(1, std::memory_order_acq_rel);
+        parser.body_limit(256 * 1024);
       }
-    } else {
-      res.result(http::status::not_found);
-      res.body() = "Not Found";
-    }
+      ~HttpConn() {
+        active_counter->fetch_sub(1, std::memory_order_acq_rel);
+      }
+      boost::beast::tcp_stream stream;
+      std::atomic<size_t>* active_counter;
+      boost::beast::flat_buffer buffer;
+      http::request_parser<http::string_body> parser;
+      http::response<http::string_body> res;
+    };
+    auto conn =
+        std::make_shared<HttpConn>(std::move(socket), &active_http_clients_);
+    conn->stream.expires_after(std::chrono::seconds(5));
+    http::async_read(
+        conn->stream, conn->buffer, conn->parser,
+        [this, conn](boost::system::error_code ec, size_t /*n*/) {
+          if (ec || stopped_.load(std::memory_order_acquire)) {
+            return;
+          }
+          auto req = conn->parser.release();
+          conn->res =
+              http::response<http::string_body>{http::status::ok, req.version()};
+          const std::string origin(req[http::field::origin]);
+          if (!IsAllowedLocalOrigin(origin)) {
+            conn->res.result(http::status::forbidden);
+            conn->res.body() = "Forbidden cross-origin request";
+          } else {
+            if (!origin.empty()) {
+              conn->res.set(http::field::access_control_allow_origin, origin);
+              conn->res.set(http::field::vary, "Origin");
+            }
+            if (req.method() == http::verb::options) {
+              conn->res.set(http::field::access_control_allow_methods,
+                            "GET, POST, OPTIONS");
+              conn->res.set(http::field::access_control_allow_headers,
+                            "Content-Type");
+            } else if (req.method() == http::verb::get && req.target() == "/") {
+              conn->res.set(http::field::content_type,
+                            "text/html; charset=utf-8");
+              conn->res.body() = kBrowserHtmlPage;
+            } else if (req.method() == http::verb::post &&
+                       req.target() == "/api/offer") {
+              std::string answer_sdp;
+              if (AcceptBrowserOffer(req.body(), &answer_sdp)) {
+                conn->res.set(http::field::content_type, "application/sdp");
+                conn->res.body() = std::move(answer_sdp);
+              } else {
+                conn->res.result(http::status::bad_request);
+                conn->res.body() = "Invalid WebRTC SDP Offer";
+              }
+            } else {
+              conn->res.result(http::status::not_found);
+              conn->res.body() = "Not Found";
+            }
+          }
 
-    res.prepare_payload();
-    http::write(socket, res, ec);
-    socket.shutdown(tcp::socket::shutdown_send, ec);
+          conn->res.prepare_payload();
+          conn->stream.expires_after(std::chrono::seconds(5));
+          http::async_write(
+              conn->stream, conn->res,
+              [conn](boost::system::error_code /*wec*/, size_t /*wn*/) {
+                boost::system::error_code sec;
+                conn->stream.socket().shutdown(tcp::socket::shutdown_send, sec);
+              });
+        });
   }
 
   bool AcceptBrowserOffer(std::string_view offer_sdp,
@@ -359,7 +424,8 @@ class BrowserP2pHttpGateway {
 
   rtc::TaskQueueBoost http_queue_;
   tcp::acceptor acceptor_;
-  uint16_t bound_port_ = 0;
+  std::atomic<uint16_t> bound_port_{0};
+  std::atomic<size_t> active_http_clients_{0};
   std::atomic<bool> stopped_{false};
   std::thread pump_thread_;
 

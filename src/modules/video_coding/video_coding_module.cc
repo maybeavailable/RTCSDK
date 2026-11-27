@@ -8,30 +8,38 @@
 
 namespace rtc {
 
+// ======================= 1. PacketBuffer 视频包重组缓冲区 =======================
+
 namespace {
-bool SeqNumLess(uint16_t a, uint16_t b) {
-  return a != b && AheadOf<uint16_t>(b, a);
+size_t RoundUpPowerOfTwo(size_t n, size_t min_pow2) {
+  size_t p = min_pow2;
+  while (p < n && p < (size_t{1} << 15)) {
+    p <<= 1;
+  }
+  return p;
 }
 }  // namespace
 
-// ======================= 1. PacketBuffer 视频包重组缓冲区 =======================
-
 PacketBuffer::PacketBuffer(VideoCodec codec, size_t start_size, size_t max_size)
     : codec_(codec),
-      max_size_(std::max(start_size, max_size)),
-      buffer_(start_size) {}
+      max_size_(RoundUpPowerOfTwo(std::max(start_size, max_size), 16)),
+      buffer_(std::min(max_size_, RoundUpPowerOfTwo(start_size, 16))) {}
 
 void PacketBuffer::Clear() {
   for (auto& s : buffer_) {
     s = Slot{};
   }
   first_packet_received_ = false;
+  is_cleared_to_first_seq_num_ = false;
+  last_assembled_end_seq_.reset();
+  recently_assembled_.clear();
 }
 
 void PacketBuffer::ClearTo(uint16_t seq_num) {
   if (!first_packet_received_) {
     return;
   }
+  is_cleared_to_first_seq_num_ = true;
   while (AheadOrAt<uint16_t>(seq_num, first_seq_num_)) {
     const size_t idx = first_seq_num_ % buffer_.size();
     if (buffer_[idx].used && buffer_[idx].seq_num == first_seq_num_) {
@@ -41,6 +49,16 @@ void PacketBuffer::ClearTo(uint16_t seq_num) {
     if (first_seq_num_ == static_cast<uint16_t>(seq_num + 1)) {
       break;
     }
+  }
+  // 清理因前驱起始包被淘汰而悬空的半截分片连续标记，防止后续收包向回扫描死循环或跨帧拼接。
+  for (size_t k = 0; k < buffer_.size(); ++k) {
+    const uint16_t cur_seq = static_cast<uint16_t>(first_seq_num_ + k);
+    Slot& s = buffer_[cur_seq % buffer_.size()];
+    if (!s.used || s.seq_num != cur_seq || s.is_first_in_frame ||
+        !s.continuous) {
+      break;
+    }
+    s.continuous = false;
   }
 }
 
@@ -63,6 +81,17 @@ void PacketBuffer::ExpandBufferSize() {
   buffer_ = std::move(new_buf);
 }
 
+bool PacketBuffer::AreAdjacentSlotsCompatible(const Slot& prev,
+                                              const Slot& cur) {
+  if (prev.rtp_ts != cur.rtp_ts || prev.is_last_in_frame) {
+    return false;
+  }
+  if (prev.is_fu && !prev.is_fu_end) {
+    return cur.is_fu && !cur.is_fu_start && cur.nalu_type == prev.nalu_type;
+  }
+  return !(cur.is_fu && !cur.is_fu_start);
+}
+
 std::vector<AssembledRtpFrame> PacketBuffer::InsertPacket(
     const RtpPacket& packet,
     Timestamp receive_time) {
@@ -75,11 +104,24 @@ std::vector<AssembledRtpFrame> PacketBuffer::InsertPacket(
   }
 
   const uint16_t seq = packet.sequence_number();
+  for (const auto& span : recently_assembled_) {
+    if (span.rtp_ts == packet.timestamp() &&
+        AheadOrAt<uint16_t>(seq, span.first_seq) &&
+        AheadOrAt<uint16_t>(span.last_seq, seq)) {
+      return {};
+    }
+  }
+
   if (!first_packet_received_) {
     first_seq_num_ = seq;
     first_packet_received_ = true;
   } else if (AheadOf<uint16_t>(first_seq_num_, seq)) {
-    return {};
+    if (!is_cleared_to_first_seq_num_ &&
+        static_cast<uint16_t>(first_seq_num_ - seq) < buffer_.size() / 4) {
+      first_seq_num_ = seq;
+    } else {
+      return {};
+    }
   } else if (static_cast<uint16_t>(seq - first_seq_num_) >=
              buffer_.size() / 2) {
     ClearTo(static_cast<uint16_t>(seq - buffer_.size() / 4));
@@ -91,6 +133,10 @@ std::vector<AssembledRtpFrame> PacketBuffer::InsertPacket(
       return {};
     }
     ExpandBufferSize();
+    if (!first_packet_received_) {
+      first_seq_num_ = seq;
+      first_packet_received_ = true;
+    }
     idx = seq % buffer_.size();
     if (buffer_[idx].used) {
       Clear();
@@ -104,11 +150,15 @@ std::vector<AssembledRtpFrame> PacketBuffer::InsertPacket(
   slot.used = true;
   slot.seq_num = seq;
   slot.rtp_ts = packet.timestamp();
-  slot.is_first_in_frame =
-      packet.dependency_descriptor().has_value()
-          ? packet.dependency_descriptor()->is_first_in_frame
-          : depkt->is_first_in_frame;
-  if (!packet.dependency_descriptor().has_value() && depkt->is_first_in_frame) {
+  if (depkt->is_fu && !depkt->is_fu_start) {
+    slot.is_first_in_frame = false;
+  } else {
+    slot.is_first_in_frame =
+        packet.dependency_descriptor().has_value()
+            ? packet.dependency_descriptor()->is_first_in_frame
+            : depkt->is_first_in_frame;
+  }
+  if (!packet.dependency_descriptor().has_value() && slot.is_first_in_frame) {
     const uint16_t prev_seq = static_cast<uint16_t>(seq - 1);
     const Slot& prev = buffer_[prev_seq % buffer_.size()];
     if (prev.used && prev.seq_num == prev_seq &&
@@ -120,12 +170,27 @@ std::vector<AssembledRtpFrame> PacketBuffer::InsertPacket(
   slot.is_keyframe = packet.dependency_descriptor().has_value()
                          ? packet.dependency_descriptor()->is_keyframe
                          : depkt->is_keyframe;
+  slot.is_fu = depkt->is_fu;
+  slot.is_fu_start = depkt->is_fu_start;
+  slot.is_fu_end = depkt->is_fu_end;
+  slot.nalu_type = depkt->nalu_type;
+  slot.has_sps = depkt->has_sps;
+  slot.has_pps = depkt->has_pps;
+  slot.has_vps = depkt->has_vps;
   slot.receive_time = receive_time;
   slot.playout_delay = packet.playout_delay();
   slot.dep_ext = packet.dependency_descriptor();
   slot.annexb_chunk = std::move(depkt->annexb_bytes);
 
   buffer_[idx] = std::move(slot);
+  if (!packet.marker()) {
+    const uint16_t next_seq = static_cast<uint16_t>(seq + 1);
+    Slot& next = buffer_[next_seq % buffer_.size()];
+    if (next.used && next.seq_num == next_seq &&
+        next.rtp_ts == packet.timestamp() && !next.dep_ext.has_value()) {
+      next.is_first_in_frame = false;
+    }
+  }
   return FindFrames(seq);
 }
 
@@ -136,19 +201,16 @@ bool PacketBuffer::PotentialNewFrame(uint16_t seq_num) const {
     return false;
   }
   if (cur.is_first_in_frame) {
-    return true;
+    return !(cur.is_fu && !cur.is_fu_start);
   }
 
   const uint16_t prev_seq = static_cast<uint16_t>(seq_num - 1);
   const size_t prev_index = prev_seq % buffer_.size();
   const Slot& prev = buffer_[prev_index];
-  if (!prev.used || prev.seq_num != prev_seq) {
+  if (!prev.used || prev.seq_num != prev_seq || !prev.continuous) {
     return false;
   }
-  if (prev.rtp_ts != cur.rtp_ts) {
-    return false;
-  }
-  return prev.continuous;
+  return AreAdjacentSlotsCompatible(prev, cur);
 }
 
 std::vector<AssembledRtpFrame> PacketBuffer::FindFrames(uint16_t seq_num) {
@@ -158,13 +220,33 @@ std::vector<AssembledRtpFrame> PacketBuffer::FindFrames(uint16_t seq_num) {
     buffer_[index].continuous = true;
 
     if (buffer_[index].is_last_in_frame) {
+      if (buffer_[index].is_fu && !buffer_[index].is_fu_end) {
+        // 帧末包（Marker=1）不能停留在未闭合的 FU 分片上。
+        buffer_[index].continuous = false;
+        break;
+      }
+      const uint32_t frame_ts = buffer_[index].rtp_ts;
       uint16_t start_seq = seq_num;
       Timestamp max_recv_time = buffer_[index].receive_time;
       bool frame_is_key = false;
+      bool frame_has_sps = false;
+      bool frame_has_pps = false;
+      bool frame_has_vps = false;
       size_t total_bytes = 0;
+      bool valid_chain = false;
 
-      while (true) {
+      for (size_t steps = 0; steps < buffer_.size(); ++steps) {
         const Slot& s = buffer_[start_seq % buffer_.size()];
+        if (!s.used || s.seq_num != start_seq || s.rtp_ts != frame_ts) {
+          break;
+        }
+        if (start_seq != seq_num) {
+          const uint16_t next_s_num = static_cast<uint16_t>(start_seq + 1);
+          const Slot& next_s = buffer_[next_s_num % buffer_.size()];
+          if (!AreAdjacentSlotsCompatible(s, next_s)) {
+            break;
+          }
+        }
         total_bytes += s.annexb_chunk.size();
         if (s.receive_time > max_recv_time) {
           max_recv_time = s.receive_time;
@@ -172,10 +254,45 @@ std::vector<AssembledRtpFrame> PacketBuffer::FindFrames(uint16_t seq_num) {
         if (s.is_keyframe) {
           frame_is_key = true;
         }
+        frame_has_sps = frame_has_sps || s.has_sps;
+        frame_has_pps = frame_has_pps || s.has_pps;
+        frame_has_vps = frame_has_vps || s.has_vps;
         if (s.is_first_in_frame) {
+          valid_chain = !(s.is_fu && !s.is_fu_start);
           break;
         }
         --start_seq;
+      }
+
+      if (valid_chain) {
+        const Slot& start_slot = buffer_[start_seq % buffer_.size()];
+        if (!start_slot.dep_ext.has_value() && frame_is_key) {
+          const bool has_param_sets =
+              (codec_ == VideoCodec::kH264)
+                  ? (frame_has_sps && frame_has_pps)
+                  : (frame_has_vps && frame_has_sps && frame_has_pps);
+          if (!has_param_sets) {
+            const uint16_t prev_seq = static_cast<uint16_t>(start_seq - 1);
+            const Slot& prev = buffer_[prev_seq % buffer_.size()];
+            const bool prev_proven_boundary =
+                (last_assembled_end_seq_.has_value() &&
+                 prev_seq == *last_assembled_end_seq_) ||
+                (prev.used && prev.seq_num == prev_seq &&
+                 (prev.is_last_in_frame || prev.rtp_ts != frame_ts));
+            if (!prev_proven_boundary &&
+                (last_assembled_end_seq_.has_value() ||
+                 is_cleared_to_first_seq_num_) &&
+                AheadOrAt<uint16_t>(prev_seq, first_seq_num_)) {
+              // 前驱序列号仍在等待窗口内且当前 IDR 分片缺少 SPS/PPS（如 STAP-A 尚在重传），暂不残缺出帧。
+              valid_chain = false;
+            }
+          }
+        }
+      }
+
+      if (!valid_chain) {
+        buffer_[index].continuous = false;
+        break;
       }
 
       AssembledRtpFrame frame;
@@ -202,6 +319,15 @@ std::vector<AssembledRtpFrame> PacketBuffer::FindFrames(uint16_t seq_num) {
       if (start_seq == first_seq_num_) {
         first_seq_num_ = static_cast<uint16_t>(seq_num + 1);
       }
+      last_assembled_end_seq_ = seq_num;
+      recently_assembled_.push_back(AssembledSpan{start_seq, seq_num, frame_ts});
+      while (recently_assembled_.size() > 128 ||
+             (!recently_assembled_.empty() &&
+              static_cast<uint16_t>(seq_num -
+                                    recently_assembled_.front().last_seq) >=
+                  0x2000u)) {
+        recently_assembled_.pop_front();
+      }
       found_frames.push_back(std::move(frame));
     }
     ++seq_num;
@@ -211,12 +337,11 @@ std::vector<AssembledRtpFrame> PacketBuffer::FindFrames(uint16_t seq_num) {
 
 // ======================= 2. NackModule2 丢包重传控制模块 =======================
 
-NackModule2::NackModule2()
-    : nack_list_(&SeqNumLess), reordering_histogram_(64, 0) {}
+NackModule2::NackModule2() : reordering_histogram_(64, 0) {}
 
 void NackModule2::UpdateRtt(TimeDelta rtt) {
   if (rtt > TimeDelta::Zero()) {
-    rtt_ = std::clamp(rtt, TimeDelta::Millis(10), TimeDelta::Millis(1000));
+    rtt_ = std::clamp(rtt, TimeDelta::Millis(20), TimeDelta::Millis(1000));
   }
 }
 
@@ -263,8 +388,9 @@ std::vector<uint16_t> NackModule2::OnReceivedPacket(
   if (!initialized_) {
     initialized_ = true;
     newest_seq_num_ = seq_num;
+    newest_unwrapped_seq_ = seq_unwrapper_.Unwrap(seq_num);
     if (is_keyframe) {
-      keyframe_list_.push_back(seq_num);
+      keyframe_list_.push_back(newest_unwrapped_seq_);
     }
     return {};
   }
@@ -273,7 +399,8 @@ std::vector<uint16_t> NackModule2::OnReceivedPacket(
   }
 
   if (AheadOf<uint16_t>(newest_seq_num_, seq_num)) {
-    const auto it = nack_list_.find(seq_num);
+    const int64_t uw = seq_unwrapper_.PeekUnwrap(seq_num);
+    const auto it = nack_list_.find(uw);
     if (it != nack_list_.end()) {
       if (!is_recovered && it->second.retries == 0) {
         RecordReorderingDistance(
@@ -284,36 +411,33 @@ std::vector<uint16_t> NackModule2::OnReceivedPacket(
     return {};
   }
 
+  const int64_t uw = seq_unwrapper_.Unwrap(seq_num);
   if (is_keyframe) {
-    keyframe_list_.push_back(seq_num);
+    keyframe_list_.push_back(uw);
     while (keyframe_list_.size() > 64) {
       keyframe_list_.pop_front();
     }
   }
 
-  const uint16_t wait_packets = WaitNumberOfPackets(0.5);
-  for (uint16_t missing = static_cast<uint16_t>(newest_seq_num_ + 1);
-       missing != seq_num; ++missing) {
-    NackInfo info;
-    info.seq_num = missing;
-    info.send_at_seq_num =
-        static_cast<uint16_t>(missing + wait_packets + 1);
-    info.created_time = now;
-    nack_list_[missing] = info;
-  }
-  newest_seq_num_ = seq_num;
-
-  if (nack_list_.size() > kMaxNackPackets) {
-    while (nack_list_.size() > kMaxNackPackets && !keyframe_list_.empty()) {
-      const uint16_t kf_seq = keyframe_list_.front();
+  const int64_t missing_span = uw - newest_unwrapped_seq_ - 1;
+  if (missing_span > 0 &&
+      static_cast<size_t>(missing_span) + nack_list_.size() > kMaxNackPackets) {
+    while (!keyframe_list_.empty() &&
+           static_cast<size_t>(missing_span) + nack_list_.size() >
+               kMaxNackPackets) {
+      const int64_t kf_uw = keyframe_list_.front();
       keyframe_list_.pop_front();
-      ClearUpTo(kf_seq);
+      ClearUpToUnwrapped(kf_uw);
     }
-    if (nack_list_.size() > kMaxNackPackets) {
-      RTC_LOG(kWarning)
-          << "NackModule2 list overflow (" << nack_list_.size()
-          << " packets), clearing and requesting IDR recovery";
+    if (static_cast<size_t>(missing_span) > kMaxNackPackets ||
+        static_cast<size_t>(missing_span) + nack_list_.size() >
+            kMaxNackPackets) {
+      RTC_LOG(kWarning) << "NackModule2 sequence jump/overflow (missing_span="
+                        << missing_span << ", pending=" << nack_list_.size()
+                        << "), clearing and requesting IDR recovery";
       nack_list_.clear();
+      newest_seq_num_ = seq_num;
+      newest_unwrapped_seq_ = uw;
       if (out_keyframe_requested != nullptr) {
         *out_keyframe_requested = true;
       }
@@ -321,9 +445,23 @@ std::vector<uint16_t> NackModule2::OnReceivedPacket(
     }
   }
 
+  const uint16_t wait_packets = WaitNumberOfPackets(0.5);
+  for (int64_t missing_uw = newest_unwrapped_seq_ + 1; missing_uw < uw;
+       ++missing_uw) {
+    const uint16_t missing_seq = static_cast<uint16_t>(missing_uw & 0xFFFF);
+    NackInfo info;
+    info.seq_num = missing_seq;
+    info.send_at_seq_num =
+        static_cast<uint16_t>(missing_seq + wait_packets + 1);
+    info.created_time = now;
+    nack_list_[missing_uw] = info;
+  }
+  newest_seq_num_ = seq_num;
+  newest_unwrapped_seq_ = uw;
+
   std::vector<uint16_t> immediate_nacks;
-  for (auto& [seq, info] : nack_list_) {
-    (void)seq;
+  for (auto& [uw_key, info] : nack_list_) {
+    (void)uw_key;
     if (info.sent_time.IsMinusInfinity() &&
         AheadOrAt<uint16_t>(newest_seq_num_, info.send_at_seq_num)) {
       info.sent_time = now;
@@ -363,11 +501,16 @@ std::vector<uint16_t> NackModule2::ProcessNacks(Timestamp now,
   return retry_batch;
 }
 
+void NackModule2::ClearUpToUnwrapped(int64_t target_unwrapped_seq) {
+  nack_list_.erase(nack_list_.begin(),
+                   nack_list_.lower_bound(target_unwrapped_seq));
+}
+
 void NackModule2::ClearUpTo(uint16_t seq_num) {
-  while (!nack_list_.empty() &&
-         SeqNumLess(nack_list_.begin()->first, seq_num)) {
-    nack_list_.erase(nack_list_.begin());
+  if (!initialized_) {
+    return;
   }
+  ClearUpToUnwrapped(seq_unwrapper_.PeekUnwrap(seq_num));
 }
 
 // ======================= 3. RtpFrameReferenceFinder 帧参考关系解析器 =======================
@@ -410,25 +553,78 @@ std::vector<AssembledRtpFrame> RtpFrameReferenceFinder::ManageFrame(
 RtpFrameReferenceFinder::Decision RtpFrameReferenceFinder::ResolveFrame(
     AssembledRtpFrame* frame) {
   if (frame->dependency_ext.has_value()) {
+    constexpr int64_t kFrameIdOffset = int64_t{1} << 16;
     const auto& ext = *frame->dependency_ext;
-    const int64_t fid = frame_num_unwrapper_.Unwrap(ext.frame_number);
+    const bool is_kf = ext.is_keyframe || frame->is_keyframe;
+    if (!is_kf && ext.num_fdiffs > 4) {
+      return Decision::kDrop;
+    }
+    const uint8_t num_refs =
+        is_kf ? 0 : std::min<uint8_t>(ext.num_fdiffs, 4);
+    for (uint8_t i = 0; i < num_refs; ++i) {
+      if (ext.fdiffs[i] == 0) {
+        return Decision::kDrop;
+      }
+    }
+    if (!is_kf && !last_keyframe_id_.has_value()) {
+      const int64_t peek_fid =
+          frame_num_unwrapper_.PeekUnwrap(ext.frame_number) + kFrameIdOffset;
+      if (peek_fid < 0) {
+        return Decision::kDrop;
+      }
+      return Decision::kStash;
+    }
+
+    const int64_t peek_fid =
+        frame_num_unwrapper_.PeekUnwrap(ext.frame_number) + kFrameIdOffset;
+    if (peek_fid < 0) {
+      return Decision::kDrop;
+    }
+    for (int64_t seen_id : recent_dd_frame_ids_) {
+      if (seen_id == peek_fid) {
+        return Decision::kDrop;
+      }
+    }
+    for (uint8_t i = 0; i < num_refs; ++i) {
+      const int64_t ref_id = peek_fid - static_cast<int64_t>(ext.fdiffs[i]);
+      if (ref_id < 0 ||
+          (first_keyframe_id_.has_value() && ref_id < *first_keyframe_id_)) {
+        return Decision::kDrop;
+      }
+    }
+
+    const int64_t fid =
+        frame_num_unwrapper_.Unwrap(ext.frame_number) + kFrameIdOffset;
     frame->dep.frame_id = fid;
     frame->dep.picture_id = ext.frame_number;
     frame->dep.spatial_id = ext.spatial_id;
     frame->dep.temporal_id = ext.temporal_id;
-    frame->dep.is_keyframe = ext.is_keyframe || frame->is_keyframe;
+    frame->dep.is_keyframe = is_kf;
     frame->dep.discardable = ext.discardable;
-    frame->dep.num_references = frame->dep.is_keyframe ? 0 : ext.num_fdiffs;
-    for (uint8_t i = 0; i < frame->dep.num_references; ++i) {
+    frame->dep.num_references = num_refs;
+    for (uint8_t i = 0; i < num_refs; ++i) {
       frame->dep.references[i] = fid - static_cast<int64_t>(ext.fdiffs[i]);
     }
-    if (frame->dep.is_keyframe) {
-      last_keyframe_id_ = fid;
+    if (is_kf) {
+      if (!first_keyframe_id_.has_value() || fid < *first_keyframe_id_) {
+        first_keyframe_id_ = fid;
+      }
+      if (!last_keyframe_id_.has_value() || fid > *last_keyframe_id_) {
+        last_keyframe_id_ = fid;
+      }
+    }
+    recent_dd_frame_ids_.push_back(fid);
+    while (recent_dd_frame_ids_.size() > 128) {
+      recent_dd_frame_ids_.pop_front();
     }
     return Decision::kHandOff;
   }
 
   if (frame->is_keyframe) {
+    if (last_unwrapped_seq_end_.has_value() &&
+        AheadOrAt<uint16_t>(*last_unwrapped_seq_end_, frame->last_seq_num)) {
+      return Decision::kDrop;
+    }
     const int64_t fid = ++synthetic_frame_id_;
     frame->dep.frame_id = fid;
     frame->dep.is_keyframe = true;
@@ -453,10 +649,25 @@ RtpFrameReferenceFinder::Decision RtpFrameReferenceFinder::ResolveFrame(
     last_unwrapped_seq_end_ = frame->last_seq_num;
     return Decision::kHandOff;
   }
-  if (AheadOf<uint16_t>(*last_unwrapped_seq_end_, frame->last_seq_num)) {
+  if (AheadOrAt<uint16_t>(*last_unwrapped_seq_end_, frame->last_seq_num) ||
+      AheadOrAt<uint16_t>(*last_unwrapped_seq_end_, frame->first_seq_num)) {
     return Decision::kDrop;
   }
   return Decision::kStash;
+}
+
+bool RtpFrameReferenceFinder::HasStalledFrames(Timestamp now,
+                                               TimeDelta max_wait) const {
+  if (stashed_frames_.empty()) {
+    return false;
+  }
+  Timestamp oldest = Timestamp::PlusInfinity();
+  for (const auto& f : stashed_frames_) {
+    if (f.received_time.IsFinite() && f.received_time < oldest) {
+      oldest = f.received_time;
+    }
+  }
+  return oldest.IsFinite() && (now - oldest) >= max_wait;
 }
 
 void RtpFrameReferenceFinder::ClearTo(uint16_t /*seq_num*/) {
@@ -470,6 +681,9 @@ DecodedFramesHistory::DecodedFramesHistory(size_t window_size)
 
 void DecodedFramesHistory::InsertDecoded(int64_t frame_id,
                                          uint32_t rtp_timestamp) {
+  if (frame_id < 0 || window_size_ == 0) {
+    return;
+  }
   if (!last_frame_id_.has_value()) {
     std::fill(buffer_.begin(), buffer_.end(), false);
     buffer_[static_cast<size_t>(frame_id % static_cast<int64_t>(window_size_))] =
@@ -483,6 +697,13 @@ void DecodedFramesHistory::InsertDecoded(int64_t frame_id,
     if (static_cast<size_t>(back) < window_size_) {
       buffer_[static_cast<size_t>(
           frame_id % static_cast<int64_t>(window_size_))] = true;
+    } else {
+      // 超出历史窗口下界的帧号回退（如流重启），重置历史并记录当前帧。
+      std::fill(buffer_.begin(), buffer_.end(), false);
+      buffer_[static_cast<size_t>(
+          frame_id % static_cast<int64_t>(window_size_))] = true;
+      last_frame_id_ = frame_id;
+      last_decoded_timestamp_ = rtp_timestamp;
     }
     return;
   }
@@ -502,7 +723,8 @@ void DecodedFramesHistory::InsertDecoded(int64_t frame_id,
 }
 
 bool DecodedFramesHistory::WasDecoded(int64_t frame_id) const {
-  if (!last_frame_id_.has_value() || frame_id > *last_frame_id_) {
+  if (frame_id < 0 || window_size_ == 0 || !last_frame_id_.has_value() ||
+      frame_id > *last_frame_id_) {
     return false;
   }
   const int64_t back = *last_frame_id_ - frame_id;
@@ -526,6 +748,17 @@ void FrameBuffer3::InsertFrame(AssembledRtpFrame frame) {
   if (frame.dep.frame_id < 0 ||
       decoded_history_.WasDecoded(frame.dep.frame_id)) {
     return;
+  }
+  if (last_decoded_frame_id_.has_value() &&
+      frame.dep.frame_id <= *last_decoded_frame_id_) {
+    if (frame.dep.is_keyframe &&
+        (*last_decoded_frame_id_ - frame.dep.frame_id) >= 1024) {
+      Clear();
+    } else if (frame.dep.discardable || frame.dep.temporal_id == 0 ||
+               (*last_decoded_frame_id_ - frame.dep.frame_id) > 8) {
+      // 丢弃迟到的旧时域可丢弃帧、基础层回退帧或超出多流子组重组窗口的过期帧。
+      return;
+    }
   }
   frames_[frame.dep.frame_id] = std::move(frame);
   while (frames_.size() > max_size_) {
@@ -577,6 +810,10 @@ std::optional<AssembledRtpFrame> FrameBuffer3::ExtractNextDecodableFrame() {
       AssembledRtpFrame out = std::move(it->second);
       const int64_t decoded_id = out.dep.frame_id;
       frames_.erase(frames_.begin(), std::next(it));
+      last_decoded_frame_id_ =
+          last_decoded_frame_id_.has_value()
+              ? std::max(*last_decoded_frame_id_, decoded_id)
+              : decoded_id;
       decoded_history_.InsertDecoded(decoded_id, out.rtp_timestamp);
       oldest_undecodable_since_ = Timestamp::MinusInfinity();
       return out;
@@ -606,6 +843,7 @@ bool FrameBuffer3::IsCorruptedOrStalled(Timestamp now,
 void FrameBuffer3::Clear() {
   frames_.clear();
   decoded_history_.Clear();
+  last_decoded_frame_id_.reset();
   oldest_undecodable_since_ = Timestamp::MinusInfinity();
 }
 
@@ -719,7 +957,8 @@ void VCMTiming::SetJitterDelay(TimeDelta jitter_delay) {
 
 void VCMTiming::SetPlayoutDelay(PlayoutDelayLimits limits) {
   min_playout_delay_ = TimeDelta::Millis(limits.min_ms);
-  max_playout_delay_ = TimeDelta::Millis(limits.max_ms);
+  max_playout_delay_ =
+      std::max(min_playout_delay_, TimeDelta::Millis(limits.max_ms));
   zero_playout_delay_ = (limits.min_ms == 0 && limits.max_ms == 0);
 }
 
@@ -731,8 +970,9 @@ TimeDelta VCMTiming::TargetVideoDelay() const {
   if (zero_playout_delay_ || max_playout_delay_.IsZero()) {
     return TimeDelta::Zero();
   }
+  const TimeDelta hi = std::max(min_playout_delay_, max_playout_delay_);
   return std::clamp(jitter_delay_ + estimated_decode_time_, min_playout_delay_,
-                    max_playout_delay_);
+                    hi);
 }
 
 Timestamp VCMTiming::RenderTime(uint32_t frame_timestamp, Timestamp now) const {
@@ -767,11 +1007,17 @@ VideoBitrateAllocation SimulcastRateAllocator::Allocate(
   VideoBitrateAllocation alloc{};
   protection_overhead_ratio = std::clamp(protection_overhead_ratio, 0.0, 1.0);
 
+  const int64_t min_tot = static_cast<int64_t>(cfg_.min_total_bps);
+  const int64_t max_tot = std::max<int64_t>(min_tot, cfg_.max_total_bps);
+  const double raw_target_bps =
+      total_target_rate.IsFinite()
+          ? static_cast<double>(total_target_rate.bps())
+          : static_cast<double>(max_tot) * (1.0 + protection_overhead_ratio);
+
   // 带宽守恒定律：R_wire = R_media * (1 + overhead_ratio) <= R_target。
   const uint32_t media_budget_bps = static_cast<uint32_t>(std::clamp<int64_t>(
-      static_cast<int64_t>(static_cast<double>(total_target_rate.bps()) /
-                           (1.0 + protection_overhead_ratio)),
-      cfg_.min_total_bps, cfg_.max_total_bps));
+      static_cast<int64_t>(raw_target_bps / (1.0 + protection_overhead_ratio)),
+      min_tot, max_tot));
 
   if (!cfg_.enable_simulcast) {
     alloc.layers[0] = LayerAllocation{false, 0, 0};
@@ -781,14 +1027,19 @@ VideoBitrateAllocation SimulcastRateAllocator::Allocate(
     return alloc;
   }
 
-  const uint32_t enable_high_threshold =
-      cfg_.low_max_bps + cfg_.high_min_bps +
-      (high_was_active_ ? 0 : cfg_.high_hysteresis_bps);
-  const uint32_t disable_high_threshold = cfg_.low_min_bps + cfg_.high_min_bps;
+  const uint32_t low_lo = cfg_.low_min_bps;
+  const uint32_t low_hi = std::max(low_lo, cfg_.low_max_bps);
+  const uint64_t enable_high_threshold =
+      static_cast<uint64_t>(low_hi) + static_cast<uint64_t>(cfg_.high_min_bps) +
+      (high_was_active_ ? 0ULL : static_cast<uint64_t>(cfg_.high_hysteresis_bps));
+  const uint64_t disable_high_threshold =
+      static_cast<uint64_t>(low_lo) +
+      static_cast<uint64_t>(std::max<uint32_t>(1, cfg_.high_min_bps));
 
   const bool enable_high =
-      high_was_active_ ? (media_budget_bps >= disable_high_threshold)
-                       : (media_budget_bps >= enable_high_threshold);
+      high_was_active_
+          ? (static_cast<uint64_t>(media_budget_bps) >= disable_high_threshold)
+          : (static_cast<uint64_t>(media_budget_bps) >= enable_high_threshold);
   if (enable_high != high_was_active_) {
     RTC_LOG(kInfo) << "Simulcast HIGH spatial layer "
                    << (enable_high ? "ACTIVATED" : "SUSPENDED")
@@ -798,20 +1049,21 @@ VideoBitrateAllocation SimulcastRateAllocator::Allocate(
 
   if (!enable_high) {
     alloc.layers[0].active = true;
-    alloc.layers[0].target_bitrate_bps =
-        std::min(media_budget_bps, cfg_.low_max_bps);
+    alloc.layers[0].target_bitrate_bps = std::min(media_budget_bps, low_hi);
     alloc.layers[0].target_fps = (media_budget_bps < 200'000) ? 15 : 25;
     alloc.layers[1] = LayerAllocation{false, 0, 0};
   } else {
     const uint32_t low_bps =
-        std::clamp(media_budget_bps / 5, cfg_.low_min_bps, cfg_.low_max_bps);
-    const uint32_t high_bps = media_budget_bps - low_bps;
+        std::min(media_budget_bps,
+                 std::clamp(media_budget_bps / 5, low_lo, low_hi));
+    const uint32_t high_bps =
+        (media_budget_bps > low_bps) ? (media_budget_bps - low_bps) : 0;
 
     alloc.layers[0].active = true;
     alloc.layers[0].target_bitrate_bps = low_bps;
     alloc.layers[0].target_fps = 20;
 
-    alloc.layers[1].active = true;
+    alloc.layers[1].active = high_bps > 0;
     alloc.layers[1].target_bitrate_bps = high_bps;
     alloc.layers[1].target_fps = (high_bps < 700'000) ? 20 : 30;
   }

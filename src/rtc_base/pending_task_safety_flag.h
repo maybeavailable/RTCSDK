@@ -6,6 +6,7 @@
 
 #include <atomic>
 #include <memory>
+#include <mutex>
 #include <utility>
 
 #include "rtc_base/sequence_checker.h"
@@ -62,25 +63,38 @@ class ScopedTaskSafety final {
       : flag_(std::move(flag)) {}
 
   ~ScopedTaskSafety() {
-    if (flag_ && flag_->alive()) {
-      flag_->SetNotAlive();
+    std::shared_ptr<PendingTaskSafetyFlag> old_flag;
+    {
+      std::lock_guard<std::mutex> lock(mu_);
+      old_flag = std::move(flag_);
+    }
+    if (old_flag && old_flag->alive()) {
+      old_flag->SetNotAlive();
     }
   }
 
   ScopedTaskSafety(const ScopedTaskSafety&) = delete;
   ScopedTaskSafety& operator=(const ScopedTaskSafety&) = delete;
 
-  std::shared_ptr<PendingTaskSafetyFlag> flag() const { return flag_; }
+  std::shared_ptr<PendingTaskSafetyFlag> flag() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    return flag_;
+  }
 
   void Reset(std::shared_ptr<PendingTaskSafetyFlag> new_flag =
                  PendingTaskSafetyFlag::Create()) {
-    if (flag_ && flag_->alive()) {
-      flag_->SetNotAlive();
+    std::shared_ptr<PendingTaskSafetyFlag> old_flag;
+    {
+      std::lock_guard<std::mutex> lock(mu_);
+      old_flag = std::exchange(flag_, std::move(new_flag));
     }
-    flag_ = std::move(new_flag);
+    if (old_flag && old_flag->alive()) {
+      old_flag->SetNotAlive();
+    }
   }
 
  private:
+  mutable std::mutex mu_;
   std::shared_ptr<PendingTaskSafetyFlag> flag_;
 };
 
@@ -88,7 +102,7 @@ template <typename Closure>
 auto SafeTask(std::shared_ptr<PendingTaskSafetyFlag> flag, Closure&& closure) {
   return [flag = std::move(flag),
           task = std::forward<Closure>(closure)](auto&&... args) mutable {
-    if (flag->alive()) {
+    if (flag && flag->alive()) {
       task(std::forward<decltype(args)>(args)...);
     }
   };

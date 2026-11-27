@@ -12,7 +12,7 @@ RtpPacketHistory::RtpPacketHistory(size_t number_to_store)
 
 void RtpPacketHistory::SetRtt(TimeDelta rtt) {
   if (rtt > TimeDelta::Zero()) {
-    rtt_ = std::clamp(rtt, TimeDelta::Millis(5), TimeDelta::Seconds(2));
+    rtt_ = std::clamp(rtt, TimeDelta::Millis(20), TimeDelta::Seconds(2));
   }
 }
 
@@ -72,12 +72,11 @@ std::optional<RtpPacket> RtpPacketHistory::GetPacketAndMarkAsSent(
 
 std::optional<RtpPacket> RtpPacketHistory::GetPayloadPaddingPacket(
     Timestamp now) {
+  CullOldPackets(now);
   if (packets_.empty()) {
     return std::nullopt;
   }
-  auto& latest = packets_.back();
-  latest.last_send_time = now;
-  return latest.packet;
+  return packets_.back().packet;
 }
 
 void RtpPacketHistory::CullOldPackets(Timestamp now) {
@@ -104,6 +103,7 @@ RtpPacket RtxCodec::BuildRtxPacket(const RtpPacket& original,
 
   if (original.rid().has_value()) {
     rtx.SetRepairedRid(*original.rid());
+    rtx.ClearRid();
   }
 
   std::vector<uint8_t>* dst_payload = rtx.mutable_payload();
@@ -120,7 +120,7 @@ std::optional<RtpPacket> RtxCodec::ParseRtxPacket(
     const RtpPacket& rtx_packet,
     uint32_t original_media_ssrc,
     uint8_t original_media_payload_type) {
-  if (rtx_packet.payload_size() < 2) {
+  if (rtx_packet.payload_size() <= 2) {
     return std::nullopt;
   }
   RtpPacket media;
@@ -132,6 +132,7 @@ std::optional<RtpPacket> RtxCodec::ParseRtxPacket(
   media.set_sequence_number(osn);
   if (rtx_packet.repaired_rid().has_value()) {
     media.SetRid(*rtx_packet.repaired_rid());
+    media.ClearRepairedRid();
   }
   media.SetPayload(MakeArrayView(rtx_packet.payload().data() + 2,
                                  rtx_packet.payload_size() - 2));

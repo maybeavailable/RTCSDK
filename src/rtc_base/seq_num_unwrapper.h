@@ -47,9 +47,12 @@ class SeqNumUnwrapper {
       last_unwrapped_ = static_cast<int64_t>(value);
       return last_unwrapped_;
     }
-    last_unwrapped_ += ForwardDiff(*last_value_, value);
-    last_value_ = value;
-    return last_unwrapped_;
+    const int64_t unwrapped = last_unwrapped_ + ForwardDiff(*last_value_, value);
+    if (unwrapped > last_unwrapped_) {
+      last_unwrapped_ = unwrapped;
+      last_value_ = value;
+    }
+    return unwrapped;
   }
 
   int64_t PeekUnwrap(U value) const {

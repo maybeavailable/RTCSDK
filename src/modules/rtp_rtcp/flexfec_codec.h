@@ -60,6 +60,8 @@ class FlexfecSender {
   void set_repair_window_us(uint32_t repair_window_us) {
     repair_window_us_ = repair_window_us > 0 ? repair_window_us : 10'000'000;
   }
+  void set_use_flexfec_03(bool enable) { use_flexfec_03_ = enable; }
+  bool use_flexfec_03() const { return use_flexfec_03_; }
 
   void AddRtpPacketAndGenerateFec(const RtpPacket& media_packet);
 
@@ -93,6 +95,8 @@ class FlexfecSender {
   uint32_t repair_window_us_ = 10'000'000;
   uint16_t seq_num_ = 0;
   std::optional<uint16_t> last_added_seq_;
+  bool use_flexfec_03_ = false;
+  int fec_budget_accum_ = 0;
 
   FecProtectionParams params_{};
   std::vector<RtpPacket> pending_media_;
@@ -149,6 +153,7 @@ class FlexfecReceiver {
   RtpHeaderExtensionMap ext_map_{};
 
   SeqNumUnwrapper<uint16_t> seq_unwrapper_;
+  bool has_received_media_ = false;
   int64_t newest_unwrapped_seq_ = -1;
   std::map<int64_t, std::vector<uint8_t>> received_media_wire_;
   std::deque<ParityRecord> pending_fecs_;

@@ -222,7 +222,7 @@ void TrendlineEstimator::UpdateThreshold(double modified_trend, Timestamp now) {
   }
   const double k = (std::fabs(modified_trend) < threshold_) ? k_down_ : k_up_;
   const int64_t time_delta_ms =
-      std::min<int64_t>((now - last_update_time_).ms(), 100);
+      std::clamp<int64_t>((now - last_update_time_).ms(), 0, 100);
   threshold_ += k * (std::fabs(modified_trend) - threshold_) *
                 static_cast<double>(time_delta_ms);
   threshold_ = std::clamp(threshold_, 6.0, 600.0);
@@ -253,14 +253,13 @@ void AckedBitrateEstimator::UpdateWindow(Timestamp now,
   if (prev_time_.IsFinite() && now < prev_time_) {
     prev_time_ = Timestamp::MinusInfinity();
     sum_bytes_ = 0;
-    current_window_ = Timestamp::MinusInfinity();
+    current_window_ = Timestamp::Zero();
   }
   if (prev_time_.IsFinite()) {
     current_window_ = current_window_ + (now - prev_time_);
     if (now - prev_time_ > TimeDelta::Millis(rate_window_ms)) {
       sum_bytes_ = 0;
-      current_window_ =
-          Timestamp::Zero() + TimeDelta::Millis(now.ms() % rate_window_ms);
+      current_window_ = Timestamp::Zero();
     }
   } else {
     current_window_ = Timestamp::Zero();
@@ -268,12 +267,14 @@ void AckedBitrateEstimator::UpdateWindow(Timestamp now,
   prev_time_ = now;
   sum_bytes_ += static_cast<int>(bytes.bytes());
 
-  if (current_window_.us() < rate_window_ms * 1000) {
+  if (current_window_.us() < static_cast<int64_t>(rate_window_ms) * 1000) {
     return;
   }
+  const float actual_window_ms =
+      std::max(1.0f, static_cast<float>(current_window_.us()) / 1000.0f);
   const float bitrate_sample_kbps =
-      8.0f * static_cast<float>(sum_bytes_) / static_cast<float>(rate_window_ms);
-  current_window_ = current_window_ - TimeDelta::Millis(rate_window_ms);
+      8.0f * static_cast<float>(sum_bytes_) / actual_window_ms;
+  current_window_ = Timestamp::Zero();
   sum_bytes_ = 0;
 
   if (bitrate_estimate_kbps_ < 0.0f) {
@@ -339,9 +340,11 @@ void AlrDetector::OnBytesSent(size_t bytes_sent, Timestamp send_time) {
 AimdRateControl::AimdRateControl(DataRate min_bitrate,
                                  DataRate max_bitrate,
                                  DataRate start_bitrate)
-    : min_configured_bitrate_(min_bitrate),
-      max_configured_bitrate_(max_bitrate),
-      current_bitrate_(std::clamp(start_bitrate, min_bitrate, max_bitrate)),
+    : min_configured_bitrate_(std::max(DataRate::Zero(), min_bitrate)),
+      max_configured_bitrate_(std::max(min_configured_bitrate_, max_bitrate)),
+      current_bitrate_(std::clamp(start_bitrate,
+                                  min_configured_bitrate_,
+                                  max_configured_bitrate_)),
       bitrate_is_initialized_(start_bitrate > DataRate::Zero()) {}
 
 void AimdRateControl::SetStartBitrate(DataRate start_bitrate) {
@@ -372,8 +375,8 @@ void AimdRateControl::SetEstimate(DataRate bitrate, Timestamp at_time) {
 
 void AimdRateControl::SetMinMaxBitrate(DataRate min_bitrate,
                                        DataRate max_bitrate) {
-  min_configured_bitrate_ = min_bitrate;
-  max_configured_bitrate_ = std::max(min_bitrate, max_bitrate);
+  min_configured_bitrate_ = std::max(DataRate::Zero(), min_bitrate);
+  max_configured_bitrate_ = std::max(min_configured_bitrate_, max_bitrate);
   current_bitrate_ = std::clamp(current_bitrate_, min_configured_bitrate_,
                                 max_configured_bitrate_);
 }
@@ -489,25 +492,29 @@ DataRate AimdRateControl::MultiplicativeRateIncrease(
     Timestamp last_time,
     DataRate current_bitrate) const {
   double alpha = 1.08;
+  double seconds = 1.0;
   if (last_time.IsFinite()) {
-    const double seconds = std::min((at_time - last_time).seconds_double(), 1.0);
+    seconds = std::clamp((at_time - last_time).seconds_double(), 0.0, 1.0);
     alpha = std::pow(alpha, seconds);
   }
-  const DataRate inc =
-      std::max(current_bitrate * (alpha - 1.0), DataRate::BitsPerSec(1000));
+  const DataRate min_inc =
+      DataRate::BitsPerSec(static_cast<int64_t>(1000.0 * seconds));
+  const DataRate inc = std::max(current_bitrate * (alpha - 1.0), min_inc);
   return current_bitrate + inc;
 }
 
 DataRate AimdRateControl::AdditiveRateIncrease(Timestamp at_time,
                                                Timestamp last_time) const {
   const double time_delta_s =
-      last_time.IsFinite() ? std::min((at_time - last_time).seconds_double(), 1.0)
-                           : 0.0;
-  const double response_time_s = 0.100 + rtt_.seconds_double();
+      last_time.IsFinite()
+          ? std::clamp((at_time - last_time).seconds_double(), 0.0, 1.0)
+          : 0.0;
+  const double response_time_s = 0.100 + std::max(0.0, rtt_.seconds_double());
   constexpr double kAvgPacketBits = 1100.0 * 8.0;
-  const double bps_increase =
-      std::max(4000.0, (kAvgPacketBits / response_time_s) * time_delta_s);
-  return DataRate::BitsPerSec(static_cast<int64_t>(bps_increase));
+  const double bits_per_second_rate =
+      std::max(4000.0, kAvgPacketBits / response_time_s);
+  return DataRate::BitsPerSec(
+      static_cast<int64_t>(bits_per_second_rate * time_delta_s));
 }
 
 void AimdRateControl::ChangeState(BandwidthUsage bw_state, Timestamp at_time) {
@@ -534,9 +541,9 @@ void AimdRateControl::ChangeState(BandwidthUsage bw_state, Timestamp at_time) {
 SendSideBandwidthEstimation::SendSideBandwidthEstimation(DataRate min_bitrate,
                                                          DataRate max_bitrate,
                                                          DataRate start_bitrate)
-    : min_bitrate_(min_bitrate),
-      max_bitrate_(max_bitrate),
-      current_target_(std::clamp(start_bitrate, min_bitrate, max_bitrate)) {}
+    : min_bitrate_(std::max(DataRate::Zero(), min_bitrate)),
+      max_bitrate_(std::max(min_bitrate_, max_bitrate)),
+      current_target_(std::clamp(start_bitrate, min_bitrate_, max_bitrate_)) {}
 
 void SendSideBandwidthEstimation::UpdateReceiverReport(Timestamp at_time,
                                                        uint8_t fraction_lost,
@@ -669,11 +676,15 @@ void SendSideBandwidthEstimation::UpdateEstimate(Timestamp at_time) {
 
 void ProbeBitrateEstimator::EraseOldClusters(Timestamp timestamp) {
   for (auto it = clusters_.begin(); it != clusters_.end();) {
-    if (it->second.last_receive + TimeDelta::Seconds(1) < timestamp) {
+    if (it->second.last_receive.IsFinite() &&
+        it->second.last_receive + TimeDelta::Seconds(1) < timestamp) {
       it = clusters_.erase(it);
     } else {
       ++it;
     }
+  }
+  while (clusters_.size() > 32) {
+    clusters_.erase(clusters_.begin());
   }
 }
 
@@ -681,6 +692,7 @@ std::optional<DataRate> ProbeBitrateEstimator::HandleProbeAndEstimateBitrate(
     const PacketResult& packet_feedback) {
   const int cluster_id = packet_feedback.sent_packet.pacing_info.probe_cluster_id;
   if (cluster_id == PacedPacketInfo::kNotAProbe ||
+      cluster_id <= max_consumed_cluster_id_ ||
       !packet_feedback.IsReceived()) {
     return std::nullopt;
   }
@@ -691,16 +703,26 @@ std::optional<DataRate> ProbeBitrateEstimator::HandleProbeAndEstimateBitrate(
   if (packet_feedback.sent_packet.send_time < cluster->first_send) {
     cluster->first_send = packet_feedback.sent_packet.send_time;
   }
-  if (packet_feedback.sent_packet.send_time > cluster->last_send) {
+  if (!cluster->last_send.IsFinite() ||
+      packet_feedback.sent_packet.send_time >
+          cluster->last_send + TimeDelta::Micros(250)) {
     cluster->last_send = packet_feedback.sent_packet.send_time;
     cluster->size_last_send = packet_feedback.sent_packet.size;
-  } else if (packet_feedback.sent_packet.send_time == cluster->last_send) {
+  } else if (packet_feedback.sent_packet.send_time >=
+             cluster->last_send - TimeDelta::Micros(250)) {
+    cluster->last_send =
+        std::max(cluster->last_send, packet_feedback.sent_packet.send_time);
     cluster->size_last_send += packet_feedback.sent_packet.size;
   }
-  if (packet_feedback.receive_time < cluster->first_receive) {
+  if (!cluster->first_receive.IsFinite() ||
+      packet_feedback.receive_time + TimeDelta::Micros(250) <
+          cluster->first_receive) {
     cluster->first_receive = packet_feedback.receive_time;
     cluster->size_first_receive = packet_feedback.sent_packet.size;
-  } else if (packet_feedback.receive_time == cluster->first_receive) {
+  } else if (packet_feedback.receive_time <=
+             cluster->first_receive + TimeDelta::Micros(250)) {
+    cluster->first_receive =
+        std::min(cluster->first_receive, packet_feedback.receive_time);
     cluster->size_first_receive += packet_feedback.sent_packet.size;
   }
   if (packet_feedback.receive_time > cluster->last_receive) {
@@ -738,12 +760,11 @@ std::optional<DataRate> ProbeBitrateEstimator::HandleProbeAndEstimateBitrate(
       static_cast<double>(receive_rate.bps()) /
       std::max<double>(1.0, static_cast<double>(send_rate.bps()));
   if (ratio > 2.0) {
-    clusters_.erase(cluster_id);
     return std::nullopt;
   }
 
   DataRate res = std::min(send_rate, receive_rate);
-  if (receive_rate < send_rate * 0.90) {
+  if (receive_rate < send_rate * 0.85) {
     // 探测期间链路饱和：此时接收速率即反映瓶颈链路容量。
     res = receive_rate * 0.95;
     last_probe_saturated_ = true;
@@ -751,8 +772,8 @@ std::optional<DataRate> ProbeBitrateEstimator::HandleProbeAndEstimateBitrate(
     last_probe_saturated_ = false;
   }
 
-  clusters_.erase(cluster_id);
   estimated_data_rate_ = res;
+  last_estimated_cluster_id_ = cluster_id;
   RTC_LOG(kVerbose) << "ProbeBitrateEstimator cluster=" << cluster_id
                     << " send_kbps=" << send_rate.kbps()
                     << " recv_kbps=" << receive_rate.kbps()
@@ -763,6 +784,12 @@ std::optional<DataRate> ProbeBitrateEstimator::HandleProbeAndEstimateBitrate(
 std::optional<DataRate>
 ProbeBitrateEstimator::FetchAndResetLastEstimatedBitrate() {
   std::optional<DataRate> est = estimated_data_rate_;
+  if (last_estimated_cluster_id_.has_value()) {
+    max_consumed_cluster_id_ =
+        std::max(max_consumed_cluster_id_, *last_estimated_cluster_id_);
+    clusters_.erase(*last_estimated_cluster_id_);
+    last_estimated_cluster_id_.reset();
+  }
   estimated_data_rate_.reset();
   return est;
 }
@@ -799,9 +826,30 @@ std::vector<ProbeClusterConfig> ProbeController::SetEstimatedBitrate(
   return {};
 }
 
+void ProbeController::set_alr_start_time(
+    std::optional<Timestamp> alr_start_time) {
+  if (alr_start_time.has_value()) {
+    alr_end_time_.reset();
+    pending_alr_exit_probe_ = false;
+  } else if (alr_start_time_.has_value()) {
+    pending_alr_exit_probe_ = true;
+  }
+  alr_start_time_ = alr_start_time;
+}
+
 std::vector<ProbeClusterConfig> ProbeController::RequestProbe(
     Timestamp at_time) {
-  if (alr_start_time_.has_value() && estimated_bitrate_ > DataRate::Zero()) {
+  const bool in_alr_or_recently_exited =
+      alr_start_time_.has_value() || pending_alr_exit_probe_ ||
+      (alr_end_time_.has_value() && at_time.IsFinite() &&
+       alr_end_time_->IsFinite() &&
+       (at_time - *alr_end_time_) < TimeDelta::Seconds(3));
+  if (in_alr_or_recently_exited && estimated_bitrate_ > DataRate::Zero()) {
+    pending_alr_exit_probe_ = false;
+    alr_end_time_.reset();
+    if (state_ == State::kWaitingForProbingResult) {
+      return {};
+    }
     const DataRate suggested = std::min(max_bitrate_, estimated_bitrate_ * 2.0);
     if (suggested > estimated_bitrate_) {
       return InitiateProbing(at_time, {suggested}, true);
@@ -828,15 +876,15 @@ std::vector<ProbeClusterConfig> ProbeController::Process(Timestamp at_time) {
       return InitiateProbing(at_time, {probe_rate}, true);
     }
   }
-  // 拥塞降码率后的周期性恢复探测：当估计码率显著低于最大允许码率时，每 1.8 秒发起一次短促 1.8x 探测簇，
+  // 拥塞降码率后的周期性恢复探测：当估计码率显著低于最大允许码率时，每 1.2 秒发起一次短促 2.0x 探测簇，
   // 以便在物理瓶颈带宽恢复后迅速探测到新增容量；若链路仍饱和则由 ProbeBitrateEstimator 自动截断。
   if (state_ == State::kProbingComplete &&
       estimated_bitrate_ > DataRate::Zero() &&
       estimated_bitrate_ < max_bitrate_ * 0.75 &&
       (time_last_probing_initiated_.IsMinusInfinity() ||
-       (at_time - time_last_probing_initiated_) >= TimeDelta::Millis(1800))) {
+        (at_time - time_last_probing_initiated_) >= TimeDelta::Millis(1200))) {
     const DataRate probe_rate =
-        std::min(max_bitrate_, estimated_bitrate_ * 1.8);
+        std::min(max_bitrate_, estimated_bitrate_ * 2.0);
     if (probe_rate > estimated_bitrate_ * 1.15) {
       return InitiateProbing(at_time, {probe_rate}, true);
     }
@@ -888,9 +936,10 @@ void TransportFeedbackAdapter::AddPacket(uint16_t transport_seq_num,
   history_[unwrapped] = rec;
 
   while (history_.size() > 4096) {
-    if (!history_.begin()->second.has_been_acked &&
-        history_.begin()->second.sent.send_time.IsFinite()) {
-      in_flight_bytes_ -= history_.begin()->second.sent.size;
+    if (history_.begin()->second.in_flight) {
+      in_flight_bytes_ =
+          std::max(DataSize::Zero(),
+                   in_flight_bytes_ - history_.begin()->second.sent.size);
     }
     history_.erase(history_.begin());
   }
@@ -908,7 +957,8 @@ std::optional<SentPacket> TransportFeedbackAdapter::ProcessSentPacket(
   const bool first_send = rec.sent.send_time.IsMinusInfinity();
   rec.sent.send_time = send_time;
   rec.sent.prior_unacked_data = in_flight_bytes_;
-  if (first_send && !rec.has_been_acked) {
+  if (first_send && !rec.has_been_acked && !rec.reported_lost) {
+    rec.in_flight = true;
     in_flight_bytes_ += rec.sent.size;
   }
   rec.sent.data_in_flight = in_flight_bytes_;
@@ -955,14 +1005,25 @@ TransportFeedbackAdapter::ProcessTransportFeedback(
   // 回收两次 TWCC 报告之间因尾部丢包被跳过的未确认序列号区间，彻底防止 in_flight_bytes_ 泄漏导致 Pacer 拥塞窗口死锁。
   const int64_t first_seq_unwrapped =
       seq_unwrapper_.PeekUnwrap(statuses.front().sequence_number);
-  if (last_ack_seq_num_ >= 0 && first_seq_unwrapped > last_ack_seq_num_ + 1) {
+  const int64_t last_seq_unwrapped =
+      seq_unwrapper_.PeekUnwrap(statuses.back().sequence_number);
+  const bool window_matches_history =
+      !history_.empty() &&
+      history_.lower_bound(first_seq_unwrapped) != history_.end() &&
+      history_.lower_bound(first_seq_unwrapped)->first <= last_seq_unwrapped;
+  if (window_matches_history && last_ack_seq_num_ >= 0 &&
+      first_seq_unwrapped > last_ack_seq_num_ + 1) {
     auto gap_it = history_.upper_bound(last_ack_seq_num_);
     while (gap_it != history_.end() && gap_it->first < first_seq_unwrapped) {
       auto& rec = gap_it->second;
-      if (rec.sent.send_time.IsFinite() && !rec.has_been_acked) {
-        rec.has_been_acked = true;
-        in_flight_bytes_ =
-            std::max(DataSize::Zero(), in_flight_bytes_ - rec.sent.size);
+      if (rec.sent.send_time.IsFinite() && !rec.has_been_acked &&
+          !rec.reported_lost) {
+        rec.reported_lost = true;
+        if (rec.in_flight) {
+          rec.in_flight = false;
+          in_flight_bytes_ =
+              std::max(DataSize::Zero(), in_flight_bytes_ - rec.sent.size);
+        }
         PacketResult lost_res;
         lost_res.sent_packet = rec.sent;
         lost_res.receive_time = Timestamp::PlusInfinity();
@@ -974,24 +1035,42 @@ TransportFeedbackAdapter::ProcessTransportFeedback(
 
   for (const auto& st : statuses) {
     const int64_t unwrapped = seq_unwrapper_.PeekUnwrap(st.sequence_number);
-    last_ack_seq_num_ = std::max(last_ack_seq_num_, unwrapped);
     const auto it = history_.find(unwrapped);
     if (it == history_.end() ||
         it->second.sent.send_time.IsMinusInfinity()) {
       continue;
     }
+    last_ack_seq_num_ = std::max(last_ack_seq_num_, unwrapped);
     auto& rec = it->second;
-    if (!rec.has_been_acked) {
+    if (st.receive_time.IsFinite()) {
+      if (rec.has_been_acked) {
+        continue;
+      }
       rec.has_been_acked = true;
-      in_flight_bytes_ =
-          std::max(DataSize::Zero(), in_flight_bytes_ - rec.sent.size);
+      if (rec.in_flight) {
+        rec.in_flight = false;
+        in_flight_bytes_ =
+            std::max(DataSize::Zero(), in_flight_bytes_ - rec.sent.size);
+      }
+      PacketResult res;
+      res.sent_packet = rec.sent;
+      res.receive_time = st.receive_time + base_offset;
+      msg.packet_feedbacks.push_back(res);
+    } else {
+      if (rec.has_been_acked || rec.reported_lost) {
+        continue;
+      }
+      rec.reported_lost = true;
+      if (rec.in_flight) {
+        rec.in_flight = false;
+        in_flight_bytes_ =
+            std::max(DataSize::Zero(), in_flight_bytes_ - rec.sent.size);
+      }
+      PacketResult res;
+      res.sent_packet = rec.sent;
+      res.receive_time = Timestamp::PlusInfinity();
+      msg.packet_feedbacks.push_back(res);
     }
-    PacketResult res;
-    res.sent_packet = rec.sent;
-    res.receive_time = st.receive_time.IsFinite()
-                           ? (st.receive_time + base_offset)
-                           : st.receive_time;
-    msg.packet_feedbacks.push_back(res);
   }
 
   CullExpiredInFlight(feedback_receive_time);
@@ -999,7 +1078,7 @@ TransportFeedbackAdapter::ProcessTransportFeedback(
   msg.data_in_flight = in_flight_bytes_;
   for (const auto& [seq, rec] : history_) {
     (void)seq;
-    if (!rec.has_been_acked && rec.sent.send_time.IsFinite()) {
+    if (rec.in_flight && rec.sent.send_time.IsFinite()) {
       msg.first_unacked_send_time = rec.sent.send_time;
       break;
     }
@@ -1019,8 +1098,9 @@ void TransportFeedbackAdapter::CullExpiredInFlight(Timestamp now) {
     (void)seq;
     if (rec.sent.send_time.IsFinite() &&
         (now - rec.sent.send_time) > TimeDelta::Millis(1000)) {
-      if (!rec.has_been_acked) {
-        rec.has_been_acked = true;
+      if (rec.in_flight) {
+        rec.in_flight = false;
+        rec.reported_lost = true;
         in_flight_bytes_ =
             std::max(DataSize::Zero(), in_flight_bytes_ - rec.sent.size);
       }
@@ -1032,15 +1112,31 @@ void TransportFeedbackAdapter::CullExpiredInFlight(Timestamp now) {
 
 // ======================= 8. GoogCcNetworkController 拥塞控制器 =======================
 
+namespace {
+GoogCcConfig SanitizeGoogCcConfig(const GoogCcConfig& cfg) {
+  GoogCcConfig out = cfg;
+  out.min_bitrate = std::max(DataRate::BitsPerSec(1000), cfg.min_bitrate);
+  out.max_bitrate = std::max(out.min_bitrate, cfg.max_bitrate);
+  out.start_bitrate =
+      std::clamp(cfg.start_bitrate, out.min_bitrate, out.max_bitrate);
+  if (!std::isfinite(cfg.pacing_factor) || cfg.pacing_factor <= 0.0) {
+    out.pacing_factor = 1.1;
+  } else {
+    out.pacing_factor = std::clamp(cfg.pacing_factor, 0.5, 4.0);
+  }
+  return out;
+}
+}  // namespace
+
 GoogCcNetworkController::GoogCcNetworkController(const GoogCcConfig& config)
-    : config_(config),
-      delay_based_bwe_(config.min_bitrate,
-                       config.max_bitrate,
-                       config.start_bitrate),
-      bandwidth_estimation_(config.min_bitrate,
-                            config.max_bitrate,
-                            config.start_bitrate) {
-  alr_detector_.SetEstimatedBitrate(config.start_bitrate);
+    : config_(SanitizeGoogCcConfig(config)),
+      delay_based_bwe_(config_.min_bitrate,
+                       config_.max_bitrate,
+                       config_.start_bitrate),
+      bandwidth_estimation_(config_.min_bitrate,
+                            config_.max_bitrate,
+                            config_.start_bitrate) {
+  alr_detector_.SetEstimatedBitrate(config_.start_bitrate);
 }
 
 NetworkControlUpdate GoogCcNetworkController::OnNetworkAvailability(
@@ -1080,13 +1176,18 @@ NetworkControlUpdate GoogCcNetworkController::OnTransportPacketsFeedback(
       alr_detector_.GetApplicationLimitedRegionStartTime().has_value();
   if (previously_in_alr_ && !currently_in_alr) {
     acked_bitrate_estimator_.set_alr_ended_time(report.feedback_time);
+    probe_controller_.set_alr_ended_time(report.feedback_time);
     auto probes = probe_controller_.RequestProbe(report.feedback_time);
     update.probe_cluster_configs.insert(update.probe_cluster_configs.end(),
                                         probes.begin(), probes.end());
   }
   previously_in_alr_ = currently_in_alr;
 
-  const auto received = report.ReceivedWithSendInfo();
+  auto received = report.ReceivedWithSendInfo();
+  std::stable_sort(received.begin(), received.end(),
+                   [](const PacketResult& a, const PacketResult& b) {
+                     return a.receive_time < b.receive_time;
+                   });
   const int64_t lost_count =
       static_cast<int64_t>(report.packet_feedbacks.size()) -
       static_cast<int64_t>(received.size());
@@ -1233,6 +1334,18 @@ NetworkControlUpdate GoogCcNetworkController::OnReceiverReport(
   }
   bandwidth_estimation_.UpdateReceiverReport(at_time, fraction_lost, rtt);
   MaybeTriggerOnNetworkChanged(&update, at_time);
+  return update;
+}
+
+NetworkControlUpdate GoogCcNetworkController::OnRoundTripTimeUpdate(
+    Timestamp at_time,
+    TimeDelta rtt) {
+  NetworkControlUpdate update;
+  if (rtt > TimeDelta::Zero() && rtt.IsFinite()) {
+    delay_based_bwe_.set_rtt(rtt);
+    bandwidth_estimation_.UpdateRtt(rtt);
+    MaybeTriggerOnNetworkChanged(&update, at_time);
+  }
   return update;
 }
 

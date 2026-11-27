@@ -2,7 +2,9 @@
 #define INCLUDE_RTC_VIDEO_ENGINE_HPP_
 
 #include <cstdint>
+#include <deque>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -31,9 +33,33 @@ struct LogEntryView {
 
 class RTC_SDK_API LogSink {
  public:
-  virtual ~LogSink() = default;
+  virtual ~LogSink();
+  // 注意：`entry` 内的 `string_view` 字段及 `formatted_line` 仅在本次回调栈帧内有效；
+  // 回调在无全局日志锁状态下调用，若需跨线程保留文本请拷贝为 `std::string`。
   virtual void OnLogMessage(const LogEntryView& entry,
                             std::string_view formatted_line) = 0;
+};
+
+// 用于嵌入式事后故障诊断的有界内存环形日志接收器。
+class RTC_SDK_API RingBufferLogSink final : public LogSink {
+ public:
+  explicit RingBufferLogSink(size_t capacity = 256);
+  ~RingBufferLogSink() override;
+
+  RingBufferLogSink(const RingBufferLogSink&) = delete;
+  RingBufferLogSink& operator=(const RingBufferLogSink&) = delete;
+
+  void OnLogMessage(const LogEntryView& entry,
+                    std::string_view formatted_line) override;
+
+  std::vector<std::string> Snapshot() const;
+  void Clear();
+  size_t Size() const;
+
+ private:
+  const size_t capacity_;
+  mutable std::mutex mutex_;
+  std::deque<std::string> lines_;
 };
 
 struct IceServerConfig {
@@ -75,8 +101,21 @@ struct EngineConfig {
   // 若 `custom_quic_cc_factory` 非空，则优先于 `quic_cc_algo` 生效。
   rtc_quic_cc_algo_e quic_cc_algo = RTC_QUIC_CC_BBR;
   std::shared_ptr<IQuicCongestionControllerFactory> custom_quic_cc_factory;
+
+  // TLS 证书校验配置（用于 WSS 信令与 QUIC / WebTransport TLS 1.3 握手）：
+  // - 若 `tls_pinned_cert_sha256` 非空，强制校验对端叶子证书 SHA-256 指纹；
+  // - 若 `tls_verify_peer == true` 或 `tls_ca_cert_path` 非空，强制校验 X.509 信任链与 SAN 主机名/IP。
+  bool tls_verify_peer = false;
+  std::string tls_ca_cert_path;
+  std::string tls_pinned_cert_sha256;
 };
 
+// 引擎异步事件观察者接口。
+// 线程与生命周期约定：
+//   1. 所有回调均在 SDK 独立的串行 `callback` 线程上顺序触发。
+//   2. `OnRemoteEncodedFrame` 中的 `frame.data` 以及 `OnDataChannelMessage` 中的
+//      `data` 指针仅在当次回调返回前有效，异步消费时请自行拷贝负载字节。
+//   3. 建议在外部业务线程析构 `RtcVideoEngine`（底层亦对回调内自析构做了生命周期兜底保护）。
 class RTC_SDK_API IRtcEventObserver {
  public:
   virtual ~IRtcEventObserver() = default;

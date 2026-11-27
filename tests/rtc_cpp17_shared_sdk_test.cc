@@ -64,6 +64,30 @@ TEST(Cpp17SharedSdkTest, LogSinkAndBuiltinQuicCongestionControllers) {
     EXPECT_EQ(from_factory->Name(), expected_name);
   }
 
+  // 验证 BBRv1 -> BBRv2 跨模块热迁移保留 delivered_bytes 采样基准，以及 RingBufferLogSink 符号导出与析构自动注销。
+  {
+    auto bbr1 = rtc::CreateBuiltinQuicCongestionController(RTC_QUIC_CC_BBR, 1200);
+    auto bbr2 = rtc::CreateBuiltinQuicCongestionController(RTC_QUIC_CC_BBR2, 1200);
+    bbr1->OnPacketSent(10'000, 1, 1200, true, 0);
+    rtc::QuicRttSample rtt{25'000, 25'000, 25'000, 5'000};
+    std::vector<rtc::QuicAckedPacket> acked = {
+        {1, 1200, 10'000, 1200, 0, 10'000, 10'000, false}};
+    bbr1->OnCongestionEvent(35'000, 1200, 0, rtt, acked, {});
+    const rtc::QuicCcMigrationState mig = bbr1->ExportMigrationState();
+    EXPECT_GE(mig.delivered_bytes, 1200u);
+    bbr2->ImportMigrationState(mig, 35'000);
+    EXPECT_EQ(bbr2->ExportMigrationState().delivered_bytes, mig.delivered_bytes);
+
+    rtc::RingBufferLogSink scoped_ring(16);
+    rtc::RtcVideoEngine::AddLogSink(&scoped_ring, rtc::LoggingSeverity::kInfo);
+    rtc::EngineConfig tmp_cfg;
+    auto tmp_eng = rtc::RtcVideoEngine::Create(tmp_cfg, nullptr);
+    ASSERT_NE(tmp_eng, nullptr);
+    EXPECT_GT(scoped_ring.Size(), 0u);
+    EXPECT_FALSE(scoped_ring.Snapshot().empty());
+  }
+  // scoped_ring 已离开作用域析构自动注销，此处再次创建/销毁引擎打日志绝不触发悬垂指针崩溃。
+
   rtc::EngineConfig cfg;
   cfg.transport_mode = RTC_TRANSPORT_MODE_WEBRTC_P2P;
   auto engine = rtc::RtcVideoEngine::Create(cfg, nullptr);

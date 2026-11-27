@@ -8,9 +8,12 @@
 #include <sstream>
 
 #include <openssl/bn.h>
+#include <openssl/crypto.h>
 #include <openssl/err.h>
 #include <openssl/evp.h>
+#include <openssl/rand.h>
 
+#include "modules/rtp_rtcp/byte_io.h"
 #include "rtc_base/json_utils.h"
 #include "rtc_base/logging.h"
 
@@ -74,7 +77,26 @@ std::shared_ptr<DtlsCertificate> DtlsCertificate::GenerateEcdsaP256() {
     return nullptr;
   }
   X509_set_version(x509, 2);
-  ASN1_INTEGER_set(X509_get_serialNumber(x509), 1);
+
+  // RFC 5280 §4.1.2.2：生成随机正 64 位序列号，避免 Firefox 因自签证书相同序列号触发 SEC_ERROR_REUSED_ISSUER_AND_SERIAL。
+  uint8_t serial_bytes[8]{};
+  if (RAND_bytes(serial_bytes, sizeof(serial_bytes)) != 1) {
+    X509_free(x509);
+    EVP_PKEY_free(pkey);
+    return nullptr;
+  }
+  serial_bytes[0] &= 0x7Fu;
+  serial_bytes[0] |= 0x01u;
+  BIGNUM* bn_serial = BN_bin2bn(serial_bytes, sizeof(serial_bytes), nullptr);
+  if (bn_serial == nullptr ||
+      BN_to_ASN1_INTEGER(bn_serial, X509_get_serialNumber(x509)) == nullptr) {
+    BN_free(bn_serial);
+    X509_free(x509);
+    EVP_PKEY_free(pkey);
+    return nullptr;
+  }
+  BN_free(bn_serial);
+
   X509_gmtime_adj(X509_get_notBefore(x509), -3600);
   X509_gmtime_adj(X509_get_notAfter(x509), 365L * 24 * 3600);
   X509_set_pubkey(x509, pkey);
@@ -106,6 +128,7 @@ SrtpSessionPair::SrtpSessionPair() { EnsureLibsrtpInitialized(); }
 SrtpSessionPair::~SrtpSessionPair() { Reset(); }
 
 void SrtpSessionPair::Reset() {
+  active_.store(false, std::memory_order_release);
   if (send_ctx_ != nullptr) {
     srtp_dealloc(send_ctx_);
     send_ctx_ = nullptr;
@@ -114,7 +137,6 @@ void SrtpSessionPair::Reset() {
     srtp_dealloc(recv_ctx_);
     recv_ctx_ = nullptr;
   }
-  active_ = false;
 }
 
 bool SrtpSessionPair::SetupKeys(
@@ -144,7 +166,7 @@ bool SrtpSessionPair::SetupKeys(
     policy.ssrc.value = 0;
     policy.key = const_cast<uint8_t*>(key_salt.data());
     policy.window_size = 1024;
-    policy.allow_repeat_tx = 1;
+    policy.allow_repeat_tx = 0;
     policy.next = nullptr;
     return srtp_create(out_ctx, &policy) == srtp_err_status_ok;
   };
@@ -157,12 +179,12 @@ bool SrtpSessionPair::SetupKeys(
     Reset();
     return false;
   }
-  active_ = true;
+  active_.store(true, std::memory_order_release);
   return true;
 }
 
 bool SrtpSessionPair::ProtectRtp(std::vector<uint8_t>* packet_buf) {
-  if (!active_ || packet_buf == nullptr || packet_buf->size() < 12) {
+  if (!IsActive() || packet_buf == nullptr || packet_buf->size() < 12) {
     return false;
   }
   int len = static_cast<int>(packet_buf->size());
@@ -175,7 +197,7 @@ bool SrtpSessionPair::ProtectRtp(std::vector<uint8_t>* packet_buf) {
 }
 
 bool SrtpSessionPair::ProtectRtcp(std::vector<uint8_t>* packet_buf) {
-  if (!active_ || packet_buf == nullptr || packet_buf->size() < 8) {
+  if (!IsActive() || packet_buf == nullptr || packet_buf->size() < 8) {
     return false;
   }
   int len = static_cast<int>(packet_buf->size());
@@ -189,7 +211,7 @@ bool SrtpSessionPair::ProtectRtcp(std::vector<uint8_t>* packet_buf) {
 }
 
 bool SrtpSessionPair::UnprotectRtp(std::vector<uint8_t>* packet_buf) {
-  if (!active_ || packet_buf == nullptr || packet_buf->size() < 12) {
+  if (!IsActive() || packet_buf == nullptr || packet_buf->size() < 12) {
     return false;
   }
   int len = static_cast<int>(packet_buf->size());
@@ -202,7 +224,7 @@ bool SrtpSessionPair::UnprotectRtp(std::vector<uint8_t>* packet_buf) {
 }
 
 bool SrtpSessionPair::UnprotectRtcp(std::vector<uint8_t>* packet_buf) {
-  if (!active_ || packet_buf == nullptr || packet_buf->size() < 8) {
+  if (!IsActive() || packet_buf == nullptr || packet_buf->size() < 8) {
     return false;
   }
   int len = static_cast<int>(packet_buf->size());
@@ -241,7 +263,7 @@ long DgramBioCtrl(BIO* /*bio*/, int cmd, long /*num*/, void* /*ptr*/) {
       return 1;
     case BIO_CTRL_DGRAM_QUERY_MTU:
     case BIO_CTRL_DGRAM_GET_FALLBACK_MTU:
-      return 1280;
+      return 1400;
     default:
       return 0;
   }
@@ -287,31 +309,48 @@ DtlsSrtpTransport::DtlsSrtpTransport(Clock* clock,
       ice_channel_(ice_channel),
       local_cert_(std::move(local_cert)),
       observer_(observer),
+      dtls_app_rx_buf_(SSL3_RT_MAX_PLAIN_LENGTH, 0),
       safety_(PendingTaskSafetyFlag::CreateDetached()) {
   ssl_ctx_ = SSL_CTX_new(DTLS_method());
-  SSL_CTX_set_min_proto_version(ssl_ctx_, DTLS1_2_VERSION);
-  SSL_CTX_use_certificate(ssl_ctx_, local_cert_->x509());
-  SSL_CTX_use_PrivateKey(ssl_ctx_, local_cert_->pkey());
-  SSL_CTX_set_verify(ssl_ctx_,
-                     SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT,
-                     &AlwaysVerifyPeerCertCallback);
-  SSL_CTX_set_tlsext_use_srtp(ssl_ctx_,
-                              "SRTP_AEAD_AES_128_GCM:SRTP_AES128_CM_SHA1_80");
+  if (ssl_ctx_ != nullptr && local_cert_) {
+    SSL_CTX_set_min_proto_version(ssl_ctx_, DTLS1_2_VERSION);
+    SSL_CTX_use_certificate(ssl_ctx_, local_cert_->x509());
+    SSL_CTX_use_PrivateKey(ssl_ctx_, local_cert_->pkey());
+    SSL_CTX_set_verify(ssl_ctx_,
+                       SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT,
+                       &AlwaysVerifyPeerCertCallback);
+    SSL_CTX_set_tlsext_use_srtp(ssl_ctx_,
+                                "SRTP_AEAD_AES_128_GCM:SRTP_AES128_CM_SHA1_80");
+  }
 }
 
 DtlsSrtpTransport::~DtlsSrtpTransport() {
   network_queue_->Invoke([this]() {
     RTC_DCHECK_RUN_ON(&net_checker_);
     safety_.flag()->SetNotAlive();
-    if (ssl_ != nullptr) {
-      SSL_free(ssl_);
-      ssl_ = nullptr;
-    }
+    ResetDtlsHandshakeState();
+    srtp_.Reset();
     if (ssl_ctx_ != nullptr) {
       SSL_CTX_free(ssl_ctx_);
       ssl_ctx_ = nullptr;
     }
   });
+}
+
+void DtlsSrtpTransport::ResetDtlsHandshakeState() {
+  ++timer_generation_;
+  timer_scheduled_ = false;
+  pending_dtls_packets_.clear();
+  inbound_ssrcs_.clear();
+  if (ssl_ != nullptr) {
+    SSL_free(ssl_);
+    ssl_ = nullptr;
+  }
+  read_bio_ = nullptr;
+  write_bio_ = nullptr;
+  handshake_started_ = false;
+  handshake_complete_.store(false, std::memory_order_release);
+  handshake_started_at_ = Timestamp::MinusInfinity();
 }
 
 void DtlsSrtpTransport::SetDtlsRoleAndRemoteFingerprint(
@@ -321,6 +360,11 @@ void DtlsSrtpTransport::SetDtlsRoleAndRemoteFingerprint(
       safety_.flag(),
       [this, role, fp = std::move(expected_sha256_fp)]() mutable {
         RTC_DCHECK_RUN_ON(&net_checker_);
+        if (handshake_started_ &&
+            (role_ != role || expected_remote_fingerprint_ != fp)) {
+          ResetDtlsHandshakeState();
+          srtp_.Reset();
+        }
         role_ = role;
         expected_remote_fingerprint_ = std::move(fp);
         StartHandshakeIfReady();
@@ -337,7 +381,8 @@ void DtlsSrtpTransport::SetRtpHeaderExtensionMap(
 
 void DtlsSrtpTransport::StartHandshakeIfReady() {
   RTC_DCHECK_RUN_ON(&net_checker_);
-  if (handshake_started_ || expected_remote_fingerprint_.empty()) {
+  if (handshake_started_ || expected_remote_fingerprint_.empty() ||
+      ssl_ctx_ == nullptr || !local_cert_ || ice_channel_ == nullptr) {
     return;
   }
   if (ice_channel_->state() != IceTransportState::kConnected &&
@@ -346,14 +391,25 @@ void DtlsSrtpTransport::StartHandshakeIfReady() {
   }
 
   ssl_ = SSL_new(ssl_ctx_);
+  if (ssl_ == nullptr) {
+    return;
+  }
   SSL_set_options(ssl_, SSL_OP_NO_QUERY_MTU);
   SSL_set_mtu(ssl_, 1280);
   DTLS_set_link_mtu(ssl_, 1280);
 
   read_bio_ = BIO_new(BIO_s_mem());
-  BIO_set_mem_eof_return(read_bio_, -1);
-
   write_bio_ = BIO_new(GetDgramWriteBioMethod());
+  if (read_bio_ == nullptr || write_bio_ == nullptr) {
+    if (read_bio_ != nullptr) BIO_free(read_bio_);
+    if (write_bio_ != nullptr) BIO_free(write_bio_);
+    read_bio_ = nullptr;
+    write_bio_ = nullptr;
+    SSL_free(ssl_);
+    ssl_ = nullptr;
+    return;
+  }
+  BIO_set_mem_eof_return(read_bio_, -1);
   BIO_set_data(write_bio_, ice_channel_);
 
   SSL_set_bio(ssl_, read_bio_, write_bio_);
@@ -364,26 +420,36 @@ void DtlsSrtpTransport::StartHandshakeIfReady() {
     SSL_set_accept_state(ssl_);
   }
   handshake_started_ = true;
+  handshake_started_at_ = clock_->CurrentTime();
   RTC_LOG(kInfo) << "Starting DTLS 1.2 handshake (role="
                  << (role_ == DtlsRole::kClient ? "kClient" : "kServer") << ")";
-  for (const auto& pkt : pending_dtls_packets_) {
-    BIO_write(read_bio_, pkt.data(), static_cast<int>(pkt.size()));
-  }
-  pending_dtls_packets_.clear();
   DriveDtlsHandshake();
+  if (!pending_dtls_packets_.empty()) {
+    auto queued = std::move(pending_dtls_packets_);
+    pending_dtls_packets_.clear();
+    const Timestamp now = clock_->CurrentTime();
+    for (const auto& pkt : queued) {
+      if (ssl_ == nullptr) {
+        break;
+      }
+      ProcessDtlsDatagram(pkt, now);
+    }
+  }
 }
 
 void DtlsSrtpTransport::DriveDtlsHandshake() {
   RTC_DCHECK_RUN_ON(&net_checker_);
-  if (ssl_ == nullptr || handshake_complete_) {
+  if (ssl_ == nullptr || handshake_complete_.load(std::memory_order_relaxed)) {
     return;
   }
 
+  ERR_clear_error();
   const int ret = SSL_do_handshake(ssl_);
   if (ret == 1) {
     X509* peer_cert = SSL_get1_peer_certificate(ssl_);
     if (peer_cert == nullptr) {
       RTC_LOG(kError) << "DTLS handshake missing peer X509 certificate";
+      ResetDtlsHandshakeState();
       if (observer_ != nullptr) {
         observer_->OnDtlsSrtpError("Missing DTLS peer certificate");
       }
@@ -394,6 +460,16 @@ void DtlsSrtpTransport::DriveDtlsHandshake() {
     X509_free(peer_cert);
 
     auto normalize_fp = [](std::string s) {
+      while (!s.empty() &&
+             (s.front() == ' ' || s.front() == '\t' || s.front() == '\r' ||
+              s.front() == '\n')) {
+        s.erase(s.begin());
+      }
+      while (!s.empty() &&
+             (s.back() == ' ' || s.back() == '\t' || s.back() == '\r' ||
+              s.back() == '\n')) {
+        s.pop_back();
+      }
       std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) {
         return static_cast<char>(std::toupper(c));
       });
@@ -403,6 +479,7 @@ void DtlsSrtpTransport::DriveDtlsHandshake() {
       RTC_LOG(kError) << "DTLS certificate fingerprint mismatch! actual="
                       << actual_fp
                       << " expected=" << expected_remote_fingerprint_;
+      ResetDtlsHandshakeState();
       if (observer_ != nullptr) {
         observer_->OnDtlsSrtpError("DTLS certificate fingerprint mismatch");
       }
@@ -411,12 +488,17 @@ void DtlsSrtpTransport::DriveDtlsHandshake() {
 
     if (!ExportAndInstallSrtpKeys()) {
       RTC_LOG(kError) << "RFC 5764 DTLS-SRTP key export failed";
+      ResetDtlsHandshakeState();
       if (observer_ != nullptr) {
         observer_->OnDtlsSrtpError("RFC 5764 SRTP key export failed");
       }
       return;
     }
-    handshake_complete_ = true;
+    ++timer_generation_;
+    timer_scheduled_ = false;
+    SSL_set_mtu(ssl_, 1400);
+    DTLS_set_link_mtu(ssl_, 1400);
+    handshake_complete_.store(true, std::memory_order_release);
     RTC_LOG(kInfo) << "DTLS-SRTP handshake verified and SRTP keys installed";
     if (observer_ != nullptr) {
       observer_->OnDtlsSrtpHandshakeComplete();
@@ -429,32 +511,124 @@ void DtlsSrtpTransport::DriveDtlsHandshake() {
     ScheduleDtlsRetransmitTimer();
   } else {
     RTC_LOG(kError) << "DTLS handshake fatal SSL error=" << ssl_err;
+    ResetDtlsHandshakeState();
     if (observer_ != nullptr) {
       observer_->OnDtlsSrtpError("DTLS handshake fatal SSL error");
     }
   }
 }
 
-void DtlsSrtpTransport::ScheduleDtlsRetransmitTimer() {
+void DtlsSrtpTransport::ProcessDtlsDatagram(ArrayView<const uint8_t> packet,
+                                            Timestamp receive_time) {
   RTC_DCHECK_RUN_ON(&net_checker_);
-  if (ssl_ == nullptr || handshake_complete_) {
+  if (read_bio_ == nullptr || ssl_ == nullptr || packet.empty()) {
     return;
   }
-  struct timeval tv {};
-  if (DTLSv1_get_timeout(ssl_, &tv) == 1) {
-    const int64_t delay_us = static_cast<int64_t>(tv.tv_sec) * 1'000'000 +
-                             static_cast<int64_t>(tv.tv_usec);
-    network_queue_->PostDelayedTask(
-        SafeTask(safety_.flag(),
-                 [this]() {
-                   RTC_DCHECK_RUN_ON(&net_checker_);
-                   if (ssl_ != nullptr && !handshake_complete_) {
-                     DTLSv1_handle_timeout(ssl_);
-                     ScheduleDtlsRetransmitTimer();
-                   }
-                 }),
-        TimeDelta::Micros(std::max<int64_t>(delay_us, 10'000)));
+  (void)BIO_reset(read_bio_);
+  BIO_set_mem_eof_return(read_bio_, -1);
+  BIO_write(read_bio_, packet.data(), static_cast<int>(packet.size()));
+
+  if (!handshake_complete_.load(std::memory_order_relaxed)) {
+    DriveDtlsHandshake();
   }
+  if (handshake_complete_.load(std::memory_order_relaxed) && ssl_ != nullptr) {
+    // RFC 8261：按完整 DTLS 最大明文记录长度（16384B）读取应用数据记录，并在单数据报处理完毕后重置 read_bio_ 防止跨包粘连污染。
+    while (ssl_ != nullptr) {
+      ERR_clear_error();
+      const int n = SSL_read(ssl_, dtls_app_rx_buf_.data(),
+                             static_cast<int>(dtls_app_rx_buf_.size()));
+      if (n <= 0) {
+        const int ssl_err = SSL_get_error(ssl_, n);
+        if (ssl_err == SSL_ERROR_ZERO_RETURN || ssl_err == SSL_ERROR_SSL) {
+          RTC_LOG(kWarning) << "DTLS session closed or fatal post-handshake "
+                               "error (ssl_err="
+                            << ssl_err << ")";
+          ResetDtlsHandshakeState();
+          srtp_.Reset();
+          if (observer_ != nullptr) {
+            observer_->OnDtlsSrtpError(
+                ssl_err == SSL_ERROR_ZERO_RETURN
+                    ? "DTLS peer sent close_notify"
+                    : "DTLS post-handshake fatal SSL error");
+          }
+        }
+        break;
+      }
+      if (observer_ != nullptr) {
+        observer_->OnDtlsApplicationData(
+            MakeArrayView(dtls_app_rx_buf_.data(), static_cast<size_t>(n)),
+            receive_time);
+      }
+    }
+  }
+
+  if (read_bio_ != nullptr) {
+    (void)BIO_reset(read_bio_);
+    BIO_set_mem_eof_return(read_bio_, -1);
+  }
+}
+
+void DtlsSrtpTransport::ScheduleDtlsRetransmitTimer() {
+  RTC_DCHECK_RUN_ON(&net_checker_);
+  if (ssl_ == nullptr || handshake_complete_.load(std::memory_order_relaxed)) {
+    return;
+  }
+  constexpr TimeDelta kMaxHandshakeTimeout = TimeDelta::Seconds(15);
+  if (handshake_started_at_.IsFinite() &&
+      (clock_->CurrentTime() - handshake_started_at_) >= kMaxHandshakeTimeout) {
+    RTC_LOG(kError) << "DTLS handshake exceeded 15s overall timeout";
+    ResetDtlsHandshakeState();
+    if (observer_ != nullptr) {
+      observer_->OnDtlsSrtpError("DTLS handshake timed out");
+    }
+    return;
+  }
+  if (timer_scheduled_) {
+    return;
+  }
+  timer_scheduled_ = true;
+  const uint64_t gen = timer_generation_;
+  struct timeval tv {};
+  int64_t delay_us = 1'000'000;
+  if (DTLSv1_get_timeout(ssl_, &tv) == 1) {
+    delay_us = static_cast<int64_t>(tv.tv_sec) * 1'000'000 +
+               static_cast<int64_t>(tv.tv_usec);
+  }
+  network_queue_->PostDelayedTask(
+      SafeTask(safety_.flag(),
+               [this, gen]() {
+                 RTC_DCHECK_RUN_ON(&net_checker_);
+                 if (gen != timer_generation_) {
+                   return;
+                 }
+                 timer_scheduled_ = false;
+                 if (ssl_ == nullptr ||
+                     handshake_complete_.load(std::memory_order_relaxed)) {
+                   return;
+                 }
+                 if (handshake_started_at_.IsFinite() &&
+                     (clock_->CurrentTime() - handshake_started_at_) >=
+                         TimeDelta::Seconds(15)) {
+                   RTC_LOG(kError) << "DTLS handshake overall timeout";
+                   ResetDtlsHandshakeState();
+                   if (observer_ != nullptr) {
+                     observer_->OnDtlsSrtpError("DTLS handshake timed out");
+                   }
+                   return;
+                 }
+                 ERR_clear_error();
+                 if (DTLSv1_handle_timeout(ssl_) < 0) {
+                   RTC_LOG(kError)
+                       << "DTLS handshake retransmission limit exceeded";
+                   ResetDtlsHandshakeState();
+                   if (observer_ != nullptr) {
+                     observer_->OnDtlsSrtpError("DTLS handshake timed out");
+                   }
+                   return;
+                 }
+                 ScheduleDtlsRetransmitTimer();
+               }),
+      TimeDelta::Micros(std::max<int64_t>(delay_us, 10'000)));
 }
 
 bool DtlsSrtpTransport::ExportAndInstallSrtpKeys() {
@@ -483,6 +657,7 @@ bool DtlsSrtpTransport::ExportAndInstallSrtpKeys() {
   static constexpr const char kLabel[] = "EXTRACTOR-dtls_srtp";
   if (SSL_export_keying_material(ssl_, material.data(), material.size(), kLabel,
                                  sizeof(kLabel) - 1, nullptr, 0, 0) != 1) {
+    OPENSSL_cleanse(material.data(), material.size());
     return false;
   }
 
@@ -495,11 +670,16 @@ bool DtlsSrtpTransport::ExportAndInstallSrtpKeys() {
   std::memcpy(server_key_salt.data() + key_len,
               material.data() + 2 * key_len + salt_len, salt_len);
 
+  inbound_ssrcs_.clear();
   RTC_LOG(kInfo) << "Negotiated DTLS-SRTP profile=" << srtp_prof->name;
-  if (role_ == DtlsRole::kClient) {
-    return srtp_.SetupKeys(cipher, client_key_salt, server_key_salt);
-  }
-  return srtp_.SetupKeys(cipher, server_key_salt, client_key_salt);
+  const bool ok =
+      (role_ == DtlsRole::kClient)
+          ? srtp_.SetupKeys(cipher, client_key_salt, server_key_salt)
+          : srtp_.SetupKeys(cipher, server_key_salt, client_key_salt);
+  OPENSSL_cleanse(material.data(), material.size());
+  OPENSSL_cleanse(client_key_salt.data(), client_key_salt.size());
+  OPENSSL_cleanse(server_key_salt.data(), server_key_salt.size());
+  return ok;
 }
 
 void DtlsSrtpTransport::OnLocalCandidateGathered(
@@ -514,6 +694,9 @@ void DtlsSrtpTransport::OnIceTransportStateChanged(IceTransportState state) {
   if (state == IceTransportState::kConnected ||
       state == IceTransportState::kCompleted) {
     StartHandshakeIfReady();
+  }
+  if (observer_ != nullptr) {
+    observer_->OnIceTransportState(state);
   }
 }
 
@@ -534,37 +717,39 @@ void DtlsSrtpTransport::OnIcePacketReceived(ArrayView<const uint8_t> packet,
       }
       return;
     }
-    if (read_bio_ != nullptr && ssl_ != nullptr) {
-      BIO_write(read_bio_, packet.data(), static_cast<int>(packet.size()));
-      if (!handshake_complete_) {
-        DriveDtlsHandshake();
-      }
-      if (handshake_complete_) {
-        // RFC 8261：读取所有解密后的 DTLS 应用数据记录（如 SCTP DataChannel 分组）。
-        uint8_t app_buf[4096];
-        while (true) {
-          const int n = SSL_read(ssl_, app_buf, sizeof(app_buf));
-          if (n <= 0) {
-            break;
-          }
-          if (observer_ != nullptr) {
-            observer_->OnDtlsApplicationData(
-                MakeArrayView(app_buf, static_cast<size_t>(n)), receive_time);
-          }
-        }
-      }
-    }
+    ProcessDtlsDatagram(packet, receive_time);
     return;
   }
 
   if ((packet[0] & 0xC0) == 0x80 && srtp_.IsActive()) {
-    std::vector<uint8_t> buf(packet.begin(), packet.end());
     if (IsRtcpPacketWire(packet)) {
-      if (srtp_.UnprotectRtcp(&buf) && observer_ != nullptr) {
-        observer_->OnDecryptedRtcpPacket(buf, receive_time);
+      if (packet.size() < 8) {
+        return;
+      }
+      const uint32_t rtcp_ssrc = ReadBigEndian32(packet.data() + 4);
+      if (inbound_ssrcs_.find(rtcp_ssrc) == inbound_ssrcs_.end() &&
+          inbound_ssrcs_.size() >= kMaxInboundSsrcs) {
+        return;
+      }
+      std::vector<uint8_t> buf(packet.begin(), packet.end());
+      if (srtp_.UnprotectRtcp(&buf)) {
+        inbound_ssrcs_.insert(rtcp_ssrc);
+        if (observer_ != nullptr) {
+          observer_->OnDecryptedRtcpPacket(buf, receive_time);
+        }
       }
     } else {
+      if (packet.size() < 12) {
+        return;
+      }
+      const uint32_t rtp_ssrc = ReadBigEndian32(packet.data() + 8);
+      if (inbound_ssrcs_.find(rtp_ssrc) == inbound_ssrcs_.end() &&
+          inbound_ssrcs_.size() >= kMaxInboundSsrcs) {
+        return;
+      }
+      std::vector<uint8_t> buf(packet.begin(), packet.end());
       if (srtp_.UnprotectRtp(&buf)) {
+        inbound_ssrcs_.insert(rtp_ssrc);
         RtpPacket pkt;
         if (pkt.Parse(buf, rtp_ext_map_) && observer_ != nullptr) {
           observer_->OnDecryptedRtpPacket(pkt, receive_time);
@@ -601,9 +786,11 @@ bool DtlsSrtpTransport::SendRtcpPacket(ArrayView<const uint8_t> compound_rtcp) {
 bool DtlsSrtpTransport::SendDtlsApplicationData(
     ArrayView<const uint8_t> payload) {
   RTC_DCHECK_RUN_ON(&net_checker_);
-  if (!handshake_complete_ || ssl_ == nullptr || payload.empty()) {
+  if (!handshake_complete_.load(std::memory_order_acquire) || ssl_ == nullptr ||
+      payload.empty()) {
     return false;
   }
+  ERR_clear_error();
   return SSL_write(ssl_, payload.data(), static_cast<int>(payload.size())) > 0;
 }
 
@@ -654,36 +841,39 @@ void RtpDemuxer::RemoveSink(const RtpPacketSinkInterface* sink) {
 }
 
 RtpPacketSinkInterface* RtpDemuxer::ResolveSink(const RtpPacket& packet) {
-  const auto ssrc_it = sink_by_ssrc_.find(packet.ssrc());
-  if (ssrc_it != sink_by_ssrc_.end()) {
-    return ssrc_it->second;
-  }
+  auto bind_ssrc = [this](uint32_t ssrc, RtpPacketSinkInterface* sink) {
+    if (sink_by_ssrc_.find(ssrc) != sink_by_ssrc_.end() ||
+        sink_by_ssrc_.size() < 64) {
+      sink_by_ssrc_[ssrc] = sink;
+    }
+  };
   if (packet.rid().has_value()) {
     const auto it = sink_by_rsid_.find(*packet.rid());
     if (it != sink_by_rsid_.end()) {
-      sink_by_ssrc_[packet.ssrc()] = it->second;
+      bind_ssrc(packet.ssrc(), it->second);
       return it->second;
     }
   }
   if (packet.repaired_rid().has_value()) {
     const auto it = sink_by_rsid_.find(*packet.repaired_rid());
     if (it != sink_by_rsid_.end()) {
-      sink_by_ssrc_[packet.ssrc()] = it->second;
+      bind_ssrc(packet.ssrc(), it->second);
       return it->second;
     }
   }
+  // RFC 8843 §9.2：BUNDLE 解复用优先匹配 RTP 头部 MID 扩展并动态更新 SSRC 绑定表。
   if (packet.mid().has_value()) {
     const auto it = sink_by_mid_.find(*packet.mid());
     if (it != sink_by_mid_.end()) {
-      sink_by_ssrc_[packet.ssrc()] = it->second;
+      bind_ssrc(packet.ssrc(), it->second);
       return it->second;
     }
   }
-  if (default_sink_ != nullptr) {
-    sink_by_ssrc_[packet.ssrc()] = default_sink_;
-    return default_sink_;
+  const auto ssrc_it = sink_by_ssrc_.find(packet.ssrc());
+  if (ssrc_it != sink_by_ssrc_.end()) {
+    return ssrc_it->second;
   }
-  return nullptr;
+  return default_sink_;
 }
 
 bool RtpDemuxer::OnRtpPacket(const RtpPacket& packet, Timestamp receive_time) {
@@ -758,11 +948,28 @@ std::string PureVideoSdpDescription::Serialize() const {
   }
 
   size_t vid_idx = 0;
+  size_t rej_idx = 0;
   bool data_emitted = false;
   size_t emitted_m_count = 0;
   for (SdpMediaKind kind : order) {
+    if (kind == SdpMediaKind::kUnsupported) {
+      if (rej_idx >= rejected_m_sections.size()) {
+        continue;
+      }
+      const auto& rm = rejected_m_sections[rej_idx++];
+      sdp << "m=" << (rm.kind.empty() ? "audio" : rm.kind) << " 0 "
+          << (rm.proto.empty() ? "UDP/TLS/RTP/SAVPF" : rm.proto) << " "
+          << (rm.fmt.empty() ? "0" : rm.fmt) << "\r\n"
+          << "c=IN IP4 0.0.0.0\r\n";
+      if (!rm.mid.empty()) {
+        sdp << "a=mid:" << rm.mid << "\r\n";
+      }
+      continue;
+    }
     if (kind == SdpMediaKind::kApplication) {
       if (!data_m_section.has_value() || data_emitted) {
+        sdp << "m=application 0 UDP/DTLS/SCTP webrtc-datachannel\r\n"
+            << "c=IN IP4 0.0.0.0\r\n";
         continue;
       }
       data_emitted = true;
@@ -787,6 +994,9 @@ std::string PureVideoSdpDescription::Serialize() const {
     }
 
     if (vid_idx >= video_m_sections.size()) {
+      // RFC 3264 §6：Answer 中的 m= 行总数必须严格与 Offer 一致，超出单流能力的附加视频轨输出端口 0 拒绝行。
+      sdp << "m=video 0 UDP/TLS/RTP/SAVPF 96\r\n"
+          << "c=IN IP4 0.0.0.0\r\n";
       continue;
     }
     const auto& m = video_m_sections[vid_idx++];
@@ -843,11 +1053,13 @@ std::string PureVideoSdpDescription::Serialize() const {
           << "a=fmtp:" << vpt
           << " level-id=93;profile-id=1;tier-flag=0;tx-mode=SRST\r\n";
     } else {
-      // Constrained Baseline Profile 3.1 + packetization-mode=1 在 Chrome、
-      // Edge、Firefox、Safari 以及嵌入式硬件编解码器（VPU/VDEC）上具有通用兼容性。
+      // 默认使用 Constrained Baseline Profile 3.1（42e01f），若对端 Offer 协商了特定 profile-level-id 则按 RFC 6184 回显匹配值。
+      const std::string& plid =
+          m.h264_profile_level_id.empty() ? "42e01f" : m.h264_profile_level_id;
       sdp << "a=rtpmap:" << vpt << " H264/90000\r\n"
           << "a=fmtp:" << vpt
-          << " level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f\r\n";
+          << " level-asymmetry-allowed=1;packetization-mode=1;profile-level-id="
+          << plid << "\r\n";
     }
     sdp << "a=rtcp-fb:" << vpt << " goog-remb\r\n"
         << "a=rtcp-fb:" << vpt << " transport-cc\r\n"
@@ -913,26 +1125,56 @@ std::optional<PureVideoSdpDescription> PureVideoSdpDescription::Parse(
     std::string_view sdp_text,
     VideoCodec preferred_codec) {
   struct MSectionCodecScratch {
+    std::string proto = "UDP/TLS/RTP/SAVPF";
+    std::string first_fmt = "96";
     std::vector<uint8_t> h264_pts;
     std::optional<uint8_t> preferred_h264_cb_pt;
+    std::optional<uint8_t> preferred_h264_pm1_pt;
+    std::map<uint8_t, std::string> pt_to_profile_level_id;
     std::vector<uint8_t> h265_pts;
     std::map<uint8_t, uint8_t> apt_to_rtx_pt;
     std::optional<uint8_t> flexfec_pt;
     std::string flexfec_subtype = "flexfec";
     std::map<uint8_t, uint32_t> pt_to_repair_window_us;
+    bool has_fid_primary = false;
     bool saw_extmap = false;
     RtpHeaderExtensionMap parsed_ext_map{0, 0, 0, 0, 0, 0, 0};
+  };
+
+  auto trim_ws = [](std::string_view sv) -> std::string {
+    while (!sv.empty() && (sv.front() == ' ' || sv.front() == '\t')) {
+      sv.remove_prefix(1);
+    }
+    while (!sv.empty() && (sv.back() == ' ' || sv.back() == '\t')) {
+      sv.remove_suffix(1);
+    }
+    return std::string(sv);
   };
 
   PureVideoSdpDescription out;
   std::vector<MSectionCodecScratch> scratches;
   RtpHeaderExtensionMap session_ext_map{0, 0, 0, 0, 0, 0, 0};
   bool saw_session_extmap = false;
+  bool saw_any_active_video_m = false;
+
+  // 保护会话级 / 首个被接受 BUNDLE 段的 ICE 与 DTLS 传输参数不被尾部附加媒体段覆盖，
+  // 同时保留被拒 BUNDLE 首段（如浏览器 Audio+Video Offer 中的 m=audio）作为兜底参数来源。
+  bool has_primary_ufrag = false;
+  bool has_primary_pwd = false;
+  bool has_primary_fp = false;
+  bool has_primary_setup = false;
+  std::string fallback_ufrag;
+  std::string fallback_pwd;
+  std::string fallback_fp;
+  std::string fallback_setup;
+  size_t accepted_m_count = 0;
 
   std::istringstream iss{std::string(sdp_text)};
   std::string line;
   VideoMediaTrackDesc* cur_m = nullptr;
   MSectionCodecScratch* cur_scratch = nullptr;
+  RejectedMediaDesc* cur_rejected = nullptr;
+  bool cur_rejected_was_active_in_offer = false;
   bool in_data_m = false;
 
   auto parse_extmap_line = [](std::string_view ext_body,
@@ -971,6 +1213,23 @@ std::optional<PureVideoSdpDescription> PureVideoSdpDescription::Parse(
     return true;
   };
 
+  auto record_candidate_line = [&](const std::string& cand_line) {
+    if (std::find(out.raw_candidate_lines.begin(), out.raw_candidate_lines.end(),
+                  cand_line) == out.raw_candidate_lines.end()) {
+      out.raw_candidate_lines.push_back(cand_line);
+    }
+    if (auto c = IceCandidate::FromSdpAttribute(cand_line)) {
+      const bool dup = std::any_of(
+          out.candidates.begin(), out.candidates.end(),
+          [&c](const IceCandidate& existing) {
+            return existing.address == c->address && existing.type == c->type;
+          });
+      if (!dup) {
+        out.candidates.push_back(*c);
+      }
+    }
+  };
+
   while (std::getline(iss, line)) {
     if (!line.empty() && line.back() == '\r') {
       line.pop_back();
@@ -981,11 +1240,34 @@ std::optional<PureVideoSdpDescription> PureVideoSdpDescription::Parse(
 
     if (line.rfind("m=video ", 0) == 0) {
       in_data_m = false;
+      cur_rejected = nullptr;
+      cur_rejected_was_active_in_offer = false;
+      std::istringstream vms(line.substr(8));
+      std::string port_tok;
+      std::string proto_tok;
+      std::string fmt_tok;
+      if ((vms >> port_tok >> proto_tok >> fmt_tok) && port_tok == "0") {
+        cur_m = nullptr;
+        cur_scratch = nullptr;
+        out.m_section_order.push_back(SdpMediaKind::kUnsupported);
+        out.rejected_m_sections.push_back(
+            RejectedMediaDesc{"video", proto_tok, fmt_tok, ""});
+        cur_rejected = &out.rejected_m_sections.back();
+        continue;
+      }
+      saw_any_active_video_m = true;
+      ++accepted_m_count;
       out.m_section_order.push_back(SdpMediaKind::kVideo);
       out.video_m_sections.emplace_back();
       scratches.emplace_back();
       cur_m = &out.video_m_sections.back();
       cur_scratch = &scratches.back();
+      if (!proto_tok.empty()) {
+        cur_scratch->proto = proto_tok;
+      }
+      if (!fmt_tok.empty()) {
+        cur_scratch->first_fmt = fmt_tok;
+      }
       // RFC 3264 第 5.1 节：若未显式声明方向属性，默认方向为 sendrecv。
       cur_m->direction_send = true;
       cur_m->direction_recv = true;
@@ -994,6 +1276,8 @@ std::optional<PureVideoSdpDescription> PureVideoSdpDescription::Parse(
     if (line.rfind("m=application ", 0) == 0) {
       cur_m = nullptr;
       cur_scratch = nullptr;
+      cur_rejected = nullptr;
+      cur_rejected_was_active_in_offer = false;
       in_data_m = false;
       // 解析 RFC 8841 `m=application <port> UDP/DTLS/SCTP webrtc-datachannel`
       // 及旧版草案 `m=application <port> DTLS/SCTP <sctp-port>`。
@@ -1009,6 +1293,7 @@ std::optional<PureVideoSdpDescription> PureVideoSdpDescription::Parse(
                        });
         if (proto_upper.find("SCTP") != std::string::npos &&
             !out.data_m_section.has_value()) {
+          ++accepted_m_count;
           DataChannelMediaDesc ddesc;
           uint16_t legacy_port = 0;
           if (ParseUint16(fmt_tok, &legacy_port) && legacy_port > 0) {
@@ -1017,24 +1302,85 @@ std::optional<PureVideoSdpDescription> PureVideoSdpDescription::Parse(
           out.data_m_section = ddesc;
           out.m_section_order.push_back(SdpMediaKind::kApplication);
           in_data_m = true;
+          continue;
+        }
+      }
+      out.m_section_order.push_back(SdpMediaKind::kUnsupported);
+      out.rejected_m_sections.push_back(
+          RejectedMediaDesc{"application",
+                            proto_tok.empty() ? "UDP/DTLS/SCTP" : proto_tok,
+                            fmt_tok.empty() ? "webrtc-datachannel" : fmt_tok,
+                            ""});
+      cur_rejected = &out.rejected_m_sections.back();
+      cur_rejected_was_active_in_offer = (port_tok != "0");
+      continue;
+    }
+    if (line.rfind("m=", 0) == 0) {
+      // 记录非视频/非数据通道的 m= 媒体段（如音频段），在 Answer 中按 RFC 3264 输出端口 0 拒绝行。
+      cur_m = nullptr;
+      cur_scratch = nullptr;
+      in_data_m = false;
+      std::istringstream oms(line.substr(2));
+      std::string kind_tok;
+      std::string port_tok;
+      std::string proto_tok;
+      std::string fmt_tok;
+      oms >> kind_tok >> port_tok >> proto_tok >> fmt_tok;
+      out.m_section_order.push_back(SdpMediaKind::kUnsupported);
+      out.rejected_m_sections.push_back(RejectedMediaDesc{
+          kind_tok.empty() ? "audio" : kind_tok,
+          proto_tok.empty() ? "UDP/TLS/RTP/SAVPF" : proto_tok,
+          fmt_tok.empty() ? "0" : fmt_tok, ""});
+      cur_rejected = &out.rejected_m_sections.back();
+      cur_rejected_was_active_in_offer = (port_tok != "0");
+      continue;
+    }
+
+    if (cur_rejected != nullptr) {
+      if (line.rfind("a=mid:", 0) == 0) {
+        cur_rejected->mid = trim_ws(std::string_view(line).substr(6));
+      } else if (cur_rejected_was_active_in_offer) {
+        // RFC 8843 BUNDLE：浏览器常将全部 ICE 候选及共享传输属性置于首个 m=audio 段内！
+        if (line.rfind("a=candidate:", 0) == 0) {
+          record_candidate_line(line);
+        } else if (line.rfind("a=ice-ufrag:", 0) == 0 && fallback_ufrag.empty()) {
+          fallback_ufrag = trim_ws(std::string_view(line).substr(12));
+        } else if (line.rfind("a=ice-pwd:", 0) == 0 && fallback_pwd.empty()) {
+          fallback_pwd = trim_ws(std::string_view(line).substr(10));
+        } else if (line.rfind("a=fingerprint:", 0) == 0 && fallback_fp.empty()) {
+          const size_t sp = line.find(' ', 14);
+          if (sp != std::string::npos) {
+            std::string hash_alg = line.substr(14, sp - 14);
+            std::transform(hash_alg.begin(), hash_alg.end(), hash_alg.begin(),
+                           [](unsigned char c) {
+                             return static_cast<char>(std::tolower(c));
+                           });
+            if (hash_alg == "sha-256") {
+              fallback_fp = trim_ws(std::string_view(line).substr(sp + 1));
+            }
+          }
+        } else if (line.rfind("a=setup:", 0) == 0 && fallback_setup.empty()) {
+          fallback_setup = trim_ws(std::string_view(line).substr(8));
         }
       }
       continue;
     }
-    if (line.rfind("m=", 0) == 0) {
-      // 忽略其他非视频/非数据通道的 m= 媒体段（如音频段）。
-      cur_m = nullptr;
-      cur_scratch = nullptr;
-      in_data_m = false;
-      continue;
-    }
 
+    const bool allow_transport_update = (accepted_m_count <= 1);
     if (line == "a=ice-lite") {
       out.ice_params.ice_lite = true;
     } else if (line.rfind("a=ice-ufrag:", 0) == 0) {
-      out.ice_params.ufrag = line.substr(12);
+      const std::string val = trim_ws(std::string_view(line).substr(12));
+      if (!val.empty() && (!has_primary_ufrag || allow_transport_update)) {
+        out.ice_params.ufrag = val;
+        has_primary_ufrag = true;
+      }
     } else if (line.rfind("a=ice-pwd:", 0) == 0) {
-      out.ice_params.pwd = line.substr(10);
+      const std::string val = trim_ws(std::string_view(line).substr(10));
+      if (!val.empty() && (!has_primary_pwd || allow_transport_update)) {
+        out.ice_params.pwd = val;
+        has_primary_pwd = true;
+      }
     } else if (line.rfind("a=fingerprint:", 0) == 0) {
       const size_t sp = line.find(' ', 14);
       if (sp != std::string::npos) {
@@ -1044,15 +1390,22 @@ std::optional<PureVideoSdpDescription> PureVideoSdpDescription::Parse(
                          return static_cast<char>(std::tolower(c));
                        });
         if (hash_alg == "sha-256") {
-          out.dtls_fingerprint_sha256 = line.substr(sp + 1);
+          const std::string fp_val =
+              trim_ws(std::string_view(line).substr(sp + 1));
+          if (!fp_val.empty() && (!has_primary_fp || allow_transport_update)) {
+            out.dtls_fingerprint_sha256 = fp_val;
+            has_primary_fp = true;
+          }
         }
       }
     } else if (line.rfind("a=setup:", 0) == 0) {
-      out.dtls_setup = line.substr(8);
-    } else if (line.rfind("a=candidate:", 0) == 0) {
-      if (auto c = IceCandidate::FromSdpAttribute(line)) {
-        out.candidates.push_back(*c);
+      const std::string val = trim_ws(std::string_view(line).substr(8));
+      if (!val.empty() && (!has_primary_setup || allow_transport_update)) {
+        out.dtls_setup = val;
+        has_primary_setup = true;
       }
+    } else if (line.rfind("a=candidate:", 0) == 0) {
+      record_candidate_line(line);
     } else if (line.rfind("a=extmap:", 0) == 0 && cur_m == nullptr &&
                !in_data_m) {
       if (parse_extmap_line(std::string_view(line).substr(9),
@@ -1061,10 +1414,11 @@ std::optional<PureVideoSdpDescription> PureVideoSdpDescription::Parse(
       }
     } else if (in_data_m && out.data_m_section.has_value()) {
       if (line.rfind("a=mid:", 0) == 0) {
-        out.data_m_section->mid = line.substr(6);
+        out.data_m_section->mid = trim_ws(std::string_view(line).substr(6));
       } else if (line.rfind("a=sctp-port:", 0) == 0) {
         uint16_t sp = 5000;
-        if (ParseUint16(std::string_view(line).substr(12), &sp) && sp > 0) {
+        if (ParseUint16(trim_ws(std::string_view(line).substr(12)), &sp) &&
+            sp > 0) {
           out.data_m_section->sctp_port = sp;
         }
       } else if (line.rfind("a=sctpmap:", 0) == 0) {
@@ -1077,14 +1431,15 @@ std::optional<PureVideoSdpDescription> PureVideoSdpDescription::Parse(
           out.data_m_section->sctp_port = sp;
         }
       } else if (line.rfind("a=max-message-size:", 0) == 0) {
+        // RFC 8841 §6：max-message-size=0 为合法值，代表不限制最大消息字节数。
         uint32_t mms = 262144;
-        if (ParseUint32(std::string_view(line).substr(19), &mms) && mms > 0) {
+        if (ParseUint32(trim_ws(std::string_view(line).substr(19)), &mms)) {
           out.data_m_section->max_message_size = mms;
         }
       }
     } else if (cur_m != nullptr && cur_scratch != nullptr) {
       if (line.rfind("a=mid:", 0) == 0) {
-        cur_m->mid = line.substr(6);
+        cur_m->mid = trim_ws(std::string_view(line).substr(6));
       } else if (line == "a=sendrecv") {
         cur_m->direction_send = true;
         cur_m->direction_recv = true;
@@ -1146,7 +1501,7 @@ std::optional<PureVideoSdpDescription> PureVideoSdpDescription::Parse(
               apt_val = apt_val.substr(0, semi);
             }
             uint16_t assoc_pt = 0;
-            if (ParseUint16(apt_val, &assoc_pt) && assoc_pt <= 127) {
+            if (ParseUint16(trim_ws(apt_val), &assoc_pt) && assoc_pt <= 127) {
               cur_scratch->apt_to_rtx_pt[static_cast<uint8_t>(assoc_pt)] =
                   static_cast<uint8_t>(pt);
             }
@@ -1159,7 +1514,7 @@ std::optional<PureVideoSdpDescription> PureVideoSdpDescription::Parse(
               rw_val = rw_val.substr(0, semi);
             }
             uint32_t rw_us = 0;
-            if (ParseUint32(rw_val, &rw_us) && rw_us > 0) {
+            if (ParseUint32(trim_ws(rw_val), &rw_us) && rw_us > 0) {
               cur_scratch->pt_to_repair_window_us[static_cast<uint8_t>(pt)] =
                   rw_us;
             }
@@ -1169,9 +1524,32 @@ std::optional<PureVideoSdpDescription> PureVideoSdpDescription::Parse(
                          lower_params.begin(), [](unsigned char c) {
                            return static_cast<char>(std::tolower(c));
                          });
-          if (lower_params.find("packetization-mode=1") != std::string::npos &&
+          const size_t plid_pos = lower_params.find("profile-level-id=");
+          if (plid_pos != std::string::npos) {
+            std::string_view plid_sv =
+                std::string_view(lower_params).substr(plid_pos + 17);
+            const size_t semi = plid_sv.find_first_of("; \t");
+            if (semi != std::string_view::npos) {
+              plid_sv = plid_sv.substr(0, semi);
+            }
+            if (plid_sv.size() == 6 &&
+                std::all_of(plid_sv.begin(), plid_sv.end(),
+                            [](unsigned char c) { return std::isxdigit(c); })) {
+              cur_scratch->pt_to_profile_level_id[static_cast<uint8_t>(pt)] =
+                  std::string(plid_sv);
+            }
+          }
+          const bool has_pm1 =
+              lower_params.find("packetization-mode=1") != std::string::npos;
+          if (has_pm1 &&
+              !cur_scratch->preferred_h264_pm1_pt.has_value()) {
+            cur_scratch->preferred_h264_pm1_pt = static_cast<uint8_t>(pt);
+          }
+          if (has_pm1 &&
               (lower_params.find("42e0") != std::string::npos ||
-               lower_params.find("4200") != std::string::npos) &&
+               lower_params.find("4200") != std::string::npos ||
+               lower_params.find("4280") != std::string::npos ||
+               lower_params.find("42c0") != std::string::npos) &&
               !cur_scratch->preferred_h264_cb_pt.has_value()) {
             cur_scratch->preferred_h264_cb_pt = static_cast<uint8_t>(pt);
           }
@@ -1181,9 +1559,10 @@ std::optional<PureVideoSdpDescription> PureVideoSdpDescription::Parse(
         uint32_t s1 = 0;
         uint32_t s2 = 0;
         if (fg >> s1 >> s2) {
-          if (cur_m->primary_ssrc == 0 || cur_m->primary_ssrc == s1) {
+          if (!cur_scratch->has_fid_primary || cur_m->primary_ssrc == s1) {
             cur_m->primary_ssrc = s1;
             cur_m->primary_rtx_ssrc = s2;
+            cur_scratch->has_fid_primary = true;
           }
         }
       } else if (line.rfind("a=ssrc-group:FEC-FR ", 0) == 0) {
@@ -1191,7 +1570,8 @@ std::optional<PureVideoSdpDescription> PureVideoSdpDescription::Parse(
         uint32_t s1 = 0;
         uint32_t s2 = 0;
         if (fg >> s1 >> s2) {
-          if (cur_m->primary_ssrc == 0 || cur_m->primary_ssrc == s1) {
+          if (!cur_scratch->has_fid_primary || cur_m->primary_ssrc == 0 ||
+              cur_m->primary_ssrc == s1) {
             cur_m->primary_ssrc = s1;
             cur_m->flexfec_ssrc = s2;
           }
@@ -1203,9 +1583,46 @@ std::optional<PureVideoSdpDescription> PureVideoSdpDescription::Parse(
     }
   }
 
-  for (size_t i = 0; i < out.video_m_sections.size(); ++i) {
-    auto& m = out.video_m_sections[i];
-    const auto& sc = scratches[i];
+  if (out.ice_params.ufrag.empty() && !fallback_ufrag.empty()) {
+    out.ice_params.ufrag = fallback_ufrag;
+  }
+  if (out.ice_params.pwd.empty() && !fallback_pwd.empty()) {
+    out.ice_params.pwd = fallback_pwd;
+  }
+  if (out.dtls_fingerprint_sha256.empty() && !fallback_fp.empty()) {
+    out.dtls_fingerprint_sha256 = fallback_fp;
+  }
+  if (!has_primary_setup && !fallback_setup.empty()) {
+    out.dtls_setup = fallback_setup;
+  }
+
+  // 过滤无 H.264/H.265 负载类型的 m=video 段（如纯 VP8/VP9/AV1 视频段），绝不凭空伪造 PT=96 H.264！
+  std::vector<VideoMediaTrackDesc> valid_video_sections;
+  std::vector<SdpMediaKind> rebuilt_order;
+  std::vector<RejectedMediaDesc> rebuilt_rejected;
+  size_t orig_vid_idx = 0;
+  size_t orig_rej_idx = 0;
+  for (SdpMediaKind kind : out.m_section_order) {
+    if (kind == SdpMediaKind::kUnsupported) {
+      rebuilt_order.push_back(SdpMediaKind::kUnsupported);
+      if (orig_rej_idx < out.rejected_m_sections.size()) {
+        rebuilt_rejected.push_back(std::move(out.rejected_m_sections[orig_rej_idx++]));
+      }
+      continue;
+    }
+    if (kind == SdpMediaKind::kApplication) {
+      rebuilt_order.push_back(SdpMediaKind::kApplication);
+      continue;
+    }
+    const size_t vi = orig_vid_idx++;
+    auto& m = out.video_m_sections[vi];
+    const auto& sc = scratches[vi];
+    if (sc.h264_pts.empty() && sc.h265_pts.empty()) {
+      rebuilt_order.push_back(SdpMediaKind::kUnsupported);
+      rebuilt_rejected.push_back(
+          RejectedMediaDesc{"video", sc.proto, sc.first_fmt, m.mid});
+      continue;
+    }
     if (sc.saw_extmap) {
       m.ext_map = sc.parsed_ext_map;
     } else if (saw_session_extmap) {
@@ -1217,8 +1634,22 @@ std::optional<PureVideoSdpDescription> PureVideoSdpDescription::Parse(
       m.video_pt = sc.h265_pts.front();
     } else if (!sc.h264_pts.empty()) {
       m.codec = VideoCodec::kH264;
-      m.video_pt = sc.preferred_h264_cb_pt.value_or(sc.h264_pts.front());
-    } else if (!sc.h265_pts.empty()) {
+      if (sc.preferred_h264_cb_pt.has_value() &&
+          std::find(sc.h264_pts.begin(), sc.h264_pts.end(),
+                    *sc.preferred_h264_cb_pt) != sc.h264_pts.end()) {
+        m.video_pt = *sc.preferred_h264_cb_pt;
+      } else if (sc.preferred_h264_pm1_pt.has_value() &&
+                 std::find(sc.h264_pts.begin(), sc.h264_pts.end(),
+                           *sc.preferred_h264_pm1_pt) != sc.h264_pts.end()) {
+        m.video_pt = *sc.preferred_h264_pm1_pt;
+      } else {
+        m.video_pt = sc.h264_pts.front();
+      }
+      const auto plid_it = sc.pt_to_profile_level_id.find(m.video_pt);
+      if (plid_it != sc.pt_to_profile_level_id.end()) {
+        m.h264_profile_level_id = plid_it->second;
+      }
+    } else {
       m.codec = VideoCodec::kH265;
       m.video_pt = sc.h265_pts.front();
     }
@@ -1242,8 +1673,17 @@ std::optional<PureVideoSdpDescription> PureVideoSdpDescription::Parse(
     } else {
       m.has_flexfec = false;
     }
-  }
 
+    rebuilt_order.push_back(SdpMediaKind::kVideo);
+    valid_video_sections.push_back(std::move(m));
+  }
+  out.video_m_sections = std::move(valid_video_sections);
+  out.m_section_order = std::move(rebuilt_order);
+  out.rejected_m_sections = std::move(rebuilt_rejected);
+
+  if (saw_any_active_video_m && out.video_m_sections.empty()) {
+    return std::nullopt;
+  }
   if (out.ice_params.ufrag.empty() && out.video_m_sections.empty() &&
       !out.data_m_section.has_value()) {
     return std::nullopt;

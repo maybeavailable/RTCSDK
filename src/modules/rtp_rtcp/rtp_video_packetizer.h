@@ -27,6 +27,13 @@ struct DepacketizedUnit {
   std::vector<uint8_t> annexb_bytes;
   bool is_first_in_frame = false;
   bool is_keyframe = false;
+  bool is_fu = false;
+  bool is_fu_start = false;
+  bool is_fu_end = false;
+  uint8_t nalu_type = 0;
+  bool has_sps = false;
+  bool has_pps = false;
+  bool has_vps = false;
 };
 
 class H264Packetizer {

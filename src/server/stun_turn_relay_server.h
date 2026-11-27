@@ -48,6 +48,9 @@ struct StunTurnServerConfig {
   uint32_t max_allocations = 2048;
   // 公网生产环境可关闭环回对端转发以防止 SSRF 攻击；本地自测保持开启。
   bool allow_loopback_peers = true;
+  // 默认阻断向私网段（10/8, 172.16/12, 192.168/16, 100.64/10）转发以防止内网 SSRF；
+  // 仅当显式开启或本地自测绑定 127.0.0.1 时放行。
+  bool allow_private_lan_peers = false;
 };
 
 struct StunTurnStatsSnapshot {
@@ -70,7 +73,9 @@ class StunTurnRelayServer {
   bool Start();
   void Stop();
 
-  uint16_t port() const { return bound_port_; }
+  uint16_t port() const {
+    return bound_port_.load(std::memory_order_acquire);
+  }
   StunTurnStatsSnapshot GetStatsSnapshot() const;
 
   // 生成兼容 coturn TURN REST API 的 `<expiry_ts>:<user_id>` 临时密码（Base64(HMAC-SHA1)）。
@@ -93,19 +98,28 @@ class StunTurnRelayServer {
                                StunMessageType error_resp_type,
                                StunMessage* out_verified_msg,
                                std::string* out_username,
-                               std::string* out_integrity_key);
-  std::optional<std::string> LookupUserPassword(std::string_view username,
-                                                int64_t unix_now_sec) const;
-  std::string GenerateNonce(int64_t unix_now_sec) const;
-  bool VerifyNonce(std::string_view nonce, int64_t unix_now_sec) const;
+                               std::string* out_integrity_key,
+                               std::optional<uint32_t>* out_cred_max_ttl_sec =
+                                   nullptr);
+  std::optional<std::string> LookupUserPassword(
+      std::string_view username,
+      int64_t unix_now_sec,
+      std::optional<uint32_t>* out_cred_max_ttl_sec = nullptr) const;
+  std::string GenerateNonce(int64_t unix_now_sec,
+                            const boost::asio::ip::address& client_ip) const;
+  bool VerifyNonce(std::string_view nonce,
+                   int64_t unix_now_sec,
+                   const boost::asio::ip::address& client_ip) const;
   void SendErrorResponse(StunMessageType error_type,
                          const StunTransactionId& tx_id,
                          int code,
                          std::string_view reason,
                          bool include_challenge,
-                         const boost::asio::ip::udp::endpoint& to);
+                         const boost::asio::ip::udp::endpoint& to,
+                         std::string_view integrity_key = "");
 
-  bool IsAllowedPeerEndpoint(const boost::asio::ip::udp::endpoint& peer_ep) const;
+  bool IsAllowedPeerEndpoint(const boost::asio::ip::udp::endpoint& peer_ep,
+                             const TurnAllocation* sender_alloc = nullptr) const;
   boost::asio::ip::address_v4 DetermineAdvertisedAddress(
       const boost::asio::ip::udp::endpoint& client_ep) const;
   std::shared_ptr<TurnAllocation> FindHairpinTarget(
@@ -121,6 +135,9 @@ class StunTurnRelayServer {
       ArrayView<const uint8_t> payload,
       Timestamp now);
   void StartRelayReceiveLoop(const std::shared_ptr<TurnAllocation>& alloc);
+  std::shared_ptr<TurnAllocation> LookupActiveAllocation(
+      const boost::asio::ip::udp::endpoint& client_ep,
+      Timestamp now);
   void DestroyAllocation(const boost::asio::ip::udp::endpoint& client_ep);
 
   Clock* const clock_;
@@ -133,7 +150,7 @@ class StunTurnRelayServer {
   boost::asio::ip::udp::socket control_socket_;
   std::array<uint8_t, 2048> rx_buf_{};
   boost::asio::ip::udp::endpoint sender_ep_;
-  uint16_t bound_port_ = 0;
+  std::atomic<uint16_t> bound_port_{0};
   uint16_t next_relay_port_cursor_ = 49152;
 
   std::map<boost::asio::ip::udp::endpoint, std::shared_ptr<TurnAllocation>>

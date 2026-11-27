@@ -210,6 +210,11 @@ class SendSideBandwidthEstimation {
   void SetAcknowledgedRate(std::optional<DataRate> acked_rate,
                            Timestamp at_time);
   void UpdateEstimate(Timestamp at_time);
+  void UpdateRtt(TimeDelta rtt) {
+    if (rtt > TimeDelta::Zero()) {
+      last_rtt_ = rtt;
+    }
+  }
 
   DataRate target_rate() const { return current_target_; }
   uint8_t fraction_loss() const { return last_fraction_loss_; }
@@ -261,6 +266,8 @@ class ProbeBitrateEstimator {
 
   std::map<int, AggregatedCluster> clusters_;
   std::optional<DataRate> estimated_data_rate_;
+  std::optional<int> last_estimated_cluster_id_;
+  int max_consumed_cluster_id_ = -1;
   bool last_probe_saturated_ = false;
 };
 
@@ -277,9 +284,8 @@ class ProbeController {
       bool bwe_limited_due_to_packet_loss,
       Timestamp at_time);
   std::vector<ProbeClusterConfig> RequestProbe(Timestamp at_time);
-  void set_alr_start_time(std::optional<Timestamp> alr_start_time) {
-    alr_start_time_ = alr_start_time;
-  }
+  void set_alr_start_time(std::optional<Timestamp> alr_start_time);
+  void set_alr_ended_time(Timestamp at_time) { alr_end_time_ = at_time; }
   std::vector<ProbeClusterConfig> Process(Timestamp at_time);
 
  private:
@@ -301,6 +307,8 @@ class ProbeController {
   DataRate min_bitrate_to_probe_further_ = DataRate::Infinity();
   Timestamp time_last_probing_initiated_ = Timestamp::MinusInfinity();
   std::optional<Timestamp> alr_start_time_;
+  std::optional<Timestamp> alr_end_time_;
+  bool pending_alr_exit_probe_ = false;
   int32_t next_probe_cluster_id_ = 1;
 };
 
@@ -322,7 +330,9 @@ class TransportFeedbackAdapter {
  private:
   struct PacketFeedbackRecord {
     SentPacket sent;
+    bool in_flight = false;
     bool has_been_acked = false;
+    bool reported_lost = false;
   };
 
   RtpSeqUnwrapper seq_unwrapper_;
@@ -354,6 +364,7 @@ class GoogCcNetworkController {
   NetworkControlUpdate OnReceiverReport(Timestamp at_time,
                                         uint8_t fraction_lost,
                                         TimeDelta rtt);
+  NetworkControlUpdate OnRoundTripTimeUpdate(Timestamp at_time, TimeDelta rtt);
   NetworkControlUpdate OnProcessInterval(Timestamp at_time);
 
   DataRate TargetRate() const { return bandwidth_estimation_.target_rate(); }

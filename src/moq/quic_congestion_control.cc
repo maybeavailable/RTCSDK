@@ -123,6 +123,10 @@ void BbrQuicCongestionController::UpdateBandwidthAndRound(
     int64_t now_us) {
   round_start_ = false;
   for (const auto& pkt : acked) {
+    if (delivered_bytes_ < pkt.delivered_bytes_at_send) {
+      delivered_bytes_ = pkt.delivered_bytes_at_send;
+      next_round_delivered_ = delivered_bytes_;
+    }
     delivered_bytes_ += pkt.bytes;
     delivered_time_us_ = now_us;
 
@@ -183,8 +187,11 @@ void BbrQuicCongestionController::UpdateProbeBwCycle(int64_t now_us,
   const int64_t phase_elapsed_us = now_us - cycle_stamp_us_;
   const int64_t rtt_ref_us = std::max<int64_t>(4000, min_rtt_us_);
   bool should_advance = (phase_elapsed_us > rtt_ref_us);
-  if (pacing_gain_ > 1.0 && bytes_in_flight < TargetBdpBytes(pacing_gain_)) {
-    should_advance = (phase_elapsed_us > rtt_ref_us);
+  if (pacing_gain_ > 1.0) {
+    should_advance =
+        (phase_elapsed_us > rtt_ref_us) &&
+        (bytes_in_flight >= TargetBdpBytes(pacing_gain_) ||
+         phase_elapsed_us > 2 * rtt_ref_us);
   } else if (pacing_gain_ < 1.0 && bytes_in_flight <= TargetBdpBytes(1.0)) {
     should_advance = true;
   }
@@ -259,8 +266,9 @@ void BbrQuicCongestionController::RecalculateCwndAndPacing(
   const int64_t init_pacing_bps = ComputeRateBpsFromCwnd(
       10 * mss_, min_rtt_us_ > 0 ? min_rtt_us_ : 30'000, kBbrHighGain);
   if (bw_bps > 0) {
-    const int64_t candidate_bps =
-        static_cast<int64_t>(static_cast<double>(bw_bps) * pacing_gain_);
+    const double scaled = std::clamp(
+        static_cast<double>(bw_bps) * pacing_gain_, 0.0, 1.0e12);
+    const int64_t candidate_bps = static_cast<int64_t>(scaled);
     if (full_bw_reached_) {
       pacing_rate_bps_ = std::max<int64_t>(100'000, candidate_bps);
     } else {
@@ -365,6 +373,8 @@ QuicCcMigrationState BbrQuicCongestionController::ExportMigrationState() const {
   st.pacing_rate_bps = pacing_rate_bps_;
   st.bandwidth_estimate_bps = GetBandwidthEstimateBps();
   st.min_rtt_us = min_rtt_us_;
+  st.smoothed_rtt_us = min_rtt_us_;
+  st.delivered_bytes = delivered_bytes_;
   return st;
 }
 
@@ -373,8 +383,14 @@ void BbrQuicCongestionController::ImportMigrationState(
     int64_t now_us) {
   cwnd_bytes_ = std::clamp(state.cwnd_bytes, 4 * mss_, kMaxCwndBytes);
   ssthresh_bytes_ = std::max(4 * mss_, state.ssthresh_bytes);
+  delivered_bytes_ = state.delivered_bytes;
+  next_round_delivered_ = delivered_bytes_;
+  delivered_time_us_ = now_us;
   if (state.min_rtt_us > 0) {
     min_rtt_us_ = state.min_rtt_us;
+    min_rtt_timestamp_us_ = now_us;
+  } else if (state.smoothed_rtt_us > 0) {
+    min_rtt_us_ = state.smoothed_rtt_us;
     min_rtt_timestamp_us_ = now_us;
   }
   if (state.bandwidth_estimate_bps > 0) {
@@ -471,6 +487,7 @@ void Bbr2QuicCongestionController::EnterProbeBwUp(int64_t now_us) {
   state_ = State::kProbeBwUp;
   pacing_gain_ = 1.25;
   cwnd_gain_ = 2.25;
+  probe_up_rounds_ = 0;
   cycle_stamp_us_ = now_us;
   if (inflight_hi_ >= kMaxCwndBytes) {
     inflight_hi_ = std::max(TargetBdpBytes(1.25), cwnd_bytes_);
@@ -487,6 +504,10 @@ void Bbr2QuicCongestionController::OnCongestionEvent(
   round_start_ = false;
   size_t newly_acked = 0;
   for (const auto& pkt : acked_packets) {
+    if (delivered_bytes_ < pkt.delivered_bytes_at_send) {
+      delivered_bytes_ = pkt.delivered_bytes_at_send;
+      next_round_delivered_ = delivered_bytes_;
+    }
     newly_acked += pkt.bytes;
     round_acked_bytes_ += pkt.bytes;
     delivered_bytes_ += pkt.bytes;
@@ -534,18 +555,20 @@ void Bbr2QuicCongestionController::OnCongestionEvent(
     full_bw_reached_ = true;
   }
 
-  // BBRv2 在非 Startup 等状态下的短期丢包响应。
-  if (!lost_packets.empty() && IsLossTooHighInRound()) {
+  // BBRv2 单轮次门控的短期丢包响应（同一轮次内多次 ACK 检测到丢包仅执行一次折减）。
+  if (!lost_packets.empty() && !loss_round_handled_ && IsLossTooHighInRound()) {
     if (state_ == State::kStartup) {
       if (round_lost_pkts_ >= 4) {
         full_bw_reached_ = true;
         inflight_hi_ = std::max(TargetBdpBytes(1.0), max_inflight_in_round_);
         state_ = State::kDrain;
         pacing_gain_ = kBbrDrainGain;
+        loss_round_handled_ = true;
       }
     } else if (state_ == State::kProbeBwUp) {
       inflight_hi_ = std::max(TargetBdpBytes(1.0), bytes_in_flight);
       EnterProbeBwDown(now_us);
+      loss_round_handled_ = true;
     } else {
       const int64_t cur_bw = GetBandwidthEstimateBps();
       bw_lo_bps_ = std::max<int64_t>(
@@ -556,6 +579,7 @@ void Bbr2QuicCongestionController::OnCongestionEvent(
           4 * mss_,
           static_cast<size_t>(static_cast<double>(std::min(cwnd_bytes_, inflight_lo_)) *
                               0.80));
+      loss_round_handled_ = true;
     }
   }
 
@@ -570,10 +594,14 @@ void Bbr2QuicCongestionController::OnCongestionEvent(
         full_bw_reached_ = true;
       }
     }
+    if (state_ == State::kProbeBwUp) {
+      ++probe_up_rounds_;
+    }
     round_acked_bytes_ = 0;
     round_lost_bytes_ = 0;
     round_lost_pkts_ = 0;
     max_inflight_in_round_ = bytes_in_flight;
+    loss_round_handled_ = false;
   }
 
   if (state_ == State::kStartup && full_bw_reached_) {
@@ -603,7 +631,7 @@ void Bbr2QuicCongestionController::OnCongestionEvent(
         EnterProbeBwUp(now_us);
       }
       break;
-    case State::kProbeBwUp:
+    case State::kProbeBwUp: {
       if (newly_acked > 0 && bytes_in_flight + mss_ >= inflight_hi_) {
         probe_up_acked_ += newly_acked;
         if (probe_up_acked_ >= probe_up_cnt_ * mss_) {
@@ -613,11 +641,17 @@ void Bbr2QuicCongestionController::OnCongestionEvent(
           probe_up_cnt_ = std::min<size_t>(64, probe_up_cnt_ * 2);
         }
       }
-      if ((now_us - cycle_stamp_us_) >= 2 * ref_rtt_us &&
-          bytes_in_flight > TargetBdpBytes(1.25) + 2 * mss_) {
+      const bool app_limited_exit =
+          last_sample_app_limited_ &&
+          (probe_up_rounds_ >= 2 ||
+           (now_us - cycle_stamp_us_) >= 2 * ref_rtt_us);
+      if (app_limited_exit ||
+          ((now_us - cycle_stamp_us_) >= 2 * ref_rtt_us &&
+           bytes_in_flight > TargetBdpBytes(1.25) + 2 * mss_)) {
         EnterProbeBwDown(now_us);
       }
       break;
+    }
     default:
       break;
   }
@@ -625,18 +659,34 @@ void Bbr2QuicCongestionController::OnCongestionEvent(
   if (state_ != State::kProbeRtt && rtt_expired && full_bw_reached_) {
     state_ = State::kProbeRtt;
     pacing_gain_ = 1.0;
-    probe_rtt_done_us_ = now_us + std::max(kProbeRttDurationUs, ref_rtt_us);
-  } else if (state_ == State::kProbeRtt && now_us >= probe_rtt_done_us_) {
-    min_rtt_stamp_us_ = now_us;
-    EnterProbeBwCruise(now_us);
+    probe_rtt_done_us_ = 0;
+    probe_rtt_round_done_ = false;
+  }
+  if (state_ == State::kProbeRtt) {
+    if (probe_rtt_done_us_ == 0 && bytes_in_flight <= 4 * mss_) {
+      probe_rtt_done_us_ = now_us + std::max(kProbeRttDurationUs, ref_rtt_us);
+      probe_rtt_round_done_ = false;
+      next_round_delivered_ = delivered_bytes_;
+    } else if (probe_rtt_done_us_ != 0) {
+      if (round_start_) {
+        probe_rtt_round_done_ = true;
+      }
+      if ((probe_rtt_round_done_ || bytes_in_flight == 0) &&
+          now_us >= probe_rtt_done_us_) {
+        min_rtt_stamp_us_ = now_us;
+        EnterProbeBwCruise(now_us);
+      }
+    }
   }
 
   const int64_t eff_bw = std::min(max_bw_filter_.GetBest(), bw_lo_bps_);
   const int64_t init_pacing_bps = ComputeRateBpsFromCwnd(
       10 * mss_, min_rtt_us_ > 0 ? min_rtt_us_ : 30'000, kBbrHighGain);
   if (eff_bw > 0) {
-    const int64_t candidate_bps = std::max<int64_t>(
-        100'000, static_cast<int64_t>(static_cast<double>(eff_bw) * pacing_gain_));
+    const double scaled = std::clamp(
+        static_cast<double>(eff_bw) * pacing_gain_, 0.0, 1.0e12);
+    const int64_t candidate_bps =
+        std::max<int64_t>(100'000, static_cast<int64_t>(scaled));
     pacing_rate_bps_ = full_bw_reached_
                            ? candidate_bps
                            : std::max({pacing_rate_bps_, init_pacing_bps,
@@ -668,11 +718,18 @@ void Bbr2QuicCongestionController::OnCongestionEvent(
 
 void Bbr2QuicCongestionController::OnPersistentCongestion(int64_t /*now_us*/) {
   cwnd_bytes_ = 4 * mss_;
-  inflight_lo_ = 4 * mss_;
+  inflight_lo_ = kMaxCwndBytes;
+  inflight_hi_ = kMaxCwndBytes;
+  bw_lo_bps_ = INT64_MAX;
+  full_bw_baseline_bps_ = 0;
   full_bw_reached_ = false;
   rounds_without_bw_growth_ = 0;
+  loss_round_handled_ = false;
+  probe_rtt_done_us_ = 0;
+  probe_rtt_round_done_ = false;
   state_ = State::kStartup;
   pacing_gain_ = kBbrHighGain;
+  cwnd_gain_ = 2.0;
 }
 
 size_t Bbr2QuicCongestionController::GetCongestionWindowBytes() const {
@@ -707,6 +764,8 @@ QuicCcMigrationState Bbr2QuicCongestionController::ExportMigrationState() const 
   st.pacing_rate_bps = pacing_rate_bps_;
   st.bandwidth_estimate_bps = GetBandwidthEstimateBps();
   st.min_rtt_us = min_rtt_us_;
+  st.smoothed_rtt_us = min_rtt_us_;
+  st.delivered_bytes = delivered_bytes_;
   return st;
 }
 
@@ -717,8 +776,17 @@ void Bbr2QuicCongestionController::ImportMigrationState(
   if (state.ssthresh_bytes > 4 * mss_ && state.ssthresh_bytes < kMaxCwndBytes) {
     inflight_hi_ = state.ssthresh_bytes;
   }
+  delivered_bytes_ = state.delivered_bytes;
+  next_round_delivered_ = delivered_bytes_;
+  delivered_time_us_ = now_us;
+  loss_round_handled_ = false;
+  probe_rtt_done_us_ = 0;
+  probe_rtt_round_done_ = false;
   if (state.min_rtt_us > 0) {
     min_rtt_us_ = state.min_rtt_us;
+    min_rtt_stamp_us_ = now_us;
+  } else if (state.smoothed_rtt_us > 0) {
+    min_rtt_us_ = state.smoothed_rtt_us;
     min_rtt_stamp_us_ = now_us;
   }
   if (state.bandwidth_estimate_bps > 0) {
@@ -737,13 +805,20 @@ CubicQuicCongestionController::CubicQuicCongestionController(
     : mss_(std::max<size_t>(512, max_datagram_size)),
       cwnd_bytes_(10 * mss_) {}
 
-void CubicQuicCongestionController::OnPacketSent(int64_t /*now_us*/,
+void CubicQuicCongestionController::OnPacketSent(int64_t now_us,
                                                  uint64_t packet_number,
                                                  size_t /*bytes*/,
                                                  bool in_flight,
-                                                 size_t /*prior_in_flight*/) {
+                                                 size_t prior_in_flight) {
   if (in_flight) {
     highest_sent_pn_ = std::max(highest_sent_pn_, packet_number);
+    // RFC 9438 第 5.8 节：从在途字节为空的静默暂停恢复发送时记录受限起点，
+    // 以便在重返 cwnd 受限状态时平移 epoch_start_us_，防止 (dt)^3 爆炸。
+    if (prior_in_flight == 0 && epoch_start_us_ >= 0 &&
+        app_limited_start_us_ < 0 && last_cwnd_limited_us_ > 0 &&
+        now_us > last_cwnd_limited_us_ + last_smoothed_rtt_us_) {
+      app_limited_start_us_ = last_cwnd_limited_us_;
+    }
   }
 }
 
@@ -840,6 +915,9 @@ void CubicQuicCongestionController::OnCongestionEvent(
   }
 
   if (!acked_packets.empty()) {
+    for (const auto& p : acked_packets) {
+      delivered_bytes_ += p.bytes;
+    }
     if (acked_packets.back().packet_number >= round_end_pn_) {
       round_end_pn_ = highest_sent_pn_;
       last_round_min_rtt_us_ = curr_round_min_rtt_us_;
@@ -859,6 +937,8 @@ void CubicQuicCongestionController::OnCongestionEvent(
        largest_lost_sent_us > recovery_start_time_us_)) {
     recovery_start_time_us_ = now_us;
     epoch_start_us_ = -1;
+    app_limited_start_us_ = -1;
+    last_cwnd_limited_us_ = -1;
     const double cur_segs =
         static_cast<double>(cwnd_bytes_) / static_cast<double>(mss_);
     // RFC 9438 第 4.7 节：快速收敛（Fast Convergence）。
@@ -873,9 +953,31 @@ void CubicQuicCongestionController::OnCongestionEvent(
     ssthresh_bytes_ = cwnd_bytes_;
   }
 
-  if (acked_packets.empty() || !IsCwndLimited(prior_in_flight_bytes)) {
+  if (acked_packets.empty()) {
     return;
   }
+  if (!IsCwndLimited(prior_in_flight_bytes)) {
+    if (epoch_start_us_ >= 0 && app_limited_start_us_ < 0) {
+      app_limited_start_us_ =
+          (last_cwnd_limited_us_ > 0) ? last_cwnd_limited_us_ : now_us;
+    }
+    return;
+  }
+
+  // RFC 9438 第 5.8 节：跨越应用受限或空闲期后恢复 cwnd 受限发送时平移 epoch_start_us_。
+  if (app_limited_start_us_ >= 0) {
+    if (epoch_start_us_ >= 0 && now_us > app_limited_start_us_) {
+      epoch_start_us_ += (now_us - app_limited_start_us_);
+    }
+    app_limited_start_us_ = -1;
+  } else if (epoch_start_us_ >= 0 && last_cwnd_limited_us_ > 0 &&
+             now_us - last_cwnd_limited_us_ >
+                 std::max<int64_t>(200'000, 4 * last_smoothed_rtt_us_)) {
+    epoch_start_us_ +=
+        (now_us - last_cwnd_limited_us_ - last_smoothed_rtt_us_);
+  }
+  last_cwnd_limited_us_ = now_us;
+
   if (recovery_start_time_us_ >= 0 &&
       acked_packets.back().sent_time_us <= recovery_start_time_us_) {
     return;
@@ -883,7 +985,10 @@ void CubicQuicCongestionController::OnCongestionEvent(
 
   size_t newly_acked = 0;
   for (const auto& p : acked_packets) {
-    newly_acked += p.bytes;
+    if (recovery_start_time_us_ < 0 ||
+        p.sent_time_us > recovery_start_time_us_) {
+      newly_acked += p.bytes;
+    }
   }
 
   if (cwnd_bytes_ < ssthresh_bytes_) {
@@ -894,9 +999,15 @@ void CubicQuicCongestionController::OnCongestionEvent(
 }
 
 void CubicQuicCongestionController::OnPersistentCongestion(int64_t /*now_us*/) {
+  ssthresh_bytes_ = std::max(
+      2 * mss_,
+      static_cast<size_t>(static_cast<double>(cwnd_bytes_) * 0.70));
+  w_max_segments_ =
+      static_cast<double>(cwnd_bytes_) / static_cast<double>(mss_);
   cwnd_bytes_ = 2 * mss_;
-  ssthresh_bytes_ = std::max(4 * mss_, ssthresh_bytes_ / 2);
   epoch_start_us_ = -1;
+  app_limited_start_us_ = -1;
+  last_cwnd_limited_us_ = -1;
   recovery_start_time_us_ = -1;
 }
 
@@ -920,6 +1031,7 @@ CubicQuicCongestionController::ExportMigrationState() const {
   st.pacing_rate_bps = GetPacingRateBps(last_smoothed_rtt_us_);
   st.bandwidth_estimate_bps = GetBandwidthEstimateBps();
   st.smoothed_rtt_us = last_smoothed_rtt_us_;
+  st.delivered_bytes = delivered_bytes_;
   return st;
 }
 
@@ -928,6 +1040,7 @@ void CubicQuicCongestionController::ImportMigrationState(
     int64_t /*now_us*/) {
   cwnd_bytes_ = std::clamp(state.cwnd_bytes, 2 * mss_, kMaxCwndBytes);
   ssthresh_bytes_ = std::clamp(state.ssthresh_bytes, 2 * mss_, kMaxCwndBytes);
+  delivered_bytes_ = state.delivered_bytes;
   if (state.smoothed_rtt_us > 0) {
     last_smoothed_rtt_us_ = state.smoothed_rtt_us;
   } else if (state.min_rtt_us > 0) {
@@ -936,6 +1049,8 @@ void CubicQuicCongestionController::ImportMigrationState(
   w_max_segments_ =
       static_cast<double>(cwnd_bytes_) / static_cast<double>(mss_);
   epoch_start_us_ = -1;
+  app_limited_start_us_ = -1;
+  last_cwnd_limited_us_ = -1;
 }
 
 // ======================= 4. Copa 拥塞控制算法 =======================
@@ -978,12 +1093,13 @@ void CopaQuicCongestionController::OnCongestionEvent(
     size_t /*bytes_in_flight*/,
     const QuicRttSample& rtt,
     const std::vector<QuicAckedPacket>& acked_packets,
-    const std::vector<QuicLostPacket>& /*lost_packets*/) {
+    const std::vector<QuicLostPacket>& lost_packets) {
   const int64_t sample_rtt =
       (rtt.latest_rtt_us > 0) ? rtt.latest_rtt_us : rtt.smoothed_rtt_us;
   if (sample_rtt > 0) {
     const bool expired =
-        (base_min_rtt_us_ > 0) && (now_us > base_min_rtt_stamp_us_ + kRtpropExpiryUs);
+        (base_min_rtt_us_ > 0) &&
+        (now_us > base_min_rtt_stamp_us_ + kRtpropExpiryUs);
     if (base_min_rtt_us_ == 0 || sample_rtt <= base_min_rtt_us_ || expired) {
       base_min_rtt_us_ = sample_rtt;
       base_min_rtt_stamp_us_ = now_us;
@@ -995,6 +1111,46 @@ void CopaQuicCongestionController::OnCongestionEvent(
     if (standing > 0) {
       standing_rtt_us_ = standing;
     }
+
+    const int64_t five_rtt_win_us = std::max<int64_t>(
+        20'000, 5 * std::max<int64_t>(standing_rtt_us_, rtt.smoothed_rtt_us));
+    five_rtt_samples_.push_back(TimedRtt{now_us, sample_rtt});
+    while (!five_rtt_samples_.empty() &&
+           five_rtt_samples_.front().time_us + five_rtt_win_us < now_us) {
+      five_rtt_samples_.pop_front();
+    }
+    const int64_t cur_qdelay_us =
+        std::max<int64_t>(0, standing_rtt_us_ - base_min_rtt_us_);
+    standing_qdelay_samples_.push_back(TimedRtt{now_us, cur_qdelay_us});
+    while (!standing_qdelay_samples_.empty() &&
+           standing_qdelay_samples_.front().time_us + five_rtt_win_us < now_us) {
+      standing_qdelay_samples_.pop_front();
+    }
+  }
+
+  size_t newly_acked = 0;
+  for (const auto& p : acked_packets) {
+    newly_acked += p.bytes;
+    round_acked_bytes_ += p.bytes;
+    delivered_bytes_ += p.bytes;
+  }
+  for (const auto& l : lost_packets) {
+    round_lost_bytes_ += l.bytes;
+  }
+
+  // 当浅缓冲或随机限速导致单轮丢包率超过 10% 时，主动收敛窗口并限制步长因子 velocity。
+  const size_t round_total_bytes = round_acked_bytes_ + round_lost_bytes_;
+  if (!lost_packets.empty() && !loss_reduced_in_round_ &&
+      round_total_bytes >= 4 * mss_ &&
+      round_lost_bytes_ * 10 > round_total_bytes) {
+    in_slow_start_ = false;
+    velocity_ = 1.0;
+    direction_ = -1;
+    same_direction_rounds_ = 0;
+    cwnd_bytes_fp_ = std::max<double>(static_cast<double>(2 * mss_),
+                                      cwnd_bytes_fp_ * 0.75);
+    cwnd_bytes_ = static_cast<size_t>(cwnd_bytes_fp_);
+    loss_reduced_in_round_ = true;
   }
 
   if (acked_packets.empty()) {
@@ -1023,7 +1179,26 @@ void CopaQuicCongestionController::OnCongestionEvent(
   // 轮次边界处的速率步长系数（velocity）与竞争模式检查。
   if (acked_packets.back().packet_number >= round_end_pn_) {
     round_end_pn_ = highest_sent_pn_;
-    if (queueing_delay_us > 2000) {
+
+    int64_t max_rtt_5rtt_us = standing_rtt_us_;
+    for (const auto& s : five_rtt_samples_) {
+      max_rtt_5rtt_us = std::max(max_rtt_5rtt_us, s.rtt_us);
+    }
+    int64_t min_standing_qdelay_us = queueing_delay_us;
+    for (const auto& s : standing_qdelay_samples_) {
+      min_standing_qdelay_us = std::min(min_standing_qdelay_us, s.rtt_us);
+    }
+    const double rtt_range_thresh_us =
+        0.1 * static_cast<double>(
+                  std::max<int64_t>(0, max_rtt_5rtt_us - base_min_rtt_us_));
+    const int64_t est_bw_bps = GetBandwidthEstimateBps();
+    const double pkt_ser_delay_us =
+        (static_cast<double>(mss_) * 8'000'000.0) /
+        static_cast<double>(std::max<int64_t>(100'000, est_bw_bps));
+
+    if (queueing_delay_us > 0 &&
+        static_cast<double>(min_standing_qdelay_us) > rtt_range_thresh_us &&
+        static_cast<double>(min_standing_qdelay_us) > 2.0 * pkt_ser_delay_us) {
       ++unemptied_queue_rounds_;
       if (unemptied_queue_rounds_ >= 5) {
         delta_ = std::max(0.125, delta_ * 0.85);  // 竞争模式（存在长驻队列时提高激进度）
@@ -1034,30 +1209,35 @@ void CopaQuicCongestionController::OnCongestionEvent(
     }
 
     if (!in_slow_start_) {
-      const int new_dir = (cwnd_bytes_ >= cwnd_at_round_start_) ? 1 : -1;
-      if (new_dir == direction_) {
-        ++same_direction_rounds_;
-        if (same_direction_rounds_ >= 3) {
-          velocity_ = std::min(32.0, velocity_ * 2.0);
-        }
-      } else {
-        direction_ = new_dir;
-        same_direction_rounds_ = 1;
+      if (cwnd_bytes_ == cwnd_at_round_start_) {
+        // 应用受限导致 cwnd 未发生实质增减时严禁虚增 velocity_。
+        direction_ = 0;
+        same_direction_rounds_ = 0;
         velocity_ = 1.0;
+      } else {
+        const int new_dir = (cwnd_bytes_ > cwnd_at_round_start_) ? 1 : -1;
+        if (new_dir == direction_) {
+          ++same_direction_rounds_;
+          if (same_direction_rounds_ >= 3) {
+            velocity_ = std::min(32.0, velocity_ * 2.0);
+          }
+        } else {
+          direction_ = new_dir;
+          same_direction_rounds_ = 1;
+          velocity_ = 1.0;
+        }
       }
     }
     cwnd_at_round_start_ = cwnd_bytes_;
+    round_acked_bytes_ = 0;
+    round_lost_bytes_ = 0;
+    loss_reduced_in_round_ = false;
   }
 
   const bool is_cwnd_limited =
       (prior_in_flight_bytes >= cwnd_bytes_) ||
       (cwnd_bytes_ - prior_in_flight_bytes <= 3 * mss_) ||
       (prior_in_flight_bytes * 2 >= cwnd_bytes_);
-
-  size_t newly_acked = 0;
-  for (const auto& p : acked_packets) {
-    newly_acked += p.bytes;
-  }
 
   if (in_slow_start_) {
     if (is_cwnd_limited) {
@@ -1088,7 +1268,15 @@ void CopaQuicCongestionController::OnCongestionEvent(
 void CopaQuicCongestionController::OnPersistentCongestion(int64_t /*now_us*/) {
   cwnd_bytes_ = 2 * mss_;
   cwnd_bytes_fp_ = static_cast<double>(cwnd_bytes_);
+  cwnd_at_round_start_ = cwnd_bytes_;
+  direction_ = 0;
+  same_direction_rounds_ = 0;
   velocity_ = 1.0;
+  delta_ = 0.5;
+  unemptied_queue_rounds_ = 0;
+  round_acked_bytes_ = 0;
+  round_lost_bytes_ = 0;
+  loss_reduced_in_round_ = false;
   in_slow_start_ = true;
 }
 
@@ -1112,6 +1300,7 @@ CopaQuicCongestionController::ExportMigrationState() const {
   st.bandwidth_estimate_bps = GetBandwidthEstimateBps();
   st.min_rtt_us = base_min_rtt_us_;
   st.smoothed_rtt_us = standing_rtt_us_;
+  st.delivered_bytes = delivered_bytes_;
   return st;
 }
 
@@ -1120,7 +1309,11 @@ void CopaQuicCongestionController::ImportMigrationState(
     int64_t now_us) {
   cwnd_bytes_ = std::clamp(state.cwnd_bytes, 2 * mss_, kMaxCwndBytes);
   cwnd_bytes_fp_ = static_cast<double>(cwnd_bytes_);
+  cwnd_at_round_start_ = cwnd_bytes_;
+  delivered_bytes_ = state.delivered_bytes;
   in_slow_start_ = false;
+  direction_ = 0;
+  same_direction_rounds_ = 0;
   velocity_ = 1.0;
   if (state.min_rtt_us > 0) {
     base_min_rtt_us_ = state.min_rtt_us;
@@ -1176,6 +1369,9 @@ void NewRenoQuicCongestionController::OnCongestionEvent(
     ca_byte_accum_ = 0;
   }
 
+  for (const auto& pkt : acked_packets) {
+    delivered_bytes_ += pkt.bytes;
+  }
   if (acked_packets.empty() || !IsCwndLimited(prior_in_flight_bytes)) {
     return;
   }
@@ -1197,6 +1393,7 @@ void NewRenoQuicCongestionController::OnCongestionEvent(
 }
 
 void NewRenoQuicCongestionController::OnPersistentCongestion(int64_t /*now_us*/) {
+  ssthresh_bytes_ = std::max(cwnd_bytes_ / 2, 2 * mss_);
   cwnd_bytes_ = 2 * mss_;
   ca_byte_accum_ = 0;
   recovery_start_time_us_ = -1;
@@ -1222,6 +1419,7 @@ NewRenoQuicCongestionController::ExportMigrationState() const {
   st.pacing_rate_bps = GetPacingRateBps(last_smoothed_rtt_us_);
   st.bandwidth_estimate_bps = GetBandwidthEstimateBps();
   st.smoothed_rtt_us = last_smoothed_rtt_us_;
+  st.delivered_bytes = delivered_bytes_;
   return st;
 }
 
@@ -1230,6 +1428,7 @@ void NewRenoQuicCongestionController::ImportMigrationState(
     int64_t /*now_us*/) {
   cwnd_bytes_ = std::clamp(state.cwnd_bytes, 2 * mss_, kMaxCwndBytes);
   ssthresh_bytes_ = std::clamp(state.ssthresh_bytes, 2 * mss_, kMaxCwndBytes);
+  delivered_bytes_ = state.delivered_bytes;
   if (state.smoothed_rtt_us > 0) {
     last_smoothed_rtt_us_ = state.smoothed_rtt_us;
   } else if (state.min_rtt_us > 0) {

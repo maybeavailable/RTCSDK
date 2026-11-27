@@ -142,11 +142,14 @@ std::optional<PacedPacketInfo> BitrateProber::CurrentCluster(Timestamp now) {
   if (clusters_.empty() || probing_state_ != ProbingState::kActive) {
     return std::nullopt;
   }
-  if (next_probe_time_.IsFinite() &&
-      (now - next_probe_time_) > TimeDelta::Millis(20)) {
+  if ((next_probe_time_.IsFinite() &&
+       (now - next_probe_time_) > TimeDelta::Millis(20)) ||
+      (clusters_.front().started_at.IsFinite() &&
+       (now - clusters_.front().started_at) > TimeDelta::Millis(100))) {
     clusters_.pop();
     if (clusters_.empty()) {
       probing_state_ = ProbingState::kInactive;
+      next_probe_time_ = Timestamp::PlusInfinity();
       return std::nullopt;
     }
     next_probe_time_ = Timestamp::MinusInfinity();
@@ -204,6 +207,17 @@ void BitrateProber::ProbeSent(Timestamp now, DataSize size) {
   }
 }
 
+void BitrateProber::PauseUntilIncomingPacket() {
+  if (probing_state_ != ProbingState::kActive) {
+    return;
+  }
+  while (!clusters_.empty() && clusters_.front().sent_probes > 0) {
+    clusters_.pop();
+  }
+  probing_state_ = ProbingState::kInactive;
+  next_probe_time_ = Timestamp::PlusInfinity();
+}
+
 // ======================= RoundRobinPacketQueue 优先级轮询发包队列 =======================
 
 RoundRobinPacketQueue::Stream::Stream() : packet_queue(&CompareQueuedPacket) {}
@@ -235,6 +249,7 @@ void RoundRobinPacketQueue::Push(RtpPacketMediaType type,
       was_empty ? RtpPacketMediaType::kPadding : stream.packet_queue.top().type;
 
   stream.packet_queue.push(std::move(qp));
+  enqueue_times_.insert(enqueue_time);
   ++size_packets_;
   size_data_ += pkt_size;
 
@@ -263,6 +278,10 @@ RoundRobinPacketQueue::QueuedPacket RoundRobinPacketQueue::Pop() {
     QueuedPacket qp =
         std::move(const_cast<QueuedPacket&>(stream.packet_queue.top()));
     stream.packet_queue.pop();
+    const auto ts_it = enqueue_times_.find(qp.enqueue_time);
+    if (ts_it != enqueue_times_.end()) {
+      enqueue_times_.erase(ts_it);
+    }
 
     const DataSize pkt_size = DataSize::Bytes(qp.packet->SerializedSize());
     const TimeDelta time_in_queue =
@@ -286,14 +305,10 @@ RoundRobinPacketQueue::QueuedPacket RoundRobinPacketQueue::Pop() {
 }
 
 Timestamp RoundRobinPacketQueue::OldestEnqueueTime() const {
-  Timestamp oldest = Timestamp::PlusInfinity();
-  for (const auto& [ssrc, stream] : streams_) {
-    (void)ssrc;
-    if (!stream.packet_queue.empty()) {
-      oldest = std::min(oldest, stream.packet_queue.top().enqueue_time);
-    }
+  if (enqueue_times_.empty()) {
+    return Timestamp::PlusInfinity();
   }
-  return oldest;
+  return *enqueue_times_.begin();
 }
 
 void RoundRobinPacketQueue::UpdateQueueTime(Timestamp now) {
@@ -314,6 +329,7 @@ TimeDelta RoundRobinPacketQueue::AverageQueueTime() const {
 
 void RoundRobinPacketQueue::Clear(Timestamp now) {
   streams_.clear();
+  enqueue_times_.clear();
   while (!stream_priorities_.empty()) {
     stream_priorities_.pop();
   }
@@ -322,6 +338,59 @@ void RoundRobinPacketQueue::Clear(Timestamp now) {
   max_size_ = DataSize::Zero();
   queue_time_sum_ = TimeDelta::Zero();
   time_last_updated_ = now;
+}
+
+void RoundRobinPacketQueue::PurgeStalePacketsForKeyframe(
+    Timestamp now,
+    uint32_t keyframe_ssrc,
+    uint32_t keyframe_rtp_ts) {
+  UpdateQueueTime(now);
+  enqueue_times_.clear();
+  while (!stream_priorities_.empty()) {
+    stream_priorities_.pop();
+  }
+  size_packets_ = 0;
+  size_data_ = DataSize::Zero();
+  queue_time_sum_ = TimeDelta::Zero();
+
+  for (auto it = streams_.begin(); it != streams_.end();) {
+    Stream& stream = it->second;
+    std::vector<QueuedPacket> kept;
+    while (!stream.packet_queue.empty()) {
+      QueuedPacket qp =
+          std::move(const_cast<QueuedPacket&>(stream.packet_queue.top()));
+      stream.packet_queue.pop();
+      const bool same_keyframe = (qp.packet != nullptr &&
+                                  qp.packet->ssrc() == keyframe_ssrc &&
+                                  qp.packet->timestamp() == keyframe_rtp_ts);
+      const bool recent =
+          (now - qp.enqueue_time) <= TimeDelta::Millis(5);
+      const bool high_prio_ctrl =
+          (qp.type == RtpPacketMediaType::kControlHighPriority);
+      if (same_keyframe || recent || high_prio_ctrl) {
+        kept.push_back(std::move(qp));
+      }
+    }
+    if (kept.empty()) {
+      it = streams_.erase(it);
+      continue;
+    }
+    for (auto& qp : kept) {
+      const DataSize pkt_size = DataSize::Bytes(qp.packet->SerializedSize());
+      enqueue_times_.insert(qp.enqueue_time);
+      queue_time_sum_ += std::max(TimeDelta::Zero(), now - qp.enqueue_time);
+      ++size_packets_;
+      size_data_ += pkt_size;
+      stream.packet_queue.push(std::move(qp));
+    }
+    stream_priorities_.push(
+        StreamPrioKey{stream.packet_queue.top().type, stream.size, stream.ssrc});
+    stream.in_prio_queue = true;
+    ++it;
+  }
+  if (size_packets_ == 0) {
+    max_size_ = DataSize::Zero();
+  }
 }
 
 // ======================= PacingController 平滑发送控制器 =======================
@@ -342,8 +411,14 @@ void PacingController::CreateProbeClusters(
 
 void PacingController::SetPacingRates(DataRate pacing_rate,
                                       DataRate padding_rate) {
-  pacing_rate_ = std::max(pacing_rate, DataRate::KilobitsPerSec(50));
-  padding_rate_ = std::max(padding_rate, DataRate::Zero());
+  constexpr DataRate kMinPacingRate = DataRate::KilobitsPerSec(50);
+  constexpr DataRate kMaxPacingRate = DataRate::KilobitsPerSec(1'000'000);
+  pacing_rate_ = std::clamp(
+      pacing_rate.IsFinite() ? pacing_rate : kMaxPacingRate, kMinPacingRate,
+      kMaxPacingRate);
+  padding_rate_ = std::clamp(
+      padding_rate.IsFinite() ? padding_rate : kMaxPacingRate,
+      DataRate::Zero(), kMaxPacingRate);
   adjusted_media_rate_ = pacing_rate_;
 
   const int64_t max_media_debt =
@@ -389,7 +464,9 @@ void PacingController::EnqueuePacket(std::unique_ptr<RtpPacket> packet,
   if (type == RtpPacketMediaType::kVideoKeyFrame && !packet_queue_.Empty() &&
       ExpectedQueueTime() > TimeDelta::Millis(180) &&
       (now - packet_queue_.OldestEnqueueTime()) > TimeDelta::Millis(80)) {
-    packet_queue_.Clear(now);
+    // 仅淘汰早于当前关键帧的陈旧 GOP 积压报文，严禁误删当前正在批量入队的同一关键帧前序分片。
+    packet_queue_.PurgeStalePacketsForKeyframe(now, packet->ssrc(),
+                                               packet->timestamp());
   }
   if (packet_queue_.Empty() && media_debt_bytes_ <= 0 &&
       last_process_time_ < now) {
@@ -555,6 +632,13 @@ void PacingController::ProcessPackets() {
       if (padding_to_add > DataSize::Zero()) {
         auto pad_pkts = packet_sender_->GeneratePadding(padding_to_add);
         if (pad_pkts.empty()) {
+          if (is_probing && data_sent == DataSize::Zero()) {
+            // 当前无法生成填充包且发包队列为空，挂起探测等待真实媒体包到达，杜绝 1ms 定时器空转。
+            prober_.PauseUntilIncomingPacket();
+          } else if (!is_probing && padding_rate_ > DataRate::Zero()) {
+            padding_debt_ = std::max(DataSize::Bytes(32),
+                                     padding_rate_ * TimeDelta::Millis(50));
+          }
           break;
         }
         DataSize pad_batch = DataSize::Zero();
@@ -619,12 +703,15 @@ TaskQueuePacedSender::TaskQueuePacedSender(Clock* clock,
       pacer_queue_(pacer_queue),
       pacer_checker_(pacer_queue),
       pacing_controller_(clock, packet_sender),
+      process_timer_(pacer_queue->io_context()),
       safety_(PendingTaskSafetyFlag::CreateDetached()) {}
 
 TaskQueuePacedSender::~TaskQueuePacedSender() {
   pacer_queue_->Invoke([this]() {
     RTC_DCHECK_RUN_ON(&pacer_checker_);
     safety_.flag()->SetNotAlive();
+    boost::system::error_code ec;
+    process_timer_.cancel(ec);
   });
 }
 
@@ -697,12 +784,22 @@ void TaskQueuePacedSender::MaybeProcessPackets(
 
   const Timestamp now = clock_->CurrentTime();
   Timestamp next_send_time = pacing_controller_.NextSendTime();
+  int stall_guard = 0;
   while (next_send_time <= now + PacingController::kMinSleepTime / 2) {
     pacing_controller_.ProcessPackets();
-    next_send_time = pacing_controller_.NextSendTime();
+    const Timestamp updated_next = pacing_controller_.NextSendTime();
+    if (updated_next <= next_send_time && ++stall_guard >= 4) {
+      next_send_time = now + PacingController::kMinSleepTime;
+      break;
+    }
+    next_send_time = updated_next;
   }
 
   if (next_send_time.IsPlusInfinity()) {
+    if (next_process_time_.IsFinite()) {
+      boost::system::error_code ec;
+      process_timer_.cancel(ec);
+    }
     next_process_time_ = Timestamp::MinusInfinity();
     return;
   }
@@ -712,12 +809,21 @@ void TaskQueuePacedSender::MaybeProcessPackets(
   if (next_process_time_.IsMinusInfinity() ||
       target_wakeup < next_process_time_ || scheduled_process_time.IsFinite()) {
     next_process_time_ = target_wakeup;
-    pacer_queue_->PostDelayedHighPrecisionTask(
-        SafeTask(safety_.flag(),
-                 [this, target_wakeup]() {
-                   MaybeProcessPackets(target_wakeup);
-                 }),
-        delay);
+    boost::system::error_code ec;
+    process_timer_.cancel(ec);
+    process_timer_.expires_after(std::chrono::microseconds(delay.us()));
+    auto flag = safety_.flag();
+    TaskQueueBoost* pq = pacer_queue_;
+    process_timer_.async_wait(
+        [this, flag = std::move(flag), pq,
+         target_wakeup](const boost::system::error_code& wait_ec) {
+          if (wait_ec || !flag->alive() || pq->IsStopped()) {
+            return;
+          }
+          pq->PostTask(SafeTask(flag, [this, target_wakeup]() {
+            MaybeProcessPackets(target_wakeup);
+          }));
+        });
   }
 }
 

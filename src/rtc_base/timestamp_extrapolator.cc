@@ -101,29 +101,44 @@ std::optional<Timestamp> TimestampExtrapolator::ExtrapolateLocalTime(
   if (!first_unwrapped_timestamp_.has_value()) {
     return std::nullopt;
   }
+  constexpr double kMaxExtrapolateDeltaUs = 3.6e10;  // 10 小时安全边界
   const int64_t unwrapped_ts90khz = unwrapper_.PeekUnwrap(timestamp90khz);
   if (packet_count_ < kStartUpFilterDelayInPackets) {
-    constexpr double kRtpTicksPerMs = 90.0;
-    const TimeDelta diff = TimeDelta::Micros(static_cast<int64_t>(std::llround(
-        (static_cast<double>(unwrapped_ts90khz - *prev_unwrapped_timestamp_) /
-         kRtpTicksPerMs) *
-        1000.0)));
-    if (prev_.us() + diff.us() < 0) {
+    if (!prev_unwrapped_timestamp_.has_value() || !prev_.IsFinite()) {
       return std::nullopt;
     }
-    return prev_ + diff;
+    constexpr double kRtpTicksPerMs = 90.0;
+    const double raw_us =
+        (static_cast<double>(unwrapped_ts90khz - *prev_unwrapped_timestamp_) /
+         kRtpTicksPerMs) *
+        1000.0;
+    if (!std::isfinite(raw_us) || std::fabs(raw_us) > kMaxExtrapolateDeltaUs) {
+      return std::nullopt;
+    }
+    const TimeDelta diff =
+        TimeDelta::Micros(static_cast<int64_t>(std::llround(raw_us)));
+    const Timestamp res = prev_ + diff;
+    if (!res.IsFinite() || res.us() < 0) {
+      return std::nullopt;
+    }
+    return res;
   }
-  if (w_[0] < 1e-3) {
+  if (!std::isfinite(w_[0]) || w_[0] < 1e-3 || !start_.IsFinite()) {
     return start_;
   }
   const double timestamp_diff =
       static_cast<double>(unwrapped_ts90khz - *first_unwrapped_timestamp_);
-  const TimeDelta diff_ms = TimeDelta::Micros(static_cast<int64_t>(
-      std::llround(((timestamp_diff - w_[1]) / w_[0]) * 1000.0)));
-  if (start_.us() + diff_ms.us() < 0) {
+  const double raw_us = ((timestamp_diff - w_[1]) / w_[0]) * 1000.0;
+  if (!std::isfinite(raw_us) || std::fabs(raw_us) > kMaxExtrapolateDeltaUs) {
     return std::nullopt;
   }
-  return start_ + diff_ms;
+  const TimeDelta diff_ms =
+      TimeDelta::Micros(static_cast<int64_t>(std::llround(raw_us)));
+  const Timestamp res = start_ + diff_ms;
+  if (!res.IsFinite() || res.us() < 0) {
+    return std::nullopt;
+  }
+  return res;
 }
 
 bool TimestampExtrapolator::DelayChangeDetection(double error) {

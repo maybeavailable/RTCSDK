@@ -237,10 +237,15 @@ struct IceCandidate {
   uint32_t priority = 0;
   boost::asio::ip::udp::endpoint address;
   IceCandidateType type = IceCandidateType::kHost;
+  boost::asio::ip::udp::endpoint related_address;
 
   static uint32_t ComputePriority(IceCandidateType type,
                                   uint16_t local_pref = 65535,
                                   uint8_t component_id = 1);
+  static std::string ComputeFoundation(
+      IceCandidateType type,
+      const boost::asio::ip::address& base_ip,
+      const boost::asio::ip::udp::endpoint& server_ep = {});
   std::string ToSdpAttribute() const;
   static std::optional<IceCandidate> FromSdpAttribute(std::string_view line);
 };
@@ -277,6 +282,7 @@ struct TurnServerSpec {
   std::string username;
   std::string password;
   bool is_turn = false;
+  bool use_tls = false;
 };
 
 class IceTransportChannel {
@@ -306,6 +312,7 @@ class IceTransportChannel {
   bool StartGatheringAndBind(uint16_t preferred_local_port = 0);
   bool WaitForServerReflexiveGathering(TimeDelta max_wait);
   void AddRemoteCandidate(const IceCandidate& remote);
+  void AddRemoteCandidateOrHostname(std::string_view candidate_sdp);
   void RestartIce(const IceParameters& new_local_params);
 
   int SendPacket(ArrayView<const uint8_t> packet);
@@ -316,7 +323,9 @@ class IceTransportChannel {
 
   IceParameters local_parameters() const;
   std::vector<IceCandidate> LocalCandidatesSnapshot() const;
-  uint16_t bound_local_port() const { return bound_port_; }
+  uint16_t bound_local_port() const {
+    return bound_port_.load(std::memory_order_acquire);
+  }
   TimeDelta last_rtt() const {
     return TimeDelta::Micros(smoothed_rtt_us_.load(std::memory_order_acquire));
   }
@@ -368,24 +377,49 @@ class IceTransportChannel {
     uint16_t next_channel = 0x4000;
     uint32_t lifetime_sec = 600;
     bool allocated = false;
+    bool auth_challenged = false;
+    int alloc_tx_count = 0;
+    StunTransactionId current_alloc_tx_id{};
+    std::set<StunTransactionId> pending_alloc_tx_ids;
+    std::set<StunTransactionId> pending_refresh_tx_ids;
+    Timestamp last_alloc_tx = Timestamp::MinusInfinity();
     Timestamp last_refresh_sent = Timestamp::MinusInfinity();
     boost::asio::ip::udp::endpoint relayed_ep;
     std::map<boost::asio::ip::udp::endpoint, uint16_t> peer_to_channel;
     std::map<uint16_t, boost::asio::ip::udp::endpoint> channel_to_peer;
+    std::map<StunTransactionId, uint16_t> pending_channel_binds;
+    std::map<StunTransactionId, std::vector<boost::asio::ip::udp::endpoint>>
+        pending_permissions;
     std::set<uint16_t> confirmed_channels;
+    std::map<boost::asio::ip::udp::endpoint, Timestamp> permission_refreshed_at;
+    std::map<uint16_t, Timestamp> channel_bound_at;
+    std::map<boost::asio::ip::udp::endpoint, Timestamp> last_perm_req_sent;
+    std::map<uint16_t, Timestamp> last_channel_bind_sent;
   };
 
   struct ResolvedServerEntry {
     TurnServerSpec spec;
     std::vector<boost::asio::ip::udp::endpoint> resolved_endpoints;
+    std::set<StunTransactionId> pending_stun_tx_ids;
     bool resolving = false;
     bool dns_failed = false;
     bool srflx_gathered = false;
+    bool stun_exhausted = false;
+    bool turn_failed = false;
     int stun_tx_count = 0;
     Timestamp last_stun_tx = Timestamp::MinusInfinity();
   };
 
+  boost::asio::ip::udp::endpoint DefaultLocalBaseEndpoint(bool ipv6) const;
+  bool IsAuthorizedRemoteDataSource(
+      const boost::asio::ip::udp::endpoint& from,
+      bool via_turn_relay) const;
   void DoAsyncReceive();
+  void DoAsyncReceiveV6();
+  int SendRawUdp(const boost::asio::ip::udp::endpoint& dst,
+                 ArrayView<const uint8_t> bytes);
+  void ReleaseActiveTurnAllocation();
+  void TryStartNextTurnAllocation();
   void NotifyServerGatheringProgress();
   void ResolveAndProbeServer(size_t server_index);
   void SendStunProbeToServer(size_t server_index, Timestamp now);
@@ -413,10 +447,16 @@ class IceTransportChannel {
   std::atomic<double> rx_drop_prob_{0.0};
 
   std::unique_ptr<boost::asio::ip::udp::socket> socket_;
+  std::unique_ptr<boost::asio::ip::udp::socket> socket_v6_;
   std::unique_ptr<boost::asio::ip::udp::resolver> resolver_;
-  std::array<uint8_t, 2048> rx_buf_{};
+  std::vector<uint8_t> rx_buf_;
+  std::vector<uint8_t> rx_buf_v6_;
   boost::asio::ip::udp::endpoint sender_ep_;
-  uint16_t bound_port_ = 0;
+  boost::asio::ip::udp::endpoint sender_ep_v6_;
+  std::atomic<uint16_t> bound_port_{0};
+  uint16_t bound_port_v6_ = 0;
+  size_t next_check_pair_cursor_ = 0;
+  std::optional<size_t> active_turn_server_idx_;
 
   IceParameters local_params_;
   IceParameters remote_params_;

@@ -8,7 +8,13 @@
 #include <string_view>
 
 #if defined(_WIN32)
+#if defined(RTC_SDK_SHARED_BUILD)
 #define RTC_SDK_API __declspec(dllexport)
+#elif defined(RTC_SDK_SHARED_CONSUME)
+#define RTC_SDK_API __declspec(dllimport)
+#else
+#define RTC_SDK_API
+#endif
 #elif defined(__GNUC__) && __GNUC__ >= 4
 #define RTC_SDK_API __attribute__((visibility("default")))
 #else

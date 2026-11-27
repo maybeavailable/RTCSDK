@@ -304,6 +304,14 @@ bool RunDirectSdpBidirectionalCpp17P2p() {
 
   cam_obs.BindTrickleTarget(app_eng.get());
   app_obs.BindTrickleTarget(cam_eng.get());
+  struct TrickleUnbindGuard {
+    FullP2pObserver* cam;
+    FullP2pObserver* app;
+    ~TrickleUnbindGuard() {
+      cam->BindTrickleTarget(nullptr);
+      app->BindTrickleTarget(nullptr);
+    }
+  } unbind_guard{&cam_obs, &app_obs};
 
   cam_eng->JoinRoom("cpp17_direct", "cam_a");
   app_eng->JoinRoom("cpp17_direct", "app_b");

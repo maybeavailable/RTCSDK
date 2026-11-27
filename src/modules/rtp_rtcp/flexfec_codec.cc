@@ -18,7 +18,8 @@ constexpr size_t kFlexfecCommonHeaderSize = 8;
 constexpr size_t kFlexfecRetransmitHeaderSize = 12;
 constexpr size_t kMaxCachedMediaPackets = 512;
 constexpr size_t kMaxPendingFecPackets = 64;
-constexpr uint16_t kMaxFlexibleMaskSpan = 110;  // 覆盖偏移 0..109
+constexpr uint16_t kMaxFlexibleMaskSpan = 110;    // RFC 8627 覆盖偏移 0..109
+constexpr uint16_t kMaxFlexfec03MaskSpan = 109;   // flexfec-03 覆盖偏移 0..108 (含 k2 位)
 
 bool SeqNumLess16(uint16_t a, uint16_t b) {
   return a != b && static_cast<uint16_t>(b - a) < 0x8000u;
@@ -97,7 +98,7 @@ void FecControllerDefault::UpdateNetworkMetrics(DataRate estimated_bitrate,
   if ((estimated_bitrate < DataRate::KilobitsPerSec(110) &&
        loss_rate_ratio < 0.12) ||
       (loss_rate_ratio < 0.02 && rtt < TimeDelta::Millis(70))) {
-    keyframe_params_ = FecProtectionParams{25, 1, false, false};
+    keyframe_params_ = FecProtectionParams{64, 1, false, false};
     delta_params_ = FecProtectionParams{0, 1, false, false};
     return;
   }
@@ -134,13 +135,19 @@ FlexfecSender::FlexfecSender(uint8_t flexfec_payload_type,
 
 void FlexfecSender::SetProtectionParameters(const FecProtectionParams& params) {
   params_ = params;
+  if (params_.fec_rate == 0) {
+    pending_media_.clear();
+    fec_budget_accum_ = 0;
+  }
 }
 
 void FlexfecSender::EvictExpiredPendingMedia(const RtpPacket& newest_packet) {
   if (pending_media_.empty()) {
     return;
   }
-  // 清理超出 110 位掩码跨度或超出协商 repair-window 的陈旧待保护包。
+  // 清理超出柔性位掩码跨度或超出协商 repair-window 的陈旧待保护包。
+  const uint16_t max_mask_span =
+      use_flexfec_03_ ? kMaxFlexfec03MaskSpan : kMaxFlexibleMaskSpan;
   const uint16_t newest_seq = newest_packet.sequence_number();
   const uint64_t max_ts_span_90k =
       (static_cast<uint64_t>(repair_window_us_) * 90ULL) / 1000ULL;
@@ -152,7 +159,7 @@ void FlexfecSender::EvictExpiredPendingMedia(const RtpPacket& newest_packet) {
     const uint16_t seq_span = static_cast<uint16_t>(newest_seq - seq);
     const uint32_t ts_span =
         AbsRtpTimestampDiff(newest_packet.timestamp(), it->timestamp());
-    if (invalid_order || seq_span >= kMaxFlexibleMaskSpan ||
+    if (invalid_order || seq_span >= max_mask_span ||
         ts_span > max_ts_span_90k) {
       it = pending_media_.erase(it);
     } else {
@@ -174,14 +181,17 @@ void FlexfecSender::AddRtpPacketAndGenerateFec(const RtpPacket& media_packet) {
 
   if (params_.fec_rate == 0) {
     pending_media_.clear();
+    fec_budget_accum_ = 0;
     return;
   }
 
   EvictExpiredPendingMedia(media_packet);
   pending_media_.push_back(media_packet);
+  fec_budget_accum_ =
+      std::min(fec_budget_accum_ + static_cast<int>(params_.fec_rate), 510);
 
   const size_t group_size =
-      std::clamp<size_t>((255 + params_.fec_rate / 2) / params_.fec_rate, 2, 12);
+      std::clamp<size_t>((255 + params_.fec_rate / 2) / params_.fec_rate, 2, 48);
 
   auto emit_group = [this](const std::vector<const RtpPacket*>& grp,
                            uint8_t fixed_l, uint8_t fixed_d) {
@@ -189,7 +199,7 @@ void FlexfecSender::AddRtpPacketAndGenerateFec(const RtpPacket& media_packet) {
       return;
     }
     std::optional<RtpPacket> fec_pkt;
-    if (params_.use_fixed_matrix_f1 && fixed_l > 0) {
+    if (!use_flexfec_03_ && params_.use_fixed_matrix_f1 && fixed_l > 0) {
       fec_pkt = BuildFixedMatrixParityPacket(
           grp, grp.front()->sequence_number(), fixed_l, fixed_d);
     } else {
@@ -228,6 +238,7 @@ void FlexfecSender::AddRtpPacketAndGenerateFec(const RtpPacket& media_packet) {
     pending_media_.erase(
         pending_media_.begin(),
         pending_media_.begin() + static_cast<ptrdiff_t>(group_size * 2));
+    fec_budget_accum_ = std::max(-255, fec_budget_accum_ - 510);
   } else if (!params_.use_burst_interleaving &&
              pending_media_.size() >= group_size) {
     std::vector<const RtpPacket*> group;
@@ -245,22 +256,65 @@ void FlexfecSender::AddRtpPacketAndGenerateFec(const RtpPacket& media_packet) {
     pending_media_.erase(
         pending_media_.begin(),
         pending_media_.begin() + static_cast<ptrdiff_t>(group_size));
-  } else if (media_packet.marker() && pending_media_.size() >= 2 &&
-             params_.fec_rate >= 20) {
-    std::vector<const RtpPacket*> group;
-    group.reserve(pending_media_.size());
-    bool contiguous = true;
-    const uint16_t first_seq = pending_media_.front().sequence_number();
-    for (size_t i = 0; i < pending_media_.size(); ++i) {
-      if (pending_media_[i].sequence_number() !=
-          static_cast<uint16_t>(first_seq + i)) {
-        contiguous = false;
+    fec_budget_accum_ = std::max(-255, fec_budget_accum_ - 255);
+  } else if (media_packet.marker()) {
+    int completed_frames = 0;
+    for (const auto& mp : pending_media_) {
+      if (mp.marker()) {
+        ++completed_frames;
       }
-      group.push_back(&pending_media_[i]);
     }
-    emit_group(group,
-               contiguous ? static_cast<uint8_t>(pending_media_.size()) : 0, 0);
-    pending_media_.clear();
+    const int max_frames = std::max(1, params_.max_fec_frames);
+    if (completed_frames >= max_frames) {
+      if (params_.use_burst_interleaving && pending_media_.size() >= 4 &&
+          fec_budget_accum_ >= 510) {
+        const size_t half = pending_media_.size() / 2;
+        std::vector<const RtpPacket*> even_group;
+        std::vector<const RtpPacket*> odd_group;
+        even_group.reserve(half + 1);
+        odd_group.reserve(half);
+        bool contiguous_even = (pending_media_.size() % 2) == 0;
+        const uint16_t first_seq = pending_media_.front().sequence_number();
+        for (size_t i = 0; i < pending_media_.size(); ++i) {
+          if (pending_media_[i].sequence_number() !=
+              static_cast<uint16_t>(first_seq + i)) {
+            contiguous_even = false;
+          }
+          if ((i % 2) == 0) {
+            even_group.push_back(&pending_media_[i]);
+          } else {
+            odd_group.push_back(&pending_media_[i]);
+          }
+        }
+        const uint8_t l_val = contiguous_even ? 2 : 0;
+        const uint8_t d_val =
+            contiguous_even ? static_cast<uint8_t>(half) : 0;
+        emit_group(even_group, l_val, d_val);
+        emit_group(odd_group, l_val, d_val);
+        fec_budget_accum_ = std::max(-255, fec_budget_accum_ - 510);
+        pending_media_.clear();
+      } else if (fec_budget_accum_ >= 255 && !pending_media_.empty()) {
+        std::vector<const RtpPacket*> group;
+        group.reserve(pending_media_.size());
+        bool contiguous = pending_media_.size() <= 255;
+        const uint16_t first_seq = pending_media_.front().sequence_number();
+        for (size_t i = 0; i < pending_media_.size(); ++i) {
+          if (pending_media_[i].sequence_number() !=
+              static_cast<uint16_t>(first_seq + i)) {
+            contiguous = false;
+          }
+          group.push_back(&pending_media_[i]);
+        }
+        emit_group(
+            group,
+            contiguous ? static_cast<uint8_t>(pending_media_.size()) : 0, 0);
+        fec_budget_accum_ -= 255;
+        pending_media_.clear();
+      } else {
+        // 预算尚未攒够一整包校验开销且已达 max_fec_frames 窗口上限，清空旧源包但保留预算结余。
+        pending_media_.clear();
+      }
+    }
   }
 }
 
@@ -269,11 +323,23 @@ std::optional<RtpPacket> FlexfecSender::BuildFlexibleMaskParityPacket(
   if (group.empty()) {
     return std::nullopt;
   }
+  for (const RtpPacket* pkt : group) {
+    if (pkt == nullptr) {
+      return std::nullopt;
+    }
+  }
 
   std::vector<const RtpPacket*> sorted = group;
+  uint16_t anchor = sorted.front()->sequence_number();
+  for (const RtpPacket* pkt : sorted) {
+    if (AheadOf<uint16_t>(anchor, pkt->sequence_number())) {
+      anchor = pkt->sequence_number();
+    }
+  }
   std::sort(sorted.begin(), sorted.end(),
-            [](const RtpPacket* a, const RtpPacket* b) {
-              return SeqNumLess16(a->sequence_number(), b->sequence_number());
+            [anchor](const RtpPacket* a, const RtpPacket* b) {
+              return static_cast<uint16_t>(a->sequence_number() - anchor) <
+                     static_cast<uint16_t>(b->sequence_number() - anchor);
             });
   sorted.erase(std::unique(sorted.begin(), sorted.end(),
                            [](const RtpPacket* a, const RtpPacket* b) {
@@ -282,6 +348,8 @@ std::optional<RtpPacket> FlexfecSender::BuildFlexibleMaskParityPacket(
                            }),
                sorted.end());
 
+  const uint16_t max_mask_span =
+      use_flexfec_03_ ? kMaxFlexfec03MaskSpan : kMaxFlexibleMaskSpan;
   const uint16_t base_seq = sorted.front()->sequence_number();
   uint16_t max_offset = 0;
   std::vector<const RtpPacket*> valid_group;
@@ -294,8 +362,8 @@ std::optional<RtpPacket> FlexfecSender::BuildFlexibleMaskParityPacket(
         static_cast<uint16_t>(pkt->sequence_number() - base_seq);
     const uint32_t ts_span =
         AbsRtpTimestampDiff(pkt->timestamp(), sorted.front()->timestamp());
-    if (offset >= kMaxFlexibleMaskSpan || ts_span > max_ts_span_90k) {
-      // RFC 8627 第 4.2.2 / 5.1.2 节：超出 110 位掩码或 repair-window 的修复包禁止发送。
+    if (offset >= max_mask_span || ts_span > max_ts_span_90k) {
+      // 超出柔性位掩码跨度或 repair-window 的修复包禁止发送。
       return std::nullopt;
     }
     max_offset = std::max(max_offset, offset);
@@ -312,10 +380,12 @@ std::optional<RtpPacket> FlexfecSender::BuildFlexibleMaskParityPacket(
     return std::nullopt;
   }
 
-  // 组装 RFC 8627 图 12（R=0, F=0）柔性位掩码块（MSB 对应 j=0）：
+  // 组装（R=0, F=0）柔性位掩码块（MSB 对应 j=0）：
   //   - 第 0 块（16 位）：[k0 (1b) | Mask[0..14] (15b)]
   //   - 第 1 块（32 位，可选）：[k1 (1b) | Mask[15..45] (31b)]
-  //   - 第 2 块（64 位，可选）：[Mask[46..109] (64b)]（无 k-bit）
+  //   - 第 2 块（64 位，可选）：
+  //       RFC 8627：[Mask[46..109] (64b)]（无 k2 位）
+  //       flexfec-03：[k2=0 (1b) | Mask[46..108] (63b)]
   uint16_t mask_word0 = 0;
   uint32_t mask_word1 = 0;
   uint64_t mask_word2 = 0;
@@ -329,6 +399,8 @@ std::optional<RtpPacket> FlexfecSender::BuildFlexibleMaskParityPacket(
       mask_word0 |= static_cast<uint16_t>(uint16_t{1} << (14 - j));
     } else if (j <= 45) {
       mask_word1 |= (uint32_t{1} << (45 - j));
+    } else if (use_flexfec_03_) {
+      mask_word2 |= (uint64_t{1} << (108 - j));
     } else {
       mask_word2 |= (uint64_t{1} << (109 - j));
     }
@@ -341,7 +413,9 @@ std::optional<RtpPacket> FlexfecSender::BuildFlexibleMaskParityPacket(
   }
 
   const size_t mask_bytes = 2 + (need_word1 ? 4 : 0) + (need_word2 ? 8 : 0);
-  const size_t fec_hdr_size = kFlexfecCommonHeaderSize + 2 + mask_bytes;
+  const size_t extra_03_bytes = use_flexfec_03_ ? 8 : 0;
+  const size_t fec_hdr_size =
+      kFlexfecCommonHeaderSize + extra_03_bytes + 2 + mask_bytes;
   std::vector<uint8_t> fec_payload(fec_hdr_size + repair_payload.size(), 0);
 
   // R=0, F=0 写入首字节高 2 位。
@@ -349,10 +423,20 @@ std::optional<RtpPacket> FlexfecSender::BuildFlexibleMaskParityPacket(
   fec_payload[1] = hdr1_xor;
   WriteBigEndian16(fec_payload.data() + 2, len_recovery);
   WriteBigEndian32(fec_payload.data() + 4, ts_recovery);
-  WriteBigEndian16(fec_payload.data() + 8, base_seq);
-  WriteBigEndian16(fec_payload.data() + 10, mask_word0);
 
-  size_t hdr_off = 12;
+  size_t hdr_off = 8;
+  if (use_flexfec_03_) {
+    // draft-ietf-payload-flexfec-03：SSRCCount=1 (8b) | reserved=0 (24b) | SSRC_i (32b)
+    fec_payload[8] = 1;
+    fec_payload[9] = 0;
+    fec_payload[10] = 0;
+    fec_payload[11] = 0;
+    WriteBigEndian32(fec_payload.data() + 12, protected_media_ssrc_);
+    hdr_off = 16;
+  }
+  WriteBigEndian16(fec_payload.data() + hdr_off, base_seq);
+  WriteBigEndian16(fec_payload.data() + hdr_off + 2, mask_word0);
+  hdr_off += 4;
   if (need_word1) {
     WriteBigEndian32(fec_payload.data() + hdr_off, mask_word1);
     hdr_off += 4;
@@ -369,9 +453,11 @@ std::optional<RtpPacket> FlexfecSender::BuildFlexibleMaskParityPacket(
   RtpPacket fec_pkt;
   fec_pkt.set_payload_type(flexfec_pt_);
   fec_pkt.set_ssrc(flexfec_ssrc_);
-  // RFC 8627 第 4.2.1 节：Marker 位必须设为 0，且由 RTP 头 CSRC 列表声明受保护源 SSRC。
   fec_pkt.set_marker(false);
-  fec_pkt.set_csrcs({protected_media_ssrc_});
+  if (!use_flexfec_03_) {
+    // RFC 8627 第 4.2.1 节：由 RTP 头 CSRC 列表声明受保护源 SSRC；flexfec-03 则保持 CC=0。
+    fec_pkt.set_csrcs({protected_media_ssrc_});
+  }
   fec_pkt.set_sequence_number(seq_num_++);
   fec_pkt.set_timestamp(valid_group.back()->timestamp());
   if (!mid_.empty()) {
@@ -475,7 +561,7 @@ void FlexfecReceiver::PruneBuffers() {
   while (received_media_wire_.size() > kMaxCachedMediaPackets) {
     received_media_wire_.erase(received_media_wire_.begin());
   }
-  if (newest_unwrapped_seq_ >= 0) {
+  if (has_received_media_) {
     const int64_t min_keep_seq = newest_unwrapped_seq_ -
                                  static_cast<int64_t>(kMaxCachedMediaPackets);
     while (!received_media_wire_.empty() &&
@@ -484,6 +570,12 @@ void FlexfecReceiver::PruneBuffers() {
     }
     const int64_t min_fec_seq = newest_unwrapped_seq_ - 256;
     for (auto it = pending_fecs_.begin(); it != pending_fecs_.end();) {
+      if (it->protected_seqs.empty()) {
+        it = pending_fecs_.erase(it);
+        continue;
+      }
+      it->unwrapped_base_seq =
+          seq_unwrapper_.PeekUnwrap(it->protected_seqs.front());
       if (it->unwrapped_base_seq < min_fec_seq) {
         it = pending_fecs_.erase(it);
       } else {
@@ -507,7 +599,12 @@ void FlexfecReceiver::DrainPendingFecs(
       const RecoverStatus st = TryRecover(*it, &rec_pkt);
       if (st == RecoverStatus::kRecovered) {
         const int64_t uw = seq_unwrapper_.Unwrap(rec_pkt.sequence_number());
-        newest_unwrapped_seq_ = std::max(newest_unwrapped_seq_, uw);
+        if (!has_received_media_) {
+          has_received_media_ = true;
+          newest_unwrapped_seq_ = uw;
+        } else {
+          newest_unwrapped_seq_ = std::max(newest_unwrapped_seq_, uw);
+        }
         received_media_wire_[uw] = rec_pkt.WireBytes();
         out_recovered_list->push_back(std::move(rec_pkt));
         it = pending_fecs_.erase(it);
@@ -527,7 +624,12 @@ std::vector<RtpPacket> FlexfecReceiver::OnRtpPacket(const RtpPacket& packet) {
 
   if (packet.ssrc() == protected_media_ssrc_) {
     const int64_t uw = seq_unwrapper_.Unwrap(packet.sequence_number());
-    newest_unwrapped_seq_ = std::max(newest_unwrapped_seq_, uw);
+    if (!has_received_media_) {
+      has_received_media_ = true;
+      newest_unwrapped_seq_ = uw;
+    } else {
+      newest_unwrapped_seq_ = std::max(newest_unwrapped_seq_, uw);
+    }
     received_media_wire_[uw] = packet.WireBytes();
     DrainPendingFecs(&recovered_list);
     PruneBuffers();
@@ -561,6 +663,11 @@ std::vector<RtpPacket> FlexfecReceiver::OnRtpPacket(const RtpPacket& packet) {
     }
     const uint16_t orig_seq = ReadBigEndian16(p + 2);
     const int64_t uw = seq_unwrapper_.PeekUnwrap(orig_seq);
+    if (has_received_media_ &&
+        uw < newest_unwrapped_seq_ -
+                 static_cast<int64_t>(kMaxCachedMediaPackets)) {
+      return recovered_list;
+    }
     if (received_media_wire_.find(uw) != received_media_wire_.end()) {
       return recovered_list;
     }
@@ -572,7 +679,12 @@ std::vector<RtpPacket> FlexfecReceiver::OnRtpPacket(const RtpPacket& packet) {
       return recovered_list;
     }
     const int64_t committed_uw = seq_unwrapper_.Unwrap(orig_seq);
-    newest_unwrapped_seq_ = std::max(newest_unwrapped_seq_, committed_uw);
+    if (!has_received_media_) {
+      has_received_media_ = true;
+      newest_unwrapped_seq_ = committed_uw;
+    } else {
+      newest_unwrapped_seq_ = std::max(newest_unwrapped_seq_, committed_uw);
+    }
     received_media_wire_[committed_uw] = std::move(recovered_wire);
     recovered_list.push_back(std::move(rec_pkt));
     DrainPendingFecs(&recovered_list);
@@ -588,10 +700,15 @@ std::vector<RtpPacket> FlexfecReceiver::OnRtpPacket(const RtpPacket& packet) {
   RtpPacket immediate_pkt;
   const RecoverStatus st = TryRecover(rec, &immediate_pkt);
   if (st == RecoverStatus::kRecovered) {
-    RTC_LOG(kVerbose) << "FlexFEC (RFC 8627) immediately recovered seq="
+    RTC_LOG(kVerbose) << "FlexFEC immediately recovered seq="
                       << immediate_pkt.sequence_number();
     const int64_t uw = seq_unwrapper_.Unwrap(immediate_pkt.sequence_number());
-    newest_unwrapped_seq_ = std::max(newest_unwrapped_seq_, uw);
+    if (!has_received_media_) {
+      has_received_media_ = true;
+      newest_unwrapped_seq_ = uw;
+    } else {
+      newest_unwrapped_seq_ = std::max(newest_unwrapped_seq_, uw);
+    }
     received_media_wire_[uw] = immediate_pkt.WireBytes();
     recovered_list.push_back(std::move(immediate_pkt));
     DrainPendingFecs(&recovered_list);
@@ -610,7 +727,11 @@ bool FlexfecReceiver::ParseRepairPacket(const RtpPacket& packet,
     return false;
   }
 
+  const bool r_bit = (p[0] & 0x80u) != 0;
   const bool f_bit = (p[0] & 0x40u) != 0;
+  if (r_bit) {
+    return false;
+  }
   const auto& csrcs = packet.csrcs();
 
   ParityRecord rec;
@@ -621,22 +742,27 @@ bool FlexfecReceiver::ParseRepairPacket(const RtpPacket& packet,
   rec.ts_recovery = ReadBigEndian32(p + 4);
 
   size_t off = kFlexfecCommonHeaderSize;
-  if (csrcs.empty()) {
-    return false;
-  }
+  bool matched_single_stream = false;
 
-  // RFC 8627 第 4.2.2 节：RTP 头部的 CSRC 列表按序声明每个被保护的源 SSRC 块。
-  bool matched_single_stream = (csrcs.size() == 1 &&
-                                csrcs[0] == protected_media_ssrc_);
-  for (size_t i = 0; i < csrcs.size(); ++i) {
-    if (!f_bit) {
-      // R=0, F=0：SN base_i (16b) + 级联 k-bit 位掩码（15 / 46 / 110 位）。
-      if (off + 4 > sz) {
+  if (csrcs.empty()) {
+    // 浏览器兼容 draft-ietf-payload-flexfec-03 格式（CC=0, R=0, F=0）：
+    // p[8]=SSRCCount, p[9..11]=reserved, 后接 SSRC_i + SN base_i + 15/46/108 位掩码。
+    if (f_bit || sz < 12) {
+      return false;
+    }
+    const uint8_t ssrc_count = p[8];
+    if (ssrc_count == 0) {
+      return false;
+    }
+    off = 12;
+    for (uint8_t i = 0; i < ssrc_count; ++i) {
+      if (off + 8 > sz) {
         return false;
       }
-      const uint16_t sn_base = ReadBigEndian16(p + off);
-      const uint16_t word0 = ReadBigEndian16(p + off + 2);
-      off += 4;
+      const uint32_t ssrc_i = ReadBigEndian32(p + off);
+      const uint16_t sn_base = ReadBigEndian16(p + off + 4);
+      const uint16_t word0 = ReadBigEndian16(p + off + 6);
+      off += 8;
 
       const bool k0 = (word0 & 0x8000u) != 0;
       uint32_t word1 = 0;
@@ -656,9 +782,13 @@ bool FlexfecReceiver::ParseRepairPacket(const RtpPacket& packet,
         }
         word2 = ReadBigEndian64(p + off);
         off += 8;
+        if ((word2 & (uint64_t{1} << 63)) != 0) {
+          return false;
+        }
       }
 
-      if (matched_single_stream) {
+      if (ssrc_count == 1 && ssrc_i == protected_media_ssrc_) {
+        matched_single_stream = true;
         for (uint16_t j = 0; j <= 14; ++j) {
           if ((word0 & (uint16_t{1} << (14 - j))) != 0) {
             rec.protected_seqs.push_back(static_cast<uint16_t>(sn_base + j));
@@ -672,41 +802,100 @@ bool FlexfecReceiver::ParseRepairPacket(const RtpPacket& packet,
           }
         }
         if (k1) {
-          for (uint16_t j = 46; j <= 109; ++j) {
-            if ((word2 & (uint64_t{1} << (109 - j))) != 0) {
+          for (uint16_t j = 46; j <= 108; ++j) {
+            if ((word2 & (uint64_t{1} << (108 - j))) != 0) {
               rec.protected_seqs.push_back(static_cast<uint16_t>(sn_base + j));
             }
           }
         }
       }
-    } else {
-      // R=0, F=1 固定行列矩阵模式：SN base_i (16b) | L (8b) | D (8b)。
-      if (off + 4 > sz) {
-        return false;
-      }
-      const uint16_t sn_base = ReadBigEndian16(p + off);
-      const uint8_t cols_l = p[off + 2];
-      const uint8_t rows_d = p[off + 3];
-      off += 4;
+    }
+  } else {
+    // RFC 8627 第 4.2.2 节：RTP 头部的 CSRC 列表按序声明每个被保护的源 SSRC 块。
+    matched_single_stream =
+        (csrcs.size() == 1 && csrcs[0] == protected_media_ssrc_);
+    for (size_t i = 0; i < csrcs.size(); ++i) {
+      if (!f_bit) {
+        // R=0, F=0：SN base_i (16b) + 级联 k-bit 位掩码（15 / 46 / 110 位）。
+        if (off + 4 > sz) {
+          return false;
+        }
+        const uint16_t sn_base = ReadBigEndian16(p + off);
+        const uint16_t word0 = ReadBigEndian16(p + off + 2);
+        off += 4;
 
-      // RFC 8627 图 14：L=0（含 L=0,D=0）必须忽略；跨度过大超出合理窗口亦忽略。
-      if (cols_l == 0) {
-        return false;
-      }
-      if (matched_single_stream) {
-        if (rows_d == 0 || rows_d == 1) {
-          for (uint16_t c = 0; c < cols_l; ++c) {
-            rec.protected_seqs.push_back(static_cast<uint16_t>(sn_base + c));
-          }
-        } else {
-          const uint32_t max_span =
-              static_cast<uint32_t>(rows_d - 1) * static_cast<uint32_t>(cols_l);
-          if (max_span >= kMaxCachedMediaPackets) {
+        const bool k0 = (word0 & 0x8000u) != 0;
+        uint32_t word1 = 0;
+        bool k1 = false;
+        if (k0) {
+          if (off + 4 > sz) {
             return false;
           }
-          for (uint16_t r = 0; r < rows_d; ++r) {
-            rec.protected_seqs.push_back(
-                static_cast<uint16_t>(sn_base + r * cols_l));
+          word1 = ReadBigEndian32(p + off);
+          off += 4;
+          k1 = (word1 & 0x80000000u) != 0;
+        }
+        uint64_t word2 = 0;
+        if (k1) {
+          if (off + 8 > sz) {
+            return false;
+          }
+          word2 = ReadBigEndian64(p + off);
+          off += 8;
+        }
+
+        if (matched_single_stream) {
+          for (uint16_t j = 0; j <= 14; ++j) {
+            if ((word0 & (uint16_t{1} << (14 - j))) != 0) {
+              rec.protected_seqs.push_back(static_cast<uint16_t>(sn_base + j));
+            }
+          }
+          if (k0) {
+            for (uint16_t j = 15; j <= 45; ++j) {
+              if ((word1 & (uint32_t{1} << (45 - j))) != 0) {
+                rec.protected_seqs.push_back(
+                    static_cast<uint16_t>(sn_base + j));
+              }
+            }
+          }
+          if (k1) {
+            for (uint16_t j = 46; j <= 109; ++j) {
+              if ((word2 & (uint64_t{1} << (109 - j))) != 0) {
+                rec.protected_seqs.push_back(
+                    static_cast<uint16_t>(sn_base + j));
+              }
+            }
+          }
+        }
+      } else {
+        // R=0, F=1 固定行列矩阵模式：SN base_i (16b) | L (8b) | D (8b)。
+        if (off + 4 > sz) {
+          return false;
+        }
+        const uint16_t sn_base = ReadBigEndian16(p + off);
+        const uint8_t cols_l = p[off + 2];
+        const uint8_t rows_d = p[off + 3];
+        off += 4;
+
+        // RFC 8627 图 14：L=0（含 L=0,D=0）必须忽略；跨度过大超出合理窗口亦忽略。
+        if (cols_l == 0) {
+          return false;
+        }
+        if (matched_single_stream) {
+          if (rows_d == 0 || rows_d == 1) {
+            for (uint16_t c = 0; c < cols_l; ++c) {
+              rec.protected_seqs.push_back(static_cast<uint16_t>(sn_base + c));
+            }
+          } else {
+            const uint32_t max_span = static_cast<uint32_t>(rows_d - 1) *
+                                      static_cast<uint32_t>(cols_l);
+            if (max_span >= kMaxCachedMediaPackets) {
+              return false;
+            }
+            for (uint16_t r = 0; r < rows_d; ++r) {
+              rec.protected_seqs.push_back(
+                  static_cast<uint16_t>(sn_base + r * cols_l));
+            }
           }
         }
       }
@@ -741,6 +930,12 @@ FlexfecReceiver::RecoverStatus FlexfecReceiver::TryRecover(
     }
   }
   if (missing_count == 0) {
+    return RecoverStatus::kAlreadyComplete;
+  }
+  const int64_t missing_uw = seq_unwrapper_.PeekUnwrap(missing_seq);
+  if (has_received_media_ &&
+      missing_uw < newest_unwrapped_seq_ -
+                       static_cast<int64_t>(kMaxCachedMediaPackets)) {
     return RecoverStatus::kAlreadyComplete;
   }
 

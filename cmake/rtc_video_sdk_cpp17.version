@@ -2,6 +2,8 @@
   global:
     extern "C++" {
       rtc::RtcVideoEngine::*;
+      rtc::LogSink::*;
+      rtc::RingBufferLogSink::*;
       rtc::CreateBuiltinQuicCongestionController*;
       rtc::CreateBuiltinQuicCcFactory*;
       "vtable for rtc::RtcVideoEngine";
@@ -13,6 +15,9 @@
       "vtable for rtc::LogSink";
       "typeinfo for rtc::LogSink";
       "typeinfo name for rtc::LogSink";
+      "vtable for rtc::RingBufferLogSink";
+      "typeinfo for rtc::RingBufferLogSink";
+      "typeinfo name for rtc::RingBufferLogSink";
       "vtable for rtc::IQuicCongestionController";
       "typeinfo for rtc::IQuicCongestionController";
       "typeinfo name for rtc::IQuicCongestionController";

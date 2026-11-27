@@ -46,6 +46,7 @@ void PrintUsage(const char* prog_name) {
       "  --bind-ip <ip>             WebSocket 信令监听地址（默认 0.0.0.0）\n"
       "  --ws-port <port>           WebSocket 信令监听端口（默认 9002，0 为随机端口）\n"
       "  --port-file <path>         将实际绑定的信令端口写入指定文件\n"
+      "  --auth-token <token>       启用信令房间加入鉴权令牌校验\n"
       "\n"
       "可选内置 STUN / TURN 中继服务选项（默认关闭）:\n"
       "  --enable-turn              开启内置 STUN / TURN UDP 中继转发服务\n"
@@ -63,6 +64,7 @@ void PrintUsage(const char* prog_name) {
       "  --max-lifetime <sec>       TURN 分配最大续期时长（默认 3600 秒）\n"
       "  --max-allocations <num>    最大并发 TURN 中继会话数（默认 2048）\n"
       "  --no-loopback-peers        禁止向 127.0.0.0/8 环回地址转发（公网生产防 SSRF 推荐开启）\n"
+      "  --allow-private-lan-peers  允许向内网 RFC1918/CGNAT 地址段转发（默认关闭防 SSRF）\n"
       "  -h, --help                 打印本帮助说明\n",
       prog_name != nullptr ? prog_name : "rtc_p2p_ws_signaling_server");
 }
@@ -73,6 +75,7 @@ int main(int argc, char** argv) {
   std::string bind_ip = "0.0.0.0";
   uint16_t ws_port = 9002;
   std::string port_file;
+  std::string auth_token;
 
   bool enable_turn = false;
   bool has_custom_turn_bind_ip = false;
@@ -94,6 +97,8 @@ int main(int argc, char** argv) {
       }
     } else if (arg == "--port-file" && i + 1 < argc) {
       port_file = argv[++i];
+    } else if (arg == "--auth-token" && i + 1 < argc) {
+      auth_token = argv[++i];
     } else if (arg == "--enable-turn" || arg == "--enable-stun-turn") {
       enable_turn = true;
     } else if (arg == "--turn-bind-ip" && i + 1 < argc) {
@@ -155,6 +160,8 @@ int main(int argc, char** argv) {
       }
     } else if (arg == "--no-loopback-peers") {
       turn_cfg.allow_loopback_peers = false;
+    } else if (arg == "--allow-private-lan-peers") {
+      turn_cfg.allow_private_lan_peers = true;
     } else if (!arg.empty() && arg.front() == '-') {
       std::fprintf(stderr, "未知命令行选项: %.*s\n",
                    static_cast<int>(arg.size()), arg.data());
@@ -182,6 +189,9 @@ int main(int argc, char** argv) {
 
   // 1. 启动 WebSocket P2P JSON 信令配对服务。
   rtc::P2pWsSignalingServer sig_server(bind_ip);
+  if (!auth_token.empty()) {
+    sig_server.SetRequiredAuthToken(auth_token);
+  }
   if (!sig_server.Start(ws_port)) {
     return 1;
   }

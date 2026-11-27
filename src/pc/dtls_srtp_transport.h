@@ -4,12 +4,14 @@
 // 1:1 对标 libwebrtc/p2p/base/dtls_transport.h、pc/srtp_session.h、
 // pc/srtp_transport.h、call/rtp_demuxer.h 与 pc/webrtc_sdp.h 实现。
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <map>
 #include <memory>
 #include <optional>
+#include <set>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -66,8 +68,9 @@ class SrtpSessionPair {
   bool SetupKeys(SrtpCipherProfile profile,
                  ArrayView<const uint8_t> send_master_key_and_salt,
                  ArrayView<const uint8_t> recv_master_key_and_salt);
+  void Reset();
 
-  bool IsActive() const { return active_; }
+  bool IsActive() const { return active_.load(std::memory_order_acquire); }
 
   bool ProtectRtp(std::vector<uint8_t>* packet_buf);
   bool ProtectRtcp(std::vector<uint8_t>* packet_buf);
@@ -75,11 +78,9 @@ class SrtpSessionPair {
   bool UnprotectRtcp(std::vector<uint8_t>* packet_buf);
 
  private:
-  void Reset();
-
   srtp_t send_ctx_ = nullptr;
   srtp_t recv_ctx_ = nullptr;
-  bool active_ = false;
+  std::atomic<bool> active_{false};
 };
 
 enum class DtlsRole {
@@ -93,6 +94,7 @@ class DtlsSrtpObserver {
 
   virtual void OnDtlsSrtpHandshakeComplete() = 0;
   virtual void OnDtlsSrtpError(std::string_view reason) = 0;
+  virtual void OnIceTransportState(IceTransportState /*state*/) {}
   virtual void OnDecryptedRtpPacket(const RtpPacket& packet,
                                     Timestamp receive_time) = 0;
   virtual void OnDecryptedRtcpPacket(ArrayView<const uint8_t> compound_rtcp,
@@ -118,7 +120,9 @@ class DtlsSrtpTransport final : public IceTransportObserver {
   void SetRtpHeaderExtensionMap(const RtpHeaderExtensionMap& ext_map);
   void StartHandshakeIfReady();
 
-  bool IsDtlsConnected() const { return handshake_complete_; }
+  bool IsDtlsConnected() const {
+    return handshake_complete_.load(std::memory_order_acquire);
+  }
   bool IsSrtpReady() const { return srtp_.IsActive(); }
 
   bool SendRtpPacket(const RtpPacket& packet);
@@ -136,7 +140,12 @@ class DtlsSrtpTransport final : public IceTransportObserver {
   }
 
  private:
+  static constexpr size_t kMaxInboundSsrcs = 32;
+
+  void ResetDtlsHandshakeState();
   void DriveDtlsHandshake();
+  void ProcessDtlsDatagram(ArrayView<const uint8_t> packet,
+                           Timestamp receive_time);
   void ScheduleDtlsRetransmitTimer();
   bool ExportAndInstallSrtpKeys();
 
@@ -151,13 +160,18 @@ class DtlsSrtpTransport final : public IceTransportObserver {
   DtlsRole role_ = DtlsRole::kClient;
   std::string expected_remote_fingerprint_;
   bool handshake_started_ = false;
-  bool handshake_complete_ = false;
+  std::atomic<bool> handshake_complete_{false};
+  Timestamp handshake_started_at_ = Timestamp::MinusInfinity();
+  uint64_t timer_generation_ = 0;
+  bool timer_scheduled_ = false;
 
   SSL_CTX* ssl_ctx_ = nullptr;
   SSL* ssl_ = nullptr;
   BIO* read_bio_ = nullptr;
   BIO* write_bio_ = nullptr;
   std::vector<std::vector<uint8_t>> pending_dtls_packets_;
+  std::vector<uint8_t> dtls_app_rx_buf_;
+  std::set<uint32_t> inbound_ssrcs_;
 
   SrtpSessionPair srtp_;
   RtpHeaderExtensionMap rtp_ext_map_ = RtpHeaderExtensionMap::BrowserDefault();
@@ -211,6 +225,7 @@ struct VideoMediaTrackDesc {
   uint8_t flexfec_pt = 118;
   bool has_rtx = true;
   bool has_flexfec = true;
+  std::string h264_profile_level_id = "42e01f";
   // RFC 8627 第 5.1.2 节标准子类型 `flexfec`（对端若提供 `flexfec-03` 则自动回显兼容）。
   std::string flexfec_subtype = "flexfec";
   uint32_t flexfec_repair_window_us = 10'000'000;
@@ -225,6 +240,14 @@ struct VideoMediaTrackDesc {
 enum class SdpMediaKind {
   kVideo = 0,
   kApplication = 1,
+  kUnsupported = 2,
+};
+
+struct RejectedMediaDesc {
+  std::string kind = "audio";
+  std::string proto = "UDP/TLS/RTP/SAVPF";
+  std::string fmt = "0";
+  std::string mid;
 };
 
 struct DataChannelMediaDesc {
@@ -239,8 +262,10 @@ struct PureVideoSdpDescription {
   std::string dtls_fingerprint_sha256;
   std::string dtls_setup = "actpass";
   std::vector<IceCandidate> candidates;
+  std::vector<std::string> raw_candidate_lines;
   std::vector<VideoMediaTrackDesc> video_m_sections;
   std::optional<DataChannelMediaDesc> data_m_section;
+  std::vector<RejectedMediaDesc> rejected_m_sections;
   std::vector<SdpMediaKind> m_section_order;
 
   std::string Serialize() const;

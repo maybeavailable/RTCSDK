@@ -49,6 +49,23 @@ using tcp = boost::asio::ip::tcp;
 
 constexpr const char* kDemoRoomId = "browser_moq_live";
 constexpr const char* kDemoPubPeerId = "embedded_cam";
+constexpr size_t kMaxConcurrentHttpClients = 64;
+
+bool IsAllowedLocalOrigin(std::string_view origin) {
+  if (origin.empty()) {
+    return true;
+  }
+  for (std::string_view pfx :
+       {"http://127.0.0.1", "https://127.0.0.1", "http://localhost",
+        "https://localhost", "http://[::1]", "https://[::1]"}) {
+    if (origin.size() >= pfx.size() &&
+        origin.substr(0, pfx.size()) == pfx &&
+        (origin.size() == pfx.size() || origin[pfx.size()] == ':')) {
+      return true;
+    }
+  }
+  return false;
+}
 
 std::atomic<bool> g_quit{false};
 void OnSignal(int /*sig*/) { g_quit.store(true); }
@@ -112,6 +129,8 @@ constexpr const char kBrowserMoqHtmlPage[] = R"HTML(<!DOCTYPE html>
     let activeWt = null;
     let activeWs = null;
     let videoDecoder = null;
+    let activeDecoderCodec = '';
+    let decoderFallbackForced = false;
     let framesRendered = 0;
     let nextClientReqId = 0;
     let highSubWriter = null;
@@ -214,11 +233,18 @@ constexpr const char kBrowserMoqHtmlPage[] = R"HTML(<!DOCTYPE html>
       return new Uint8Array(out);
     }
 
-    // ---------------- 视频帧渲染（W3C WebCodecs VideoDecoder + I_PCM 兜底软件光栅化） ----------------
-    function initVideoDecoder() {
-      seenKeyframe = false;
-      if ('VideoDecoder' in window) {
-        try {
+    // ---------------- 视频帧渲染（W3C WebCodecs VideoDecoder H.264/H.265 + I_PCM 兜底软件光栅化） ----------------
+    function ensureVideoDecoder(isH265) {
+      if (decoderFallbackForced || !('VideoDecoder' in window)) {
+        if (!videoDecoder) setStat('stDecoder', 'JS YUV420 Blitter');
+        return;
+      }
+      const codecStr = isH265 ? 'hev1.1.6.L93.B0' : 'avc1.42e01f';
+      if (videoDecoder && videoDecoder.state === 'configured' && activeDecoderCodec === codecStr) {
+        return;
+      }
+      try {
+        if (!videoDecoder || videoDecoder.state === 'closed') {
           videoDecoder = new VideoDecoder({
             output: (frame) => {
               if (canvas.width !== frame.displayWidth || canvas.height !== frame.displayHeight) {
@@ -233,16 +259,28 @@ constexpr const char kBrowserMoqHtmlPage[] = R"HTML(<!DOCTYPE html>
             error: (e) => {
               log('[WebCodecs fallback] ' + e.message);
               videoDecoder = null;
+              activeDecoderCodec = '';
+              decoderFallbackForced = true;
+              setStat('stDecoder', 'JS YUV420 Blitter');
             }
           });
-          videoDecoder.configure({ codec: 'avc1.42e01f', optimizeForLatency: true });
-          setStat('stDecoder', 'WebCodecs H.264');
-          return;
-        } catch (e) {
-          videoDecoder = null;
         }
+        videoDecoder.configure({ codec: codecStr, optimizeForLatency: true });
+        activeDecoderCodec = codecStr;
+        setStat('stDecoder', isH265 ? 'WebCodecs H.265' : 'WebCodecs H.264');
+      } catch (e) {
+        videoDecoder = null;
+        activeDecoderCodec = '';
+        decoderFallbackForced = true;
+        setStat('stDecoder', 'JS YUV420 Blitter');
       }
-      setStat('stDecoder', 'JS YUV420 Blitter');
+    }
+
+    function initVideoDecoder() {
+      seenKeyframe = false;
+      activeDecoderCodec = '';
+      decoderFallbackForced = false;
+      ensureVideoDecoder(false);
     }
 
     function renderIpcmFallback(annexB) {
@@ -268,10 +306,13 @@ constexpr const char kBrowserMoqHtmlPage[] = R"HTML(<!DOCTYPE html>
       setStat('stFrames', String(framesRendered));
     }
 
-    function handleAnnexBFrame(annexB, isKeyframe, tsUs, layerName, groupId, objId) {
+    function handleAnnexBFrame(annexB, isKeyframe, tsUs, layerName, groupId, objId, isH265 = false) {
       setStat('stLayer', layerName.toUpperCase());
       setStat('stLocation', groupId + ' / ' + objId);
-      if (isKeyframe) seenKeyframe = true;
+      if (isKeyframe) {
+        seenKeyframe = true;
+        ensureVideoDecoder(isH265);
+      }
       if (!seenKeyframe) return;
 
       if (videoDecoder && videoDecoder.state === 'configured') {
@@ -284,6 +325,8 @@ constexpr const char kBrowserMoqHtmlPage[] = R"HTML(<!DOCTYPE html>
           return;
         } catch (e) {
           videoDecoder = null;
+          activeDecoderCodec = '';
+          decoderFallbackForced = true;
           setStat('stDecoder', 'JS YUV420 Blitter');
         }
       }
@@ -301,9 +344,10 @@ constexpr const char kBrowserMoqHtmlPage[] = R"HTML(<!DOCTYPE html>
       if (capUs === null || mst.off + 2 > st.off + metaLen) return;
       const flags = payload[mst.off];
       const isKf = (flags & 0x01) !== 0;
+      const isH265 = (flags & 0x04) !== 0;
       const isHigh = (flags & 0x08) !== 0 || trackAlias === highAlias;
       const annexB = payload.subarray(st.off + metaLen);
-      handleAnnexBFrame(annexB, isKf, capUs, isHigh ? 'high' : 'low', groupId, objId);
+      handleAnnexBFrame(annexB, isKf, capUs, isHigh ? 'high' : 'low', groupId, objId, isH265);
     }
 
     function unpackMoqDataAndLog(payload, viaDatagram) {
@@ -414,6 +458,8 @@ constexpr const char kBrowserMoqHtmlPage[] = R"HTML(<!DOCTYPE html>
       let buf = new Uint8Array(0);
       let hdr = null;
       let prevObjId = null;
+      let isControlStream = false;
+      let isIgnoredStream = false;
 
       while (true) {
         const { value, done } = await reader.read();
@@ -424,33 +470,61 @@ constexpr const char kBrowserMoqHtmlPage[] = R"HTML(<!DOCTYPE html>
           buf = merged;
         }
 
-        if (!hdr) {
+        if (isIgnoredStream) {
+          buf = new Uint8Array(0);
+          if (done) break;
+          continue;
+        }
+
+        if (!hdr && !isControlStream) {
           const st = { off: 0 };
           const stype = readVi64(buf, st);
           if (stype === null) { if (done) break; continue; }
           if (stype === 0x2f00) {
-            // 服务端单向控制流（SETUP / GOAWAY），保持排空即可。
+            isControlStream = true;
+          } else if (stype === 0x05) {
+            isIgnoredStream = true;
             buf = new Uint8Array(0);
             if (done) break;
             continue;
+          } else {
+            const sidMode = (stype & 0x06) >> 1;
+            const hasProps = (stype & 0x01) !== 0;
+            const defPrio = (stype & 0x20) !== 0;
+            const trackAlias = readVi64(buf, st);
+            const groupId = readVi64(buf, st);
+            let subgroupId = 0;
+            if (sidMode === 0x02) subgroupId = readVi64(buf, st);
+            if (trackAlias === null || groupId === null || subgroupId === null) {
+              if (done) break;
+              continue;
+            }
+            if (!defPrio) {
+              if (st.off + 1 > buf.length) { if (done) break; continue; }
+              st.off += 1;
+            }
+            hdr = { trackAlias, groupId, hasProps };
+            buf = buf.subarray(st.off);
           }
-          const sidMode = (stype & 0x06) >> 1;
-          const hasProps = (stype & 0x01) !== 0;
-          const defPrio = (stype & 0x20) !== 0;
-          const trackAlias = readVi64(buf, st);
-          const groupId = readVi64(buf, st);
-          let subgroupId = 0;
-          if (sidMode === 0x02) subgroupId = readVi64(buf, st);
-          if (trackAlias === null || groupId === null || subgroupId === null) {
-            if (done) break;
-            continue;
+        }
+
+        if (isControlStream) {
+          while (buf.length > 0) {
+            const cst = { off: 0 };
+            const mtype = readVi64(buf, cst);
+            if (mtype === null || cst.off + 2 > buf.length) break;
+            const blen = (buf[cst.off] << 8) | buf[cst.off + 1];
+            if (cst.off + 2 + blen > buf.length) break;
+            if (mtype === 0x10) {
+              const bst = { off: cst.off + 2 };
+              const newUri = readVi64Str(buf, bst) || '';
+              const timeoutMs = readVi64(buf, bst) || 0;
+              log(`[MOQT Control] Received GOAWAY (uri="${newUri}", timeout_ms=${timeoutMs})`);
+            }
+            buf = buf.subarray(cst.off + 2 + blen);
           }
-          if (!defPrio) {
-            if (st.off + 1 > buf.length) { if (done) break; continue; }
-            st.off += 1;
-          }
-          hdr = { trackAlias, groupId, hasProps };
-          buf = buf.subarray(st.off);
+          if (done) break;
+          continue;
         }
 
         while (hdr && buf.length > 0) {
@@ -597,10 +671,11 @@ constexpr const char kBrowserMoqHtmlPage[] = R"HTML(<!DOCTYPE html>
         if (u8.length < 10) return;
         const isKf = (u8[0] & 0x01) !== 0;
         const isHigh = (u8[0] & 0x02) !== 0;
-        const view = new DataView(ev.buffer, ev.byteOffset, ev.byteLength);
+        const isH265 = (u8[0] & 0x04) !== 0;
+        const view = new DataView(ev.data);
         const grp = view.getUint32(1, false);
         const tsUs = view.getUint32(5, false) * 1000;
-        handleAnnexBFrame(u8.subarray(9), isKf, tsUs, isHigh ? 'high' : 'low', grp, 0);
+        handleAnnexBFrame(u8.subarray(9), isKf, tsUs, isHigh ? 'high' : 'low', grp, 0, isH265);
       };
     }
 
@@ -820,7 +895,12 @@ class BrowserMoqLiveGateway {
   BrowserMoqLiveGateway()
       : relay_("0.0.0.0"),
         http_queue_("moq-http-gw", rtc::TaskQueuePriority::kNormal),
-        acceptor_(http_queue_.io_context()) {}
+        bridge_cleanup_queue_("moq-ws-cleanup",
+                              rtc::TaskQueuePriority::kNormal),
+        acceptor_(http_queue_.io_context()),
+        lifetime_state_(std::make_shared<GatewayLifetimeState>()) {
+    lifetime_state_->http_queue = &http_queue_;
+  }
 
   ~BrowserMoqLiveGateway() { Stop(); }
 
@@ -844,9 +924,10 @@ class BrowserMoqLiveGateway {
       if (ec) return;
       acceptor_.listen(boost::asio::socket_base::max_listen_connections, ec);
       if (ec) return;
-      bound_http_port_ = acceptor_.local_endpoint(ec).port();
+      const uint16_t hp = acceptor_.local_endpoint(ec).port();
       http_ok = !ec;
       if (http_ok) {
+        bound_http_port_.store(hp, std::memory_order_release);
         DoAccept();
       }
     });
@@ -878,28 +959,34 @@ class BrowserMoqLiveGateway {
     if (stopped_.exchange(true)) {
       return;
     }
-    http_queue_.Invoke([this]() {
+    bound_http_port_.store(0, std::memory_order_release);
+    std::vector<std::shared_ptr<WsMoqBridgeSession>> bridges_to_stop;
+    http_queue_.Invoke([this, &bridges_to_stop]() {
       boost::system::error_code ec;
       acceptor_.close(ec);
+      for (const auto& [id, sess] : active_ws_bridges_) {
+        (void)id;
+        sess->ForceCloseOnHttpQueue();
+        bridges_to_stop.push_back(sess);
+      }
+      active_ws_bridges_.clear();
     });
+    {
+      std::lock_guard<std::mutex> lk(lifetime_state_->mu);
+      lifetime_state_->alive.store(false, std::memory_order_release);
+      lifetime_state_->http_queue = nullptr;
+    }
+    for (const auto& sess : bridges_to_stop) {
+      sess->ShutdownEngine();
+    }
+    bridges_to_stop.clear();
+    // 等待所有正在异步退出中的 WsMoqBridgeSession 彻底完成引擎销毁，杜绝悬垂引用。
+    bridge_cleanup_queue_.Shutdown();
     http_queue_.Shutdown();
 
     if (pump_thread_.joinable()) {
       pump_thread_.join();
     }
-    {
-      std::lock_guard<std::mutex> lock(ws_threads_mu_);
-      for (auto* s : active_ws_sockets_) {
-        boost::system::error_code ec;
-        s->close(ec);
-      }
-    }
-    for (auto& t : ws_threads_) {
-      if (t.joinable()) {
-        t.join();
-      }
-    }
-    ws_threads_.clear();
 
     pub_obs_.BindEngine(nullptr, -1);
     if (pub_engine_) {
@@ -909,213 +996,396 @@ class BrowserMoqLiveGateway {
     relay_.Stop();
   }
 
-  uint16_t http_port() const { return bound_http_port_; }
+  uint16_t http_port() const {
+    return bound_http_port_.load(std::memory_order_acquire);
+  }
   uint16_t moq_udp_port() const { return relay_.udp_port(); }
   std::string cert_sha256_hex() const { return relay_.certificate_sha256_hex(); }
 
  private:
+  struct GatewayLifetimeState {
+    std::mutex mu;
+    std::atomic<bool> alive{true};
+    rtc::TaskQueueBoost* http_queue = nullptr;
+  };
+
+  class WsMoqBridgeSession final
+      : public std::enable_shared_from_this<WsMoqBridgeSession>,
+        public rtc::IRtcEventObserver {
+   public:
+    WsMoqBridgeSession(uint64_t id,
+                       BrowserMoqLiveGateway* owner,
+                       std::shared_ptr<GatewayLifetimeState> lifetime_state,
+                       beast::tcp_stream stream,
+                       uint16_t relay_port)
+        : id_(id),
+          owner_(owner),
+          lifetime_state_(std::move(lifetime_state)),
+          ws_stream_(std::move(stream)),
+          rport_(relay_port) {
+      ws_stream_.read_message_max(256 * 1024);
+      ws_stream_.set_option(
+          websocket::stream_base::timeout::suggested(beast::role_type::server));
+    }
+
+    void Start(http::request<http::string_body> req) {
+      beast::get_lowest_layer(ws_stream_).expires_never();
+      auto self = shared_from_this();
+      ws_stream_.async_accept(
+          req, [self](beast::error_code ec) {
+            if (ec || self->closed_) {
+              self->OnDisconnectedOnHttpQueue();
+              return;
+            }
+            rtc::EngineConfig sub_cfg;
+            sub_cfg.transport_mode = RTC_TRANSPORT_MODE_MOQ_WEBTRANSPORT;
+            sub_cfg.signaling_or_moq_url =
+                "https://127.0.0.1:" + std::to_string(self->rport_) + "/moq";
+            sub_cfg.publish_codec = RTC_CODEC_H264;
+            auto eng = rtc::RtcVideoEngine::Create(sub_cfg, self.get());
+            rtc::DataChannelConfig dcfg;
+            dcfg.label = "ws_bridge_ctrl";
+            const int cid = eng->CreateDataChannel(dcfg);
+            {
+              std::lock_guard<std::mutex> lk(self->eng_mu_);
+              if (self->closed_) {
+                eng.reset();
+                return;
+              }
+              self->sub_ = std::move(eng);
+              self->dc_id_ = cid;
+            }
+            self->sub_->JoinRoom(kDemoRoomId,
+                                 "ws_viewer_" + std::to_string(self->id_));
+            self->DoRead();
+          });
+    }
+
+    void ForceCloseOnHttpQueue() {
+      if (closed_) {
+        return;
+      }
+      closed_ = true;
+      tx_queue_.clear();
+      beast::error_code ec;
+      beast::get_lowest_layer(ws_stream_).cancel();
+      beast::get_lowest_layer(ws_stream_).socket().close(ec);
+    }
+
+    void ShutdownEngine() {
+      std::unique_ptr<rtc::RtcVideoEngine> eng;
+      {
+        std::lock_guard<std::mutex> lk(eng_mu_);
+        eng = std::move(sub_);
+        dc_id_ = -1;
+      }
+      if (eng) {
+        eng->LeaveRoom();
+        eng.reset();
+      }
+    }
+
+    void OnEncoderBitrateAllocation(rtc_stream_layer_e,
+                                    bool,
+                                    uint32_t,
+                                    uint32_t) override {}
+    void OnEncoderForceIdr(rtc_stream_layer_e) override {}
+    void OnRemoteTrackPublished(const std::string& peer_id,
+                                const std::string& track_id,
+                                rtc_video_codec_e codec) override {
+      remote_is_h265_.store(codec == RTC_CODEC_H265, std::memory_order_release);
+      std::lock_guard<std::mutex> lk(eng_mu_);
+      if (peer_id == kDemoPubPeerId && sub_) {
+        sub_->SubscribeTrack(track_id, RTC_STREAM_LAYER_HIGH);
+      }
+    }
+    void OnRemoteTrackUnpublished(const std::string&,
+                                  const std::string&) override {}
+    void OnRemoteEncodedFrame(const std::string&,
+                              const std::string&,
+                              const rtc_encoded_frame_t& frame) override {
+      if (frame.data == nullptr || frame.size == 0) {
+        return;
+      }
+      const uint32_t grp = ++grp_;
+      const uint32_t ts_ms = static_cast<uint32_t>(frame.capture_ts_us / 1000);
+      auto pkt = std::make_shared<std::vector<uint8_t>>(9 + frame.size);
+      (*pkt)[0] =
+          (frame.is_keyframe ? 0x01u : 0x00u) |
+          (frame.layer == RTC_STREAM_LAYER_HIGH ? 0x02u : 0x00u) |
+          (remote_is_h265_.load(std::memory_order_acquire) ? 0x04u : 0x00u);
+      (*pkt)[1] = static_cast<uint8_t>((grp >> 24) & 0xFFu);
+      (*pkt)[2] = static_cast<uint8_t>((grp >> 16) & 0xFFu);
+      (*pkt)[3] = static_cast<uint8_t>((grp >> 8) & 0xFFu);
+      (*pkt)[4] = static_cast<uint8_t>(grp & 0xFFu);
+      (*pkt)[5] = static_cast<uint8_t>((ts_ms >> 24) & 0xFFu);
+      (*pkt)[6] = static_cast<uint8_t>((ts_ms >> 16) & 0xFFu);
+      (*pkt)[7] = static_cast<uint8_t>((ts_ms >> 8) & 0xFFu);
+      (*pkt)[8] = static_cast<uint8_t>(ts_ms & 0xFFu);
+      std::memcpy(pkt->data() + 9, frame.data, frame.size);
+
+      PostToGatewayHttpQueue(/*is_bin=*/true, std::move(pkt));
+    }
+    void OnConnectionState(rtc_connection_state_e, int) override {}
+    void OnDataChannelMessage(const std::string&,
+                              int,
+                              bool,
+                              const uint8_t* data,
+                              size_t size) override {
+      auto buf = std::make_shared<std::vector<uint8_t>>(data, data + size);
+      PostToGatewayHttpQueue(/*is_bin=*/false, std::move(buf));
+    }
+
+   private:
+    void PostToGatewayHttpQueue(bool is_bin,
+                                std::shared_ptr<std::vector<uint8_t>> payload) {
+      if (!lifetime_state_) {
+        return;
+      }
+      std::lock_guard<std::mutex> lk(lifetime_state_->mu);
+      if (!lifetime_state_->alive.load(std::memory_order_acquire) ||
+          lifetime_state_->http_queue == nullptr) {
+        return;
+      }
+      auto self = shared_from_this();
+      lifetime_state_->http_queue->PostTask(
+          [self, is_bin, p = std::move(payload)]() mutable {
+            self->EnqueueWsWriteOnHttpQueue(is_bin, std::move(p));
+          });
+    }
+
+    void DoRead() {
+      if (closed_) {
+        return;
+      }
+      auto self = shared_from_this();
+      ws_stream_.async_read(rx_buf_, [self](beast::error_code ec, size_t) {
+        if (ec || self->closed_) {
+          self->OnDisconnectedOnHttpQueue();
+          return;
+        }
+        const std::string cmd = beast::buffers_to_string(self->rx_buf_.data());
+        self->rx_buf_.consume(self->rx_buf_.size());
+        {
+          std::lock_guard<std::mutex> lk(self->eng_mu_);
+          if (self->sub_) {
+            if (cmd == "SWITCH:low") {
+              self->sub_->SwitchSubscribedLayer(kDemoPubPeerId,
+                                                RTC_STREAM_LAYER_LOW);
+            } else if (cmd == "SWITCH:high") {
+              self->sub_->SwitchSubscribedLayer(kDemoPubPeerId,
+                                                RTC_STREAM_LAYER_HIGH);
+            } else if (cmd.rfind("DC:", 0) == 0 && self->dc_id_ >= 0) {
+              self->sub_->SendTextData(self->dc_id_, cmd.substr(3));
+            }
+          }
+        }
+        self->DoRead();
+      });
+    }
+
+    void EnqueueWsWriteOnHttpQueue(
+        bool is_bin,
+        std::shared_ptr<std::vector<uint8_t>> data) {
+      if (closed_ || !data || tx_queue_.size() >= 128) {
+        return;
+      }
+      tx_queue_.emplace_back(is_bin, std::move(data));
+      if (!writing_) {
+        DoWrite();
+      }
+    }
+
+    void DoWrite() {
+      if (closed_ || writing_ || tx_queue_.empty()) {
+        return;
+      }
+      writing_ = true;
+      const bool is_bin = tx_queue_.front().first;
+      auto active_buf = tx_queue_.front().second;
+      ws_stream_.binary(is_bin);
+      auto self = shared_from_this();
+      ws_stream_.async_write(
+          boost::asio::buffer(*active_buf),
+          [self, active_buf](beast::error_code ec, size_t) {
+            self->writing_ = false;
+            if (ec || self->closed_) {
+              self->OnDisconnectedOnHttpQueue();
+              return;
+            }
+            if (!self->tx_queue_.empty() &&
+                self->tx_queue_.front().second == active_buf) {
+              self->tx_queue_.pop_front();
+            }
+            self->DoWrite();
+          });
+    }
+
+    void OnDisconnectedOnHttpQueue() {
+      if (disconnect_scheduled_) {
+        return;
+      }
+      disconnect_scheduled_ = true;
+      ForceCloseOnHttpQueue();
+      if (lifetime_state_ &&
+          lifetime_state_->alive.load(std::memory_order_acquire) &&
+          owner_ != nullptr) {
+        owner_->active_ws_bridges_.erase(id_);
+        auto self = shared_from_this();
+        owner_->bridge_cleanup_queue_.PostTask(
+            [self]() { self->ShutdownEngine(); });
+      }
+    }
+
+    const uint64_t id_;
+    BrowserMoqLiveGateway* const owner_;
+    std::shared_ptr<GatewayLifetimeState> lifetime_state_;
+    websocket::stream<beast::tcp_stream> ws_stream_;
+    beast::flat_buffer rx_buf_;
+    std::deque<std::pair<bool, std::shared_ptr<std::vector<uint8_t>>>>
+        tx_queue_;
+    bool writing_ = false;
+    bool closed_ = false;
+    bool disconnect_scheduled_ = false;
+    uint16_t rport_;
+    std::mutex eng_mu_;
+    std::unique_ptr<rtc::RtcVideoEngine> sub_;
+    int dc_id_ = -1;
+    std::atomic<bool> remote_is_h265_{false};
+    std::atomic<uint32_t> grp_{0};
+  };
+
+  static std::string ExtractHostForWtUrl(std::string_view host_hdr) {
+    if (host_hdr.empty()) {
+      return "127.0.0.1";
+    }
+    if (host_hdr.front() == '[') {
+      const size_t rbr = host_hdr.find(']');
+      if (rbr != std::string_view::npos && rbr > 1) {
+        return std::string(host_hdr.substr(0, rbr + 1));
+      }
+      return "127.0.0.1";
+    }
+    const size_t colon = host_hdr.rfind(':');
+    if (colon != std::string_view::npos && host_hdr.find(':') == colon) {
+      const std::string_view h = host_hdr.substr(0, colon);
+      return h.empty() ? std::string("127.0.0.1") : std::string(h);
+    }
+    return std::string(host_hdr);
+  }
+
   void DoAccept() {
     acceptor_.async_accept([this](boost::system::error_code ec,
                                   tcp::socket socket) {
       if (ec || stopped_.load(std::memory_order_acquire)) {
         return;
       }
-      HandleHttpOrWsClient(std::move(socket));
+      if (active_http_clients_.load(std::memory_order_acquire) >=
+          kMaxConcurrentHttpClients) {
+        boost::system::error_code close_ec;
+        socket.close(close_ec);
+        DoAccept();
+        return;
+      }
       DoAccept();
+      HandleHttpOrWsClientAsync(std::move(socket));
     });
   }
 
-  void HandleHttpOrWsClient(tcp::socket socket) {
-    beast::error_code ec;
-    beast::flat_buffer buffer;
-    http::request<http::string_body> req;
-    http::read(socket, buffer, req, ec);
-    if (ec) {
-      return;
-    }
-
-    if (websocket::is_upgrade(req) && req.target() == "/ws-moq") {
-      std::lock_guard<std::mutex> lock(ws_threads_mu_);
-      ws_threads_.emplace_back(
-          [this, s = std::move(socket), req = std::move(req)]() mutable {
-            tcp::socket* raw_sock = &s;
-            {
-              std::lock_guard<std::mutex> lk(ws_threads_mu_);
-              active_ws_sockets_.insert(raw_sock);
-            }
-            // 使用预读取后的请求完成 WebSocket 升级握手
-            websocket::stream<tcp::socket> ws_check(std::move(s));
-            // 转交至桥接会话运行
-            WsMoqBridgeRunner(std::move(ws_check), req, relay_.udp_port(),
-                              raw_sock);
-          });
-      return;
-    }
-
-    http::response<http::string_body> res{http::status::ok, req.version()};
-    res.set(http::field::access_control_allow_origin, "*");
-
-    if (req.method() == http::verb::get && req.target() == "/") {
-      res.set(http::field::content_type, "text/html; charset=utf-8");
-      res.body() = kBrowserMoqHtmlPage;
-    } else if (req.method() == http::verb::get &&
-               req.target() == "/api/moq-info") {
-      std::string host_hdr(req[http::field::host]);
-      const size_t colon = host_hdr.find(':');
-      const std::string host_only =
-          (colon == std::string::npos || host_hdr.empty())
-              ? "127.0.0.1"
-              : host_hdr.substr(0, colon);
-
-      rtc::JsonObject info;
-      info.SetString("room_id", kDemoRoomId);
-      info.SetString("publisher_peer_id", kDemoPubPeerId);
-      info.SetUint32("moq_udp_port", relay_.udp_port());
-      info.SetString("wt_url", "https://" + host_only + ":" +
-                                   std::to_string(relay_.udp_port()) + "/moq");
-      info.SetString("cert_sha256", relay_.certificate_sha256_hex());
-      info.SetString("alpn", "h3");
-      info.SetString("moqt_protocol", "moqt-17");
-
-      res.set(http::field::content_type, "application/json");
-      res.body() = info.Serialize();
-    } else {
-      res.result(http::status::not_found);
-      res.body() = "Not Found";
-    }
-
-    res.prepare_payload();
-    http::write(socket, res, ec);
-    socket.shutdown(tcp::socket::shutdown_send, ec);
-  }
-
-  void WsMoqBridgeRunner(websocket::stream<tcp::socket> ws,
-                         const http::request<http::string_body>& upgrade_req,
-                         uint16_t relay_port,
-                         tcp::socket* tracked_key) {
-    class PreparedWsBridge final : public rtc::IRtcEventObserver {
-     public:
-      PreparedWsBridge(websocket::stream<tcp::socket> s, uint16_t port)
-          : ws_stream_(std::move(s)), rport_(port) {}
-
-      void Run(const http::request<http::string_body>& req) {
-        beast::error_code ec;
-        ws_stream_.accept(req, ec);
-        if (ec) return;
-
-        rtc::EngineConfig sub_cfg;
-        sub_cfg.transport_mode = RTC_TRANSPORT_MODE_MOQ_WEBTRANSPORT;
-        sub_cfg.signaling_or_moq_url =
-            "https://127.0.0.1:" + std::to_string(rport_) + "/moq";
-        sub_cfg.publish_codec = RTC_CODEC_H264;
-        sub_ = rtc::RtcVideoEngine::Create(sub_cfg, this);
-
-        rtc::DataChannelConfig dcfg;
-        dcfg.label = "ws_bridge_ctrl";
-        dc_id_ = sub_->CreateDataChannel(dcfg);
-        sub_->JoinRoom(kDemoRoomId,
-                       "ws_viewer_" + std::to_string(
-                           reinterpret_cast<uintptr_t>(this) & 0xFFFFu));
-
-        while (!ec) {
-          beast::flat_buffer rx;
-          ws_stream_.read(rx, ec);
-          if (ec) break;
-          const std::string cmd = beast::buffers_to_string(rx.data());
-          if (cmd == "SWITCH:low") {
-            sub_->SwitchSubscribedLayer(kDemoPubPeerId, RTC_STREAM_LAYER_LOW);
-          } else if (cmd == "SWITCH:high") {
-            sub_->SwitchSubscribedLayer(kDemoPubPeerId, RTC_STREAM_LAYER_HIGH);
-          } else if (cmd.rfind("DC:", 0) == 0 && dc_id_ >= 0) {
-            sub_->SendTextData(dc_id_, cmd.substr(3));
-          }
-        }
-        {
-          std::lock_guard<std::mutex> lk(mu_);
-          closed_ = true;
-        }
-        if (sub_) {
-          sub_->LeaveRoom();
-          sub_.reset();
-        }
+  void HandleHttpOrWsClientAsync(tcp::socket socket) {
+    struct HttpConn {
+      HttpConn(tcp::socket s, std::atomic<size_t>* counter)
+          : stream(std::move(s)), active_counter(counter) {
+        active_counter->fetch_add(1, std::memory_order_acq_rel);
+        parser.body_limit(256 * 1024);
       }
-
-      void OnEncoderBitrateAllocation(rtc_stream_layer_e,
-                                      bool,
-                                      uint32_t,
-                                      uint32_t) override {}
-      void OnEncoderForceIdr(rtc_stream_layer_e) override {}
-      void OnRemoteTrackPublished(const std::string& peer_id,
-                                  const std::string& track_id,
-                                  rtc_video_codec_e) override {
-        if (peer_id == kDemoPubPeerId && sub_) {
-          sub_->SubscribeTrack(track_id, RTC_STREAM_LAYER_HIGH);
-        }
+      ~HttpConn() {
+        active_counter->fetch_sub(1, std::memory_order_acq_rel);
       }
-      void OnRemoteTrackUnpublished(const std::string&,
-                                    const std::string&) override {}
-      void OnRemoteEncodedFrame(const std::string&,
-                                const std::string&,
-                                const rtc_encoded_frame_t& frame) override {
-        if (frame.data == nullptr || frame.size == 0) return;
-        const uint32_t grp = ++grp_;
-        const uint32_t ts_ms = static_cast<uint32_t>(frame.capture_ts_us / 1000);
-        std::vector<uint8_t> pkt(9 + frame.size);
-        pkt[0] = (frame.is_keyframe ? 0x01u : 0x00u) |
-                 (frame.layer == RTC_STREAM_LAYER_HIGH ? 0x02u : 0x00u);
-        pkt[1] = static_cast<uint8_t>((grp >> 24) & 0xFFu);
-        pkt[2] = static_cast<uint8_t>((grp >> 16) & 0xFFu);
-        pkt[3] = static_cast<uint8_t>((grp >> 8) & 0xFFu);
-        pkt[4] = static_cast<uint8_t>(grp & 0xFFu);
-        pkt[5] = static_cast<uint8_t>((ts_ms >> 24) & 0xFFu);
-        pkt[6] = static_cast<uint8_t>((ts_ms >> 16) & 0xFFu);
-        pkt[7] = static_cast<uint8_t>((ts_ms >> 8) & 0xFFu);
-        pkt[8] = static_cast<uint8_t>(ts_ms & 0xFFu);
-        std::memcpy(pkt.data() + 9, frame.data, frame.size);
-
-        std::lock_guard<std::mutex> lk(mu_);
-        if (closed_) return;
-        beast::error_code ec;
-        ws_stream_.binary(true);
-        ws_stream_.write(boost::asio::buffer(pkt), ec);
-      }
-      void OnConnectionState(rtc_connection_state_e, int) override {}
-      void OnDataChannelMessage(const std::string&,
-                                int,
-                                bool,
-                                const uint8_t* data,
-                                size_t size) override {
-        const std::string txt(reinterpret_cast<const char*>(data), size);
-        std::lock_guard<std::mutex> lk(mu_);
-        if (closed_) return;
-        beast::error_code ec;
-        ws_stream_.text(true);
-        ws_stream_.write(boost::asio::buffer(txt), ec);
-      }
-
-      tcp::socket* underlying_socket() { return &ws_stream_.next_layer(); }
-
-     private:
-      websocket::stream<tcp::socket> ws_stream_;
-      uint16_t rport_;
-      std::unique_ptr<rtc::RtcVideoEngine> sub_;
-      int dc_id_ = -1;
-      std::atomic<uint32_t> grp_{0};
-      std::mutex mu_;
-      bool closed_ = false;
+      beast::tcp_stream stream;
+      std::atomic<size_t>* active_counter;
+      beast::flat_buffer buffer;
+      http::request_parser<http::string_body> parser;
+      http::response<http::string_body> res;
     };
+    auto conn =
+        std::make_shared<HttpConn>(std::move(socket), &active_http_clients_);
+    conn->stream.expires_after(std::chrono::seconds(5));
+    http::async_read(
+        conn->stream, conn->buffer, conn->parser,
+        [this, conn](beast::error_code ec, size_t /*n*/) {
+          if (ec || stopped_.load(std::memory_order_acquire)) {
+            return;
+          }
+          auto req = conn->parser.release();
+          const std::string origin(req[http::field::origin]);
+          const bool origin_ok = IsAllowedLocalOrigin(origin);
 
-    PreparedWsBridge bridge(std::move(ws), relay_port);
-    {
-      std::lock_guard<std::mutex> lk(ws_threads_mu_);
-      active_ws_sockets_.erase(tracked_key);
-      active_ws_sockets_.insert(bridge.underlying_socket());
-    }
-    bridge.Run(upgrade_req);
-    {
-      std::lock_guard<std::mutex> lk(ws_threads_mu_);
-      active_ws_sockets_.erase(bridge.underlying_socket());
-    }
+          if (websocket::is_upgrade(req) && req.target() == "/ws-moq") {
+            if (!origin_ok || active_ws_bridges_.size() >= 32) {
+              return;
+            }
+            const uint64_t bid = ++next_ws_bridge_id_;
+            auto sess = std::make_shared<WsMoqBridgeSession>(
+                bid, this, lifetime_state_, std::move(conn->stream),
+                relay_.udp_port());
+            active_ws_bridges_.emplace(bid, sess);
+            sess->Start(std::move(req));
+            return;
+          }
+
+          conn->res =
+              http::response<http::string_body>{http::status::ok, req.version()};
+          if (!origin_ok) {
+            conn->res.result(http::status::forbidden);
+            conn->res.body() = "Forbidden cross-origin request";
+          } else {
+            if (!origin.empty()) {
+              conn->res.set(http::field::access_control_allow_origin, origin);
+              conn->res.set(http::field::vary, "Origin");
+            }
+            if (req.method() == http::verb::options) {
+              conn->res.set(http::field::access_control_allow_methods,
+                            "GET, OPTIONS");
+              conn->res.set(http::field::access_control_allow_headers,
+                            "Content-Type");
+            } else if (req.method() == http::verb::get && req.target() == "/") {
+              conn->res.set(http::field::content_type,
+                            "text/html; charset=utf-8");
+              conn->res.body() = kBrowserMoqHtmlPage;
+            } else if (req.method() == http::verb::get &&
+                       req.target() == "/api/moq-info") {
+              const std::string host_only = ExtractHostForWtUrl(
+                  std::string_view(req[http::field::host].data(),
+                                   req[http::field::host].size()));
+              rtc::JsonObject info;
+              info.SetString("room_id", kDemoRoomId);
+              info.SetString("publisher_peer_id", kDemoPubPeerId);
+              info.SetUint32("moq_udp_port", relay_.udp_port());
+              info.SetString("wt_url",
+                             "https://" + host_only + ":" +
+                                 std::to_string(relay_.udp_port()) + "/moq");
+              info.SetString("cert_sha256", relay_.certificate_sha256_hex());
+              info.SetString("alpn", "h3");
+              info.SetString("moqt_protocol", "moqt-17");
+
+              conn->res.set(http::field::content_type, "application/json");
+              conn->res.body() = info.Serialize();
+            } else {
+              conn->res.result(http::status::not_found);
+              conn->res.body() = "Not Found";
+            }
+          }
+
+          conn->res.prepare_payload();
+          conn->stream.expires_after(std::chrono::seconds(5));
+          http::async_write(
+              conn->stream, conn->res,
+              [conn](beast::error_code /*wec*/, size_t /*wn*/) {
+                beast::error_code sec;
+                conn->stream.socket().shutdown(tcp::socket::shutdown_send, sec);
+              });
+        });
   }
 
   void RunFramePumpLoop() {
@@ -1155,17 +1425,19 @@ class BrowserMoqLiveGateway {
 
   rtc::EmbeddedMoqRelayServer relay_;
   rtc::TaskQueueBoost http_queue_;
+  rtc::TaskQueueBoost bridge_cleanup_queue_;
   tcp::acceptor acceptor_;
-  uint16_t bound_http_port_ = 0;
+  std::shared_ptr<GatewayLifetimeState> lifetime_state_;
+  std::atomic<uint16_t> bound_http_port_{0};
+  std::atomic<size_t> active_http_clients_{0};
   std::atomic<bool> stopped_{false};
 
   EmbeddedMoqPubObserver pub_obs_;
   std::unique_ptr<rtc::RtcVideoEngine> pub_engine_;
   std::thread pump_thread_;
 
-  std::mutex ws_threads_mu_;
-  std::set<tcp::socket*> active_ws_sockets_;
-  std::vector<std::thread> ws_threads_;
+  uint64_t next_ws_bridge_id_ = 0;
+  std::map<uint64_t, std::shared_ptr<WsMoqBridgeSession>> active_ws_bridges_;
 };
 
 int RunAutomatedBrowserMoqSelfTest() {
@@ -1214,7 +1486,10 @@ int RunAutomatedBrowserMoqSelfTest() {
   // 2. 模拟浏览器通过 WebTransport over HTTP/3 + MOQT draft-17 拉流、切层并交互数据通道
   class SimulatedBrowserWtObserver final : public rtc::IRtcEventObserver {
    public:
-    void BindEngine(rtc::RtcVideoEngine* eng) { engine_ = eng; }
+    void BindEngine(rtc::RtcVideoEngine* eng) {
+      std::lock_guard<std::mutex> lock(mu_);
+      engine_ = eng;
+    }
 
     void OnEncoderBitrateAllocation(rtc_stream_layer_e,
                                     bool,
@@ -1224,8 +1499,13 @@ int RunAutomatedBrowserMoqSelfTest() {
     void OnRemoteTrackPublished(const std::string& peer_id,
                                 const std::string& track_id,
                                 rtc_video_codec_e) override {
-      if (peer_id == kDemoPubPeerId && engine_ != nullptr) {
-        engine_->SubscribeTrack(track_id, RTC_STREAM_LAYER_HIGH);
+      rtc::RtcVideoEngine* eng = nullptr;
+      {
+        std::lock_guard<std::mutex> lock(mu_);
+        eng = engine_;
+      }
+      if (peer_id == kDemoPubPeerId && eng != nullptr) {
+        eng->SubscribeTrack(track_id, RTC_STREAM_LAYER_HIGH);
       }
     }
     void OnRemoteTrackUnpublished(const std::string&,

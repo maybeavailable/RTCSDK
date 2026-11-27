@@ -12,8 +12,8 @@ void PacketSlabPool::Deleter::operator()(SlabPacketBuffer* buf) const noexcept {
     delete buf;
     return;
   }
-  if (auto locked = pool.lock()) {
-    locked->ReleaseToFreeList(buf);
+  if (pool != nullptr) {
+    pool->ReleaseToFreeList(buf);
   }
 }
 
@@ -42,13 +42,13 @@ PacketSlabPool::PacketPtr PacketSlabPool::Acquire() {
     free_list_.pop_front();
     --free_count_;
     front.Reset();
-    return PacketPtr(&front, Deleter{weak_from_this(), true});
+    return PacketPtr(&front, Deleter{shared_from_this(), true});
   }
   RTC_LOG(kWarning) << "PacketSlabPool exhausted (" << arena_.size()
                     << " slots), allocating overflow buffer";
   auto* fallback = new SlabPacketBuffer();
   fallback->Reset();
-  return PacketPtr(fallback, Deleter{weak_from_this(), false});
+  return PacketPtr(fallback, Deleter{nullptr, false});
 }
 
 void PacketSlabPool::ReleaseToFreeList(SlabPacketBuffer* buf) noexcept {

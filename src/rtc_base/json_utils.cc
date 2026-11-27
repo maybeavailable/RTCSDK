@@ -8,6 +8,9 @@ namespace rtc {
 
 namespace {
 
+constexpr size_t kMaxJsonInputBytes = 256 * 1024;
+constexpr size_t kMaxJsonObjectFields = 256;
+
 void AppendEscapedJsonString(std::string_view input, std::string* out) {
   out->push_back('"');
   for (const unsigned char ch : input) {
@@ -47,11 +50,100 @@ void AppendEscapedJsonString(std::string_view input, std::string* out) {
   out->push_back('"');
 }
 
+void AppendUtf8Codepoint(uint32_t cp, std::string* out) {
+  if (cp <= 0x7Fu) {
+    out->push_back(static_cast<char>(cp));
+  } else if (cp <= 0x7FFu) {
+    out->push_back(static_cast<char>(0xC0u | ((cp >> 6) & 0x1Fu)));
+    out->push_back(static_cast<char>(0x80u | (cp & 0x3Fu)));
+  } else if (cp <= 0xFFFFu) {
+    out->push_back(static_cast<char>(0xE0u | ((cp >> 12) & 0x0Fu)));
+    out->push_back(static_cast<char>(0x80u | ((cp >> 6) & 0x3Fu)));
+    out->push_back(static_cast<char>(0x80u | (cp & 0x3Fu)));
+  } else if (cp <= 0x10FFFFu) {
+    out->push_back(static_cast<char>(0xF0u | ((cp >> 18) & 0x07u)));
+    out->push_back(static_cast<char>(0x80u | ((cp >> 12) & 0x3Fu)));
+    out->push_back(static_cast<char>(0x80u | ((cp >> 6) & 0x3Fu)));
+    out->push_back(static_cast<char>(0x80u | (cp & 0x3Fu)));
+  }
+}
+
 void SkipWhitespace(std::string_view text, size_t* pos) {
   while (*pos < text.size() &&
          std::isspace(static_cast<unsigned char>(text[*pos]))) {
     ++(*pos);
   }
+}
+
+bool ParseHex4(std::string_view text, size_t pos, uint32_t* out_code) {
+  if (pos + 4 > text.size()) {
+    return false;
+  }
+  for (size_t i = 0; i < 4; ++i) {
+    if (!std::isxdigit(static_cast<unsigned char>(text[pos + i]))) {
+      return false;
+    }
+  }
+  uint32_t code = 0;
+  const auto res =
+      std::from_chars(text.data() + pos, text.data() + pos + 4, code, 16);
+  if (res.ec != std::errc{} || res.ptr != text.data() + pos + 4) {
+    return false;
+  }
+  *out_code = code;
+  return true;
+}
+
+bool IsValidJsonPrimitiveLiteral(std::string_view token) {
+  if (token == "true" || token == "false" || token == "null") {
+    return true;
+  }
+  if (token.empty()) {
+    return false;
+  }
+  size_t i = 0;
+  if (token[i] == '-') {
+    ++i;
+  }
+  if (i >= token.size()) {
+    return false;
+  }
+  if (token[i] == '0') {
+    ++i;
+  } else if (std::isdigit(static_cast<unsigned char>(token[i]))) {
+    while (i < token.size() &&
+           std::isdigit(static_cast<unsigned char>(token[i]))) {
+      ++i;
+    }
+  } else {
+    return false;
+  }
+  if (i < token.size() && token[i] == '.') {
+    ++i;
+    if (i >= token.size() ||
+        !std::isdigit(static_cast<unsigned char>(token[i]))) {
+      return false;
+    }
+    while (i < token.size() &&
+           std::isdigit(static_cast<unsigned char>(token[i]))) {
+      ++i;
+    }
+  }
+  if (i < token.size() && (token[i] == 'e' || token[i] == 'E')) {
+    ++i;
+    if (i < token.size() && (token[i] == '+' || token[i] == '-')) {
+      ++i;
+    }
+    if (i >= token.size() ||
+        !std::isdigit(static_cast<unsigned char>(token[i]))) {
+      return false;
+    }
+    while (i < token.size() &&
+           std::isdigit(static_cast<unsigned char>(token[i]))) {
+      ++i;
+    }
+  }
+  return i == token.size();
 }
 
 bool ParseJsonStringLiteral(std::string_view text,
@@ -63,11 +155,14 @@ bool ParseJsonStringLiteral(std::string_view text,
   ++(*pos);
   out->clear();
   while (*pos < text.size()) {
-    const char c = text[(*pos)++];
-    if (c == '"') {
+    const unsigned char uc = static_cast<unsigned char>(text[(*pos)++]);
+    if (uc == '"') {
       return true;
     }
-    if (c == '\\') {
+    if (uc < 0x20u) {
+      return false;
+    }
+    if (uc == '\\') {
       if (*pos >= text.size()) {
         return false;
       }
@@ -94,26 +189,35 @@ bool ParseJsonStringLiteral(std::string_view text,
           out->push_back('\t');
           break;
         case 'u': {
-          if (*pos + 4 > text.size()) {
-            return false;
-          }
           uint32_t code = 0;
-          const auto res =
-              std::from_chars(text.data() + *pos, text.data() + *pos + 4, code, 16);
-          if (res.ec != std::errc{}) {
+          if (!ParseHex4(text, *pos, &code)) {
             return false;
           }
           *pos += 4;
-          if (code <= 0x7F) {
-            out->push_back(static_cast<char>(code));
+          if (code >= 0xD800u && code <= 0xDBFFu) {
+            if (*pos + 6 <= text.size() && text[*pos] == '\\' &&
+                text[*pos + 1] == 'u') {
+              uint32_t low = 0;
+              if (!ParseHex4(text, *pos + 2, &low) || low < 0xDC00u ||
+                  low > 0xDFFFu) {
+                return false;
+              }
+              *pos += 6;
+              code = 0x10000u + (((code - 0xD800u) << 10) | (low - 0xDC00u));
+            } else {
+              return false;
+            }
+          } else if (code >= 0xDC00u && code <= 0xDFFFu) {
+            return false;
           }
+          AppendUtf8Codepoint(code, out);
           break;
         }
         default:
           return false;
       }
     } else {
-      out->push_back(c);
+      out->push_back(static_cast<char>(uc));
     }
   }
   return false;
@@ -174,6 +278,9 @@ std::string JsonObject::Serialize() const {
 }
 
 std::optional<JsonObject> JsonObject::Parse(std::string_view json_text) {
+  if (json_text.size() > kMaxJsonInputBytes) {
+    return std::nullopt;
+  }
   size_t pos = 0;
   SkipWhitespace(json_text, &pos);
   if (pos >= json_text.size() || json_text[pos] != '{') {
@@ -184,10 +291,16 @@ std::optional<JsonObject> JsonObject::Parse(std::string_view json_text) {
   JsonObject obj;
   SkipWhitespace(json_text, &pos);
   if (pos < json_text.size() && json_text[pos] == '}') {
-    return obj;
+    ++pos;
+    SkipWhitespace(json_text, &pos);
+    return (pos == json_text.size()) ? std::optional<JsonObject>(std::move(obj))
+                                     : std::nullopt;
   }
 
   while (pos < json_text.size()) {
+    if (obj.fields_.size() >= kMaxJsonObjectFields) {
+      return std::nullopt;
+    }
     SkipWhitespace(json_text, &pos);
     std::string key;
     if (!ParseJsonStringLiteral(json_text, &pos, &key)) {
@@ -217,11 +330,11 @@ std::optional<JsonObject> JsonObject::Parse(std::string_view json_text) {
              !std::isspace(static_cast<unsigned char>(json_text[pos]))) {
         ++pos;
       }
-      if (pos == start) {
+      const std::string_view raw_tok = json_text.substr(start, pos - start);
+      if (!IsValidJsonPrimitiveLiteral(raw_tok)) {
         return std::nullopt;
       }
-      obj.fields_[key] =
-          FieldValue{std::string(json_text.substr(start, pos - start)), false};
+      obj.fields_[key] = FieldValue{std::string(raw_tok), false};
     }
 
     SkipWhitespace(json_text, &pos);
@@ -231,7 +344,10 @@ std::optional<JsonObject> JsonObject::Parse(std::string_view json_text) {
     }
     if (pos < json_text.size() && json_text[pos] == '}') {
       ++pos;
-      return obj;
+      SkipWhitespace(json_text, &pos);
+      return (pos == json_text.size())
+                 ? std::optional<JsonObject>(std::move(obj))
+                 : std::nullopt;
     }
     return std::nullopt;
   }

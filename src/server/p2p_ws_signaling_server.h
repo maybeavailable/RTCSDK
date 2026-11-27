@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <string>
 
 #include <boost/asio/ip/tcp.hpp>
@@ -27,24 +28,34 @@ class P2pWsSignalingServer {
   P2pWsSignalingServer(const P2pWsSignalingServer&) = delete;
   P2pWsSignalingServer& operator=(const P2pWsSignalingServer&) = delete;
 
+  void SetRequiredAuthToken(std::string token);
+
   bool Start(uint16_t tcp_port = 0);
   void Stop();
 
-  uint16_t port() const { return bound_port_; }
+  uint16_t port() const {
+    return bound_port_.load(std::memory_order_acquire);
+  }
 
  private:
   struct ClientConn;
 
+  std::string GetRequiredAuthTokenCopy() const;
+  void RejectClientWithError(const std::shared_ptr<ClientConn>& client,
+                             std::string_view code,
+                             std::string_view message);
   void DoAccept();
   void OnClientMessage(const std::shared_ptr<ClientConn>& sender,
                        const std::string& raw_json);
   void OnClientDisconnected(uint64_t conn_id);
 
   std::string bind_ip_;
+  mutable std::mutex auth_mu_;
+  std::string required_auth_token_;
   TaskQueueBoost queue_;
   SequenceChecker checker_;
   boost::asio::ip::tcp::acceptor acceptor_;
-  uint16_t bound_port_ = 0;
+  std::atomic<uint16_t> bound_port_{0};
   uint64_t next_conn_id_ = 1;
   std::map<uint64_t, std::shared_ptr<ClientConn>> clients_;
   std::atomic<bool> stopped_{true};

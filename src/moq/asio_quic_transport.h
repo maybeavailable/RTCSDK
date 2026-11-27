@@ -98,16 +98,20 @@ struct QuicTrafficKeys {
 
 struct QuicTransportParameters {
   uint64_t max_idle_timeout_ms = 30'000;
+  uint64_t max_udp_payload_size = 65527;
   uint64_t initial_max_data = 16 * 1024 * 1024;
   uint64_t initial_max_stream_data_bidi_local = 2 * 1024 * 1024;
   uint64_t initial_max_stream_data_bidi_remote = 2 * 1024 * 1024;
   uint64_t initial_max_stream_data_uni = 4 * 1024 * 1024;
   uint64_t initial_max_streams_bidi = 256;
   uint64_t initial_max_streams_uni = 16384;
+  uint64_t ack_delay_exponent = 3;
+  uint64_t max_ack_delay_ms = 25;
   uint64_t active_connection_id_limit = 4;
   uint64_t max_datagram_frame_size = kQuicMaxDatagramSize;
   bool reset_stream_at_supported = true;
   QuicCid initial_source_cid{};
+  bool has_initial_source_cid = false;
   QuicCid original_destination_cid{};
   bool has_original_destination_cid = false;
 
@@ -189,12 +193,14 @@ class QuicCryptoUtils {
       QuicEncryptionLevel* out_level,
       QuicCid* out_dcid,
       QuicCid* out_scid,
-      size_t* out_total_packet_len);
+      size_t* out_total_packet_len,
+      size_t short_dcid_len = kQuicCidLength);
 
   static std::optional<UnprotectedPacket> UnprotectPacket(
       ArrayView<const uint8_t> datagram,
       const QuicTrafficKeys& keys,
-      int64_t largest_authenticated_pn);
+      int64_t largest_authenticated_pn,
+      size_t short_dcid_len = kQuicCidLength);
 };
 
 // 选择性确认（SACK）区间跟踪器及遵循 RFC 9000 第 19.3 节的 ACK 编解码器。
@@ -211,35 +217,104 @@ class QuicAckRangeSet {
   int64_t largest_received() const {
     return ranges_.empty() ? -1 : static_cast<int64_t>(ranges_.back().largest);
   }
+  uint64_t min_acceptable_pn() const { return min_acceptable_pn_; }
   bool needs_ack() const { return ack_needed_; }
+  void SetAckNeeded() { ack_needed_ = true; }
   void ClearAckNeeded() { ack_needed_ = false; }
 
   void EncodeAckFrame(uint64_t ack_delay_us, std::vector<uint8_t>* out) const;
   static bool DecodeAckFrame(ArrayView<const uint8_t> data,
                              size_t* offset,
                              uint64_t* out_ack_delay_us,
-                             std::vector<Range>* out_ranges);
+                             std::vector<Range>* out_ranges,
+                             uint64_t ack_delay_exponent = 3);
 
  private:
   std::vector<Range> ranges_;
+  uint64_t min_acceptable_pn_ = 0;
   bool ack_needed_ = false;
 };
 
-// 单流按偏移量有序的字节重组器，支持乱序 STREAM 帧重组、FIN 标志跟踪以及收到 RESET_STREAM 时立即释放缓冲区。
+// 单流按偏移量有序的字节重组器，支持乱序 STREAM 帧重组、流级流控窗口跟踪、FIN 标志校验以及收到 RESET_STREAM 时立即释放缓冲区。
 class QuicStreamReceiveBuffer {
  public:
+  static constexpr size_t kMaxOutOfOrderChunks = 1024;
+
+  void ConfigureFlowControlWindow(uint64_t initial_max_data) {
+    if (!flow_window_configured_) {
+      flow_window_configured_ = true;
+      window_size_ = initial_max_data;
+      max_receive_offset_ = initial_max_data;
+    }
+  }
+
+  bool ValidateAndAccountReceive(uint64_t offset,
+                                 size_t length,
+                                 bool fin,
+                                 uint64_t* out_newly_received_bytes,
+                                 uint64_t* out_quic_error_code);
+
   void InsertChunk(uint64_t offset, ArrayView<const uint8_t> data, bool fin);
   bool ExtractContiguous(std::vector<uint8_t>* out_data, bool* out_fin);
+  bool ExtractContiguousUpTo(uint64_t max_offset,
+                             std::vector<uint8_t>* out_data,
+                             bool* out_fin);
+  void MarkStopSending() {
+    stop_sending_requested_ = true;
+    chunks_.clear();
+  }
+  void RecordFinalOffset(uint64_t final_off) {
+    final_offset_ = final_off;
+    highest_received_offset_ = std::max(highest_received_offset_, final_off);
+  }
+  void SetPendingResetAt(uint64_t reliable_size, uint64_t app_error_code) {
+    if (!pending_reset_reliable_size_.has_value() ||
+        reliable_size < *pending_reset_reliable_size_) {
+      pending_reset_reliable_size_ = reliable_size;
+      pending_reset_app_err_ = app_error_code;
+    }
+  }
   void Reset();
 
   bool is_reset() const { return reset_; }
+  bool is_stop_sending_requested() const { return stop_sending_requested_; }
+  bool has_pending_reset_at() const {
+    return pending_reset_reliable_size_.has_value();
+  }
+  uint64_t reliable_reset_size() const {
+    return pending_reset_reliable_size_.value_or(0);
+  }
+  uint64_t reset_app_error_code() const { return pending_reset_app_err_; }
+  std::optional<uint64_t> final_offset() const { return final_offset_; }
   bool is_complete() const { return fin_delivered_ || reset_; }
+  bool flow_window_configured() const { return flow_window_configured_; }
+  uint64_t next_deliver_offset() const { return next_deliver_offset_; }
+  uint64_t highest_received_offset() const { return highest_received_offset_; }
+  uint64_t max_receive_offset() const { return max_receive_offset_; }
+  uint64_t window_size() const { return window_size_; }
+  void set_max_receive_offset(uint64_t val) {
+    max_receive_offset_ = std::max(max_receive_offset_, val);
+  }
+  uint64_t accounted_consumed_offset() const {
+    return accounted_consumed_offset_;
+  }
+  void set_accounted_consumed_offset(uint64_t val) {
+    accounted_consumed_offset_ = val;
+  }
 
  private:
   uint64_t next_deliver_offset_ = 0;
+  uint64_t highest_received_offset_ = 0;
+  uint64_t max_receive_offset_ = 0;
+  uint64_t window_size_ = 0;
+  uint64_t accounted_consumed_offset_ = 0;
+  bool flow_window_configured_ = false;
   std::optional<uint64_t> final_offset_;
+  std::optional<uint64_t> pending_reset_reliable_size_;
+  uint64_t pending_reset_app_err_ = 0;
   bool fin_delivered_ = false;
   bool reset_ = false;
+  bool stop_sending_requested_ = false;
   std::map<uint64_t, std::vector<uint8_t>> chunks_;
 };
 
@@ -281,6 +356,10 @@ class AsioQuicClientEngine final
 
   int SetCongestionController(
       std::unique_ptr<IQuicCongestionController> controller) override;
+
+  void SetTlsVerifyConfig(bool verify_peer,
+                          std::string ca_cert_path,
+                          std::string pinned_cert_sha256);
 
   void SetSimulatedDropRates(double tx_drop_prob, double rx_drop_prob);
 

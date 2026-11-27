@@ -61,12 +61,26 @@ class PacketBuffer {
     bool is_first_in_frame = false;
     bool is_last_in_frame = false;
     bool is_keyframe = false;
+    bool is_fu = false;
+    bool is_fu_start = false;
+    bool is_fu_end = false;
+    uint8_t nalu_type = 0;
+    bool has_sps = false;
+    bool has_pps = false;
+    bool has_vps = false;
     Timestamp receive_time = Timestamp::MinusInfinity();
     std::optional<PlayoutDelayLimits> playout_delay;
     std::optional<CompactDependencyExtension> dep_ext;
     std::vector<uint8_t> annexb_chunk;
   };
 
+  struct AssembledSpan {
+    uint16_t first_seq = 0;
+    uint16_t last_seq = 0;
+    uint32_t rtp_ts = 0;
+  };
+
+  static bool AreAdjacentSlotsCompatible(const Slot& prev, const Slot& cur);
   bool PotentialNewFrame(uint16_t seq_num) const;
   std::vector<AssembledRtpFrame> FindFrames(uint16_t seq_num);
   void ExpandBufferSize();
@@ -75,7 +89,10 @@ class PacketBuffer {
   const size_t max_size_;
   std::vector<Slot> buffer_;
   bool first_packet_received_ = false;
+  bool is_cleared_to_first_seq_num_ = false;
   uint16_t first_seq_num_ = 0;
+  std::optional<uint16_t> last_assembled_end_seq_;
+  std::deque<AssembledSpan> recently_assembled_;
 };
 
 class NackModule2 {
@@ -110,12 +127,15 @@ class NackModule2 {
 
   void RecordReorderingDistance(uint16_t distance);
   uint16_t WaitNumberOfPackets(double probability) const;
+  void ClearUpToUnwrapped(int64_t target_unwrapped_seq);
 
   bool initialized_ = false;
   uint16_t newest_seq_num_ = 0;
+  int64_t newest_unwrapped_seq_ = 0;
+  RtpSeqUnwrapper seq_unwrapper_;
   TimeDelta rtt_ = TimeDelta::Millis(60);
-  std::map<uint16_t, NackInfo, bool (*)(uint16_t, uint16_t)> nack_list_;
-  std::deque<uint16_t> keyframe_list_;
+  std::map<int64_t, NackInfo> nack_list_;
+  std::deque<int64_t> keyframe_list_;
   std::vector<int> reordering_histogram_;
   size_t total_reordered_samples_ = 0;
 };
@@ -128,6 +148,7 @@ class RtpFrameReferenceFinder {
   RtpFrameReferenceFinder& operator=(const RtpFrameReferenceFinder&) = delete;
 
   std::vector<AssembledRtpFrame> ManageFrame(AssembledRtpFrame frame);
+  bool HasStalledFrames(Timestamp now, TimeDelta max_wait) const;
   void ClearTo(uint16_t seq_num);
 
  private:
@@ -136,9 +157,11 @@ class RtpFrameReferenceFinder {
 
   RtpSeqUnwrapper frame_num_unwrapper_;
   int64_t synthetic_frame_id_ = 0;
+  std::optional<int64_t> first_keyframe_id_;
   std::optional<int64_t> last_keyframe_id_;
   std::optional<int64_t> last_base_layer_frame_id_;
   std::optional<uint16_t> last_unwrapped_seq_end_;
+  std::deque<int64_t> recent_dd_frame_ids_;
   std::deque<AssembledRtpFrame> stashed_frames_;
 };
 
@@ -226,6 +249,7 @@ class FrameBuffer3 {
   const size_t max_size_;
   std::map<int64_t, AssembledRtpFrame> frames_;
   DecodedFramesHistory decoded_history_;
+  std::optional<int64_t> last_decoded_frame_id_;
   Timestamp oldest_undecodable_since_ = Timestamp::MinusInfinity();
 };
 

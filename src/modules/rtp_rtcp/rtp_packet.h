@@ -63,6 +63,11 @@ struct CompactDependencyExtension {
   uint8_t fdiffs[4]{};
 };
 
+struct RawExtension {
+  uint8_t id = 0;
+  std::vector<uint8_t> data;
+};
+
 class RtpPacket {
  public:
   static constexpr size_t kFixedHeaderSize = 12;
@@ -85,6 +90,7 @@ class RtpPacket {
 
   void set_extension_map(const RtpHeaderExtensionMap& ext_map) {
     ext_map_ = ext_map;
+    raw_wire_.clear();
   }
   const RtpHeaderExtensionMap& extension_map() const { return ext_map_; }
 
@@ -139,12 +145,24 @@ class RtpPacket {
 
   const std::optional<std::string>& mid() const { return mid_; }
   void SetMid(std::string_view mid_value);
+  void ClearMid() {
+    mid_.reset();
+    raw_wire_.clear();
+  }
 
   const std::optional<std::string>& rid() const { return rid_; }
   void SetRid(std::string_view rid_value);
+  void ClearRid() {
+    rid_.reset();
+    raw_wire_.clear();
+  }
 
   const std::optional<std::string>& repaired_rid() const { return rrid_; }
   void SetRepairedRid(std::string_view rrid_value);
+  void ClearRepairedRid() {
+    rrid_.reset();
+    raw_wire_.clear();
+  }
 
   std::optional<PlayoutDelayLimits> playout_delay() const {
     return playout_delay_;
@@ -192,6 +210,7 @@ class RtpPacket {
                                    const uint8_t* ptr,
                                    size_t len,
                                    const RtpHeaderExtensionMap& ext_map);
+  bool IsActiveKnownExtensionId(uint8_t id) const;
   bool UsesTwoByteExtensionHeader() const;
   size_t WriteExtensions(uint8_t* dst) const;
   size_t ExtensionsContentBytes() const;
@@ -211,6 +230,7 @@ class RtpPacket {
   std::optional<std::string> rrid_;
   std::optional<PlayoutDelayLimits> playout_delay_;
   std::optional<CompactDependencyExtension> dep_ext_;
+  std::vector<RawExtension> unknown_extensions_;
 
   std::vector<uint8_t> payload_;
   size_t padding_size_ = 0;

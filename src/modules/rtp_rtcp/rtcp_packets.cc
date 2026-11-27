@@ -128,7 +128,12 @@ std::vector<uint8_t> RtcpNack::Build() const {
   }
 
   std::vector<uint16_t> sorted = packet_ids;
-  const uint16_t anchor = sorted.front();
+  uint16_t anchor = sorted.front();
+  for (uint16_t id : sorted) {
+    if (AheadOf<uint16_t>(anchor, id)) {
+      anchor = id;
+    }
+  }
   std::sort(sorted.begin(), sorted.end(), [anchor](uint16_t a, uint16_t b) {
     return static_cast<uint16_t>(a - anchor) <
            static_cast<uint16_t>(b - anchor);
@@ -141,7 +146,7 @@ std::vector<uint8_t> RtcpNack::Build() const {
   };
   std::vector<FciItem> fcis;
   size_t idx = 0;
-  while (idx < sorted.size()) {
+  while (idx < sorted.size() && fcis.size() < 250) {
     const uint16_t pid = sorted[idx];
     uint16_t blp = 0;
     ++idx;
@@ -211,23 +216,45 @@ std::optional<RtcpPli> RtcpPli::Parse(ArrayView<const uint8_t> payload) {
 }
 
 std::vector<uint8_t> RtcpFir::Build() const {
-  std::vector<uint8_t> out(20, 0);
-  WriteRtcpHeader(out.data(), 4, rtcp_type::kPsfb, 20);
+  if (requests.empty()) {
+    std::vector<uint8_t> out(20, 0);
+    WriteRtcpHeader(out.data(), 4, rtcp_type::kPsfb, 20);
+    WriteBigEndian32(out.data() + 4, sender_ssrc);
+    WriteBigEndian32(out.data() + 8, 0);
+    WriteBigEndian32(out.data() + 12, media_ssrc);
+    out[16] = command_seq_num;
+    return out;
+  }
+  const size_t count = std::min<size_t>(requests.size(), 250);
+  const size_t total = 12 + count * 8;
+  std::vector<uint8_t> out(total, 0);
+  WriteRtcpHeader(out.data(), 4, rtcp_type::kPsfb, total);
   WriteBigEndian32(out.data() + 4, sender_ssrc);
   WriteBigEndian32(out.data() + 8, 0);
-  WriteBigEndian32(out.data() + 12, media_ssrc);
-  out[16] = command_seq_num;
+  for (size_t i = 0; i < count; ++i) {
+    WriteBigEndian32(out.data() + 12 + i * 8, requests[i].ssrc);
+    out[16 + i * 8] = requests[i].command_seq_num;
+  }
   return out;
 }
 
 std::optional<RtcpFir> RtcpFir::Parse(ArrayView<const uint8_t> payload) {
-  if (payload.size() < 16) {
+  if (payload.size() < 16 || ((payload.size() - 8) % 8) != 0) {
     return std::nullopt;
   }
   RtcpFir fir;
   fir.sender_ssrc = ReadBigEndian32(payload.data());
-  fir.media_ssrc = ReadBigEndian32(payload.data() + 8);
-  fir.command_seq_num = payload[12];
+  for (size_t off = 8; off + 8 <= payload.size(); off += 8) {
+    Request req;
+    req.ssrc = ReadBigEndian32(payload.data() + off);
+    req.command_seq_num = payload[off + 4];
+    fir.requests.push_back(req);
+  }
+  if (fir.requests.empty()) {
+    return std::nullopt;
+  }
+  fir.media_ssrc = fir.requests.front().ssrc;
+  fir.command_seq_num = fir.requests.front().command_seq_num;
   return fir;
 }
 
@@ -263,8 +290,16 @@ bool RtcpTransportFeedback::AddReceivedPacket(uint16_t sequence_number,
   }
   const int64_t quantized_us =
       (timestamp.us() / kTwccDeltaScaleUs) * kTwccDeltaScaleUs;
-  received_packets_.push_back(
-      ReceivedPacket{sequence_number, Timestamp::Micros(quantized_us)});
+  const Timestamp quantized_ts = Timestamp::Micros(quantized_us);
+  for (auto& existing : received_packets_) {
+    if (existing.sequence_number == sequence_number) {
+      if (quantized_ts < existing.receive_time) {
+        existing.receive_time = quantized_ts;
+      }
+      return true;
+    }
+  }
+  received_packets_.push_back(ReceivedPacket{sequence_number, quantized_ts});
   num_seq_no_ = std::max<uint16_t>(num_seq_no_, static_cast<uint16_t>(offset + 1));
   return true;
 }
@@ -273,7 +308,10 @@ std::vector<RtcpTransportFeedback::PacketStatus>
 RtcpTransportFeedback::AllPacketStatuses() const {
   std::map<uint16_t, Timestamp> rx_map;
   for (const auto& p : received_packets_) {
-    rx_map[p.sequence_number] = p.receive_time;
+    auto [it, inserted] = rx_map.emplace(p.sequence_number, p.receive_time);
+    if (!inserted && p.receive_time < it->second) {
+      it->second = p.receive_time;
+    }
   }
   std::vector<PacketStatus> out;
   out.reserve(num_seq_no_);
@@ -296,7 +334,10 @@ std::vector<uint8_t> RtcpTransportFeedback::Build() const {
 
   std::map<uint16_t, Timestamp> rx_map;
   for (const auto& p : received_packets_) {
-    rx_map[p.sequence_number] = p.receive_time;
+    auto [it, inserted] = rx_map.emplace(p.sequence_number, p.receive_time);
+    if (!inserted && p.receive_time < it->second) {
+      it->second = p.receive_time;
+    }
   }
 
   std::vector<uint8_t> symbols;
@@ -334,12 +375,53 @@ std::vector<uint8_t> RtcpTransportFeedback::Build() const {
   }
 
   std::vector<uint16_t> chunks;
-  for (size_t idx = 0; idx < symbols.size(); idx += 7) {
-    uint16_t chunk = 0xC000u;
-    for (size_t k = 0; k < 7 && (idx + k) < symbols.size(); ++k) {
-      chunk |= static_cast<uint16_t>((symbols[idx + k] & 0x03u) << (12 - k * 2));
+  size_t idx = 0;
+  while (idx < symbols.size()) {
+    const size_t rem = symbols.size() - idx;
+    const uint8_t first_sym = symbols[idx];
+    size_t run_len = 1;
+    while (run_len < rem && run_len < 0x1FFFu &&
+           symbols[idx + run_len] == first_sym) {
+      ++run_len;
     }
-    chunks.push_back(chunk);
+
+    const size_t vec1_cap = std::min<size_t>(14, rem);
+    bool can_use_1bit = true;
+    for (size_t k = 0; k < vec1_cap; ++k) {
+      if (symbols[idx + k] > 1) {
+        can_use_1bit = false;
+        break;
+      }
+    }
+
+    const size_t vector_cap = can_use_1bit ? vec1_cap : std::min<size_t>(7, rem);
+    if (run_len > vector_cap || (run_len == rem && run_len >= vector_cap)) {
+      // Run-Length Chunk: [0 (1b) | S (2b) | Run Length (13b)]
+      const uint16_t chunk = static_cast<uint16_t>(
+          ((static_cast<uint16_t>(first_sym) & 0x03u) << 13) |
+          static_cast<uint16_t>(run_len));
+      chunks.push_back(chunk);
+      idx += run_len;
+    } else if (can_use_1bit) {
+      // 1-bit Status Vector Chunk: [10 (2b) | S_0..S_13 (14b)]
+      uint16_t chunk = 0x8000u;
+      for (size_t k = 0; k < vec1_cap; ++k) {
+        chunk |=
+            static_cast<uint16_t>((symbols[idx + k] & 0x01u) << (13 - k));
+      }
+      chunks.push_back(chunk);
+      idx += vec1_cap;
+    } else {
+      // 2-bit Status Vector Chunk: [11 (2b) | S_0..S_6 (14b)]
+      const size_t vec2_cap = std::min<size_t>(7, rem);
+      uint16_t chunk = 0xC000u;
+      for (size_t k = 0; k < vec2_cap; ++k) {
+        chunk |= static_cast<uint16_t>((symbols[idx + k] & 0x03u)
+                                       << (12 - k * 2));
+      }
+      chunks.push_back(chunk);
+      idx += vec2_cap;
+    }
   }
 
   const size_t unpadded = 20 + chunks.size() * 2 + deltas.size();
@@ -384,6 +466,9 @@ std::optional<RtcpTransportFeedback> RtcpTransportFeedback::Parse(
   fb.media_ssrc = ReadBigEndian32(raw + 4);
   fb.base_seq_no_ = ReadBigEndian16(raw + 8);
   fb.num_seq_no_ = ReadBigEndian16(raw + 10);
+  if (fb.num_seq_no_ == 0) {
+    return std::nullopt;
+  }
 
   uint32_t raw_ref = ReadBigEndian24(raw + 12);
   if ((raw_ref & 0x800000u) != 0) {
@@ -455,6 +540,8 @@ std::optional<RtcpTransportFeedback> RtcpTransportFeedback::Parse(
       cur_ticks += delta;
       fb.received_packets_.push_back(
           ReceivedPacket{seq, Timestamp::Micros(cur_ticks * kTwccDeltaScaleUs)});
+    } else {
+      return std::nullopt;
     }
   }
   return fb;
@@ -485,11 +572,17 @@ ParsedCompoundRtcp ParseCompoundRtcp(ArrayView<const uint8_t> data) {
     }
 
     size_t payload_len = pkt_bytes - 4;
-    if (has_padding && payload_len > 0) {
-      const uint8_t pad = raw[offset + pkt_bytes - 1];
-      if (pad <= payload_len) {
-        payload_len -= pad;
+    if (has_padding) {
+      if (payload_len == 0) {
+        offset += pkt_bytes;
+        continue;
       }
+      const uint8_t pad = raw[offset + pkt_bytes - 1];
+      if (pad == 0 || pad > payload_len) {
+        offset += pkt_bytes;
+        continue;
+      }
+      payload_len -= pad;
     }
     const ArrayView<const uint8_t> body(raw + offset + 4, payload_len);
 

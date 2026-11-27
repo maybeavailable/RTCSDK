@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <set>
 #include <string>
@@ -55,6 +56,7 @@ class EmbeddedMoqRelayServer final : public IQuicServerVisitor {
 
   void SetHttp3RequestHandler(
       Http3ServerConnection::Http3RequestHandler handler);
+  void SetRequiredAuthToken(std::string token);
   void SetSimulatedDropRates(double rx_drop_prob, double tx_drop_prob);
   void SetQuicCongestionControl(rtc_quic_cc_algo_e algo);
   void SetCustomQuicCongestionController(
@@ -95,6 +97,7 @@ class EmbeddedMoqRelayServer final : public IQuicServerVisitor {
     SpatialLayer active_layer = SpatialLayer::kHigh;
     bool waiting_for_group_switch = false;
     uint64_t active_group_id = 0;
+    uint64_t switch_epoch_min_group[2]{0, 0};
     std::optional<LayerSubStreamInfo> low_sub;
     std::optional<LayerSubStreamInfo> high_sub;
   };
@@ -104,8 +107,10 @@ class EmbeddedMoqRelayServer final : public IQuicServerVisitor {
       kUnknown,
       kControl,
       kSubgroup,
+      kIgnoredFetch,
     };
     Kind kind = Kind::kUnknown;
+    bool fin_received = false;
     MoqSubgroupHeader header;
     std::vector<uint8_t> header_buf;
     std::vector<std::pair<uint64_t, uint64_t>> downstream_targets;
@@ -118,22 +123,34 @@ class EmbeddedMoqRelayServer final : public IQuicServerVisitor {
       kPublishNamespace,
       kSubscribeVideo,
       kSubscribeData,
+      kPublishTrack,
+      kDetachedRequestUpdate,
     };
     Role role = Role::kUnparsed;
+    uint64_t initial_request_id = 0;
+    bool fin_received = false;
     MoqtTrackNamespace ns;
     std::string track_name;
     SpatialLayer video_layer = SpatialLayer::kHigh;
+    std::optional<uint64_t> published_track_alias;
     std::vector<uint8_t> rx_buf;
   };
 
   struct PeerSession {
     uint64_t session_id = 0;
+    uint64_t publisher_tag = 0;
     bool is_webtransport = false;
+    bool authenticated = false;
     std::shared_ptr<QuicServerSessionHandle> quic;
     uint64_t server_control_stream_id = 0;
+    std::optional<uint64_t> client_control_stream_id;
     bool peer_setup_received = false;
     uint64_t next_server_request_id = 1;  // 服务端使用奇数 Request ID：1, 3, 5, ...
     uint64_t next_track_alias = 100;
+
+    std::set<uint64_t> seen_client_request_ids;
+    std::map<uint64_t, uint64_t> active_client_req_id_to_stream;
+    std::set<uint64_t> client_published_aliases;
 
     std::string room_id;
     std::string peer_id;
@@ -165,6 +182,17 @@ class EmbeddedMoqRelayServer final : public IQuicServerVisitor {
   };
 
   static uint64_t AllocateServerRequestId(PeerSession* peer);
+  std::string GetRequiredAuthTokenCopy() const;
+  bool VerifyAuthTokenList(
+      const std::vector<std::vector<uint8_t>>& raw_tokens,
+      std::string_view required_token) const;
+  bool IsNamespaceStillPublishedByAnyPeer(
+      const MoqtTrackNamespace& full_ns) const;
+  PeerSession* FindNewestVideoPublisher(
+      const MoqtTrackNamespace& target_peer_ns);
+  void SupersedeStalePublisherSessions(PeerSession* new_pub,
+                                       const MoqtTrackNamespace& published_ns);
+  void CloseAndEraseSession(uint64_t session_id, uint64_t error_code);
   void BroadcastNamespaceChange(uint64_t origin_session_id,
                                 const MoqtTrackNamespace& full_ns,
                                 bool is_done);
@@ -188,11 +216,14 @@ class EmbeddedMoqRelayServer final : public IQuicServerVisitor {
 
   Clock* const clock_;
   std::string bind_ip_;
+  mutable std::mutex auth_mu_;
+  std::string required_auth_token_;
   std::unique_ptr<TaskQueueBoost> net_queue_;
   SequenceChecker net_checker_;
   std::unique_ptr<AsioQuicServer> quic_server_;
   Http3ServerConnection::Http3RequestHandler custom_h3_handler_;
   uint64_t next_wt_virtual_id_base_ = 1'000'000;
+  uint64_t next_publisher_tag_ = 0;
   std::map<uint64_t, std::shared_ptr<Http3ServerConnection>> h3_conns_;
   std::map<uint64_t, std::unique_ptr<PeerSession>> sessions_;
   std::atomic<bool> stopped_{true};

@@ -46,6 +46,7 @@ struct QuicCongestionSnapshot {
   double recent_loss_ratio = 0.0;
   uint64_t packets_sent = 0;
   uint64_t packets_lost = 0;
+  uint64_t packets_retransmitted = 0;
 };
 
 class IMoqQuicEngine {

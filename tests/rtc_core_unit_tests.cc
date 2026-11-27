@@ -2025,5 +2025,635 @@ TEST(RtpRtcpTest, Rfc8627AllVariantsWrapAroundAnd2DPeeling) {
   EXPECT_EQ(reparsed->video_m_sections[0].flexfec_ssrc, kFecSsrc);
 }
 
+// 验证负 frame_id 与畸形 DependencyDescriptor (fdiffs > fid / fdiffs == 0) 绝不触发越界读写或崩溃
+TEST(DefectRegressionTest, NegativeFrameIdAndMalformedDependencyDiffs) {
+  DecodedFramesHistory history(256);
+  EXPECT_FALSE(history.WasDecoded(-1));
+  EXPECT_FALSE(history.WasDecoded(-999999));
+  history.InsertDecoded(-42, 90000);
+  EXPECT_FALSE(history.WasDecoded(-42));
+  history.InsertDecoded(0, 90000);
+  EXPECT_TRUE(history.WasDecoded(0));
+
+  RtpFrameReferenceFinder finder;
+  AssembledRtpFrame malformed;
+  malformed.first_seq_num = 10;
+  malformed.last_seq_num = 10;
+  malformed.rtp_timestamp = 90000;
+  malformed.is_keyframe = false;
+  CompactDependencyExtension bad_ext;
+  bad_ext.frame_number = 2;
+  bad_ext.spatial_id = 0;
+  bad_ext.temporal_id = 0;
+  bad_ext.discardable = false;
+  bad_ext.num_fdiffs = 1;
+  bad_ext.fdiffs[0] = 50;  // fdiffs > unwrapped frame_number -> 必须安全丢弃
+  malformed.dependency_ext = bad_ext;
+  EXPECT_TRUE(finder.ManageFrame(std::move(malformed)).empty());
+
+  AssembledRtpFrame zero_diff;
+  zero_diff.first_seq_num = 11;
+  zero_diff.last_seq_num = 11;
+  zero_diff.rtp_timestamp = 93000;
+  bad_ext.frame_number = 3;
+  bad_ext.fdiffs[0] = 0;  // fdiff == 0 自引用 -> 必须安全丢弃
+  zero_diff.dependency_ext = bad_ext;
+  EXPECT_TRUE(finder.ManageFrame(std::move(zero_diff)).empty());
+}
+
+// 验证 NackModule2 在跨度 >32768 或超大跳变时无 std::map 比较器 UB 且无万级节点瞬时尖峰
+TEST(DefectRegressionTest, NackModule2WideSpanAndHugeJump) {
+  NackModule2 nack;
+  bool kf_req = false;
+  nack.OnReceivedPacket(10, true, false, Timestamp::Millis(100), &kf_req);
+  EXPECT_FALSE(kf_req);
+
+  // 1) 构造同时包含跨度 >32768 的两个未恢复丢包（seq=11 与 seq=35011，跨度 35000 > 32768）：
+  //    旧环形 SeqNumLess 比较器在此场景下违反严格弱序破坏红黑树，展开为 int64_t 后严格有序无 UB。
+  nack.OnReceivedPacket(12, false, false, Timestamp::Millis(105), &kf_req);
+  EXPECT_EQ(nack.PendingNackCount(), 1u);
+  for (uint16_t s = 13; s <= 35010; ++s) {
+    nack.OnReceivedPacket(s, false, false, Timestamp::Millis(110), &kf_req);
+  }
+  nack.OnReceivedPacket(35012, false, false, Timestamp::Millis(115), &kf_req);
+  EXPECT_EQ(nack.PendingNackCount(), 2u);
+
+  // 2) 单步前向跳变 20000（>kMaxNackPackets=512）：应 O(1) 清空并请求关键帧，绝不瞬时插入两万个节点。
+  kf_req = false;
+  auto jump_batch =
+      nack.OnReceivedPacket(55012, false, false, Timestamp::Millis(120), &kf_req);
+  EXPECT_TRUE(kf_req);
+  EXPECT_TRUE(jump_batch.empty());
+  EXPECT_EQ(nack.PendingNackCount(), 0u);
+
+  // 3) 随后正常丢 1 包（55013），应立即恢复精确跟踪。
+  kf_req = false;
+  nack.OnReceivedPacket(55014, false, false, Timestamp::Millis(140), &kf_req);
+  EXPECT_FALSE(kf_req);
+  EXPECT_EQ(nack.PendingNackCount(), 1u);
+}
+
+// 验证日志回调内重入打日志以及在回调内移除自身 Sink 不会死锁或无限递归
+TEST(DefectRegressionTest, ReentrantLogSinkAndSelfRemoveNoDeadlock) {
+  class ReentrantSelfRemovingSink final : public LogSink {
+   public:
+    void OnLogMessage(const LogEntryView& /*entry*/,
+                      std::string_view /*formatted_line*/) override {
+      const int prev = calls.fetch_add(1, std::memory_order_relaxed);
+      if (prev == 0) {
+        RTC_LOG(kInfo) << "nested_log_inside_sink_callback";
+        RtcVideoEngine::RemoveLogSink(this);
+      }
+    }
+    std::atomic<int> calls{0};
+  } sink;
+
+  LogMessage::SetLogToStderr(false);
+  RtcVideoEngine::AddLogSink(&sink, LoggingSeverity::kInfo);
+  RTC_LOG(kInfo) << "outer_trigger_log_message";
+  EXPECT_EQ(sink.calls.load(), 1);
+  LogMessage::SetLogToStderr(true);
+}
+
+// 验证 PacketSlabPool 分配的 PacketPtr 生命周期长于池本身时安全释放无悬垂/泄漏
+TEST(DefectRegressionTest, PacketSlabPoolPacketOutlivesPool) {
+  PacketSlabPool::PacketPtr held_pkt;
+  {
+    auto pool = PacketSlabPool::Create(4);
+    ASSERT_NE(pool, nullptr);
+    held_pkt = pool->Acquire();
+    ASSERT_NE(held_pkt, nullptr);
+    held_pkt->size = 32;
+    held_pkt->MutableData()[0] = 0x5Au;
+  }
+  EXPECT_EQ(held_pkt->Data()[0], 0x5Au);
+  held_pkt.reset();
+}
+
+// 验证超过 16 字节的 mid / rid 自动切换 RFC 8285 双字节扩展头且 SerializedSize 与实际字节数严格一致
+TEST(DefectRegressionTest, LongMidRidTwoByteHeaderExtensionRoundTrip) {
+  RtpHeaderExtensionMap ext_map;  // 完整启用 mid_id=3, rid_id=4, repaired_rid_id=5
+  RtpPacket pkt;
+  pkt.set_extension_map(ext_map);
+  pkt.set_payload_type(96);
+  pkt.set_ssrc(0xCAFEBABEu);
+  pkt.set_sequence_number(1024);
+  pkt.set_timestamp(180000);
+
+  const std::string long_mid = "video_mid_exceeding_sixteen_bytes_36";
+  const std::string long_rid = "simulcast_rid_exceeding_16_bytes";
+  ASSERT_GT(long_mid.size(), 16u);
+  ASSERT_GT(long_rid.size(), 16u);
+  pkt.SetMid(long_mid);
+  pkt.SetRid(long_rid);
+  const uint8_t payload[] = {0x01, 0x02, 0x03, 0x04};
+  pkt.SetPayload(payload);
+
+  const size_t predicted_size = pkt.SerializedSize();
+  const auto wire = pkt.Serialize();
+  EXPECT_EQ(wire.size(), predicted_size);
+
+  RtpPacket parsed;
+  parsed.set_extension_map(ext_map);
+  ASSERT_TRUE(parsed.Parse(wire));
+  EXPECT_EQ(parsed.mid(), long_mid);
+  EXPECT_EQ(parsed.rid(), long_rid);
+}
+
+// 验证 QUIC 流级流控校验、HTTP/3 QPACK max_field_section_size 强制上限与 IPv6 MoQ URL 解析
+TEST(DefectRegressionTest, QuicFlowControlHttp3FieldLimitAndMoqUrlIpv6) {
+  QuicStreamReceiveBuffer rx_buf;
+  rx_buf.ConfigureFlowControlWindow(1024);
+  uint64_t newly_rx = 0;
+  uint64_t quic_err = 0;
+  EXPECT_TRUE(
+      rx_buf.ValidateAndAccountReceive(0, 512, false, &newly_rx, &quic_err));
+  EXPECT_EQ(newly_rx, 512u);
+
+  // 超出单流接收窗口 -> FLOW_CONTROL_ERROR (0x03)
+  EXPECT_FALSE(
+      rx_buf.ValidateAndAccountReceive(512, 600, false, &newly_rx, &quic_err));
+  EXPECT_EQ(quic_err, 0x03u);
+
+  // FIN 声明的最终偏移小于已收到的最大偏移 -> FINAL_SIZE_ERROR (0x06)
+  EXPECT_FALSE(
+      rx_buf.ValidateAndAccountReceive(0, 256, true, &newly_rx, &quic_err));
+  EXPECT_EQ(quic_err, 0x06u);
+
+  // HTTP/3 QPACK 头部块尺寸超限拒绝
+  std::vector<HttpHeaderField> big_hdrs = {
+      {":method", "POST"},
+      {"x-large-custom-header", std::string(400, 'A')},
+  };
+  const auto encoded_hdrs = QpackCodec::EncodeFieldSection(big_hdrs, false);
+  std::vector<HttpHeaderField> decoded_hdrs;
+  EXPECT_FALSE(QpackCodec::DecodeFieldSection(encoded_hdrs, &decoded_hdrs, 128));
+  EXPECT_TRUE(
+      QpackCodec::DecodeFieldSection(encoded_hdrs, &decoded_hdrs, 65536));
+  EXPECT_EQ(decoded_hdrs.size(), 2u);
+
+  // IPv6 方括号 MoQ URL 解析
+  const ParsedMoqUrl v6 =
+      MoqRelayBackend::ParseMoqUrl("https://[2001:db8::1]:8443/moq");
+  EXPECT_TRUE(v6.use_webtransport);
+  EXPECT_EQ(v6.host, "2001:db8::1");
+  EXPECT_EQ(v6.port, 8443u);
+  EXPECT_EQ(v6.authority, "[2001:db8::1]:8443");
+  EXPECT_EQ(v6.path, "/moq");
+}
+
+// 验证 SCTP 忽略越界伪造 SACK cum_ack（不丢失未确认分片）以及 RFC 8831 Partial PPID 54/51 消息重组
+TEST(DefectRegressionTest, SctpBogusCumAckIgnoredAndPartialPpidReassembled) {
+  SimulatedClock sim_clock;
+
+  struct LoopbackSctpEndpoint final : public SctpDataChannelObserver {
+    SctpDataChannelManager* peer = nullptr;
+    SimulatedClock* clk = nullptr;
+    bool drop_tx = false;
+    uint32_t last_seen_peer_vtag = 0;
+    uint32_t last_seen_data_tsn = 0;
+    std::vector<std::string> rx_messages;
+
+    bool SendSctpPacketOverDtls(ArrayView<const uint8_t> packet) override {
+      if (packet.size() >= 16) {
+        const uint8_t chunk_type = packet[12];
+        if (chunk_type == 0x01u && packet.size() >= 20) {
+          // INIT chunk: initiate_tag 位于偏移 16..19
+          last_seen_peer_vtag = ReadBigEndian32(packet.data() + 16);
+        } else if (chunk_type == 0x00u && packet.size() >= 20) {
+          // DATA chunk: TSN 位于偏移 16..19
+          last_seen_data_tsn = ReadBigEndian32(packet.data() + 16);
+        }
+      }
+      if (drop_tx || peer == nullptr) {
+        return true;
+      }
+      peer->OnInboundSctpPacket(packet, clk->CurrentTime());
+      return true;
+    }
+    void OnSctpDataChannelState(int,
+                                const std::string&,
+                                rtc_data_channel_state_e) override {}
+    void OnSctpDataChannelMessage(int,
+                                  bool,
+                                  std::vector<uint8_t> payload) override {
+      rx_messages.emplace_back(payload.begin(), payload.end());
+    }
+  };
+
+  LoopbackSctpEndpoint cli_obs;
+  LoopbackSctpEndpoint srv_obs;
+  cli_obs.clk = &sim_clock;
+  srv_obs.clk = &sim_clock;
+  SctpDataChannelManager cli(&sim_clock, &cli_obs);
+  SctpDataChannelManager srv(&sim_clock, &srv_obs);
+  cli_obs.peer = &srv;
+  srv_obs.peer = &cli;
+
+  DataChannelConfig dc_cfg;
+  dc_cfg.label = "sec_test";
+  dc_cfg.negotiated = true;
+  dc_cfg.id = 0;
+  dc_cfg.ordered = true;
+  ASSERT_EQ(cli.CreateDataChannel(dc_cfg), 0);
+  ASSERT_EQ(srv.CreateDataChannel(dc_cfg), 0);
+
+  cli.ConfigureAndStart(DtlsRole::kClient, 5000, 5000);
+  srv.ConfigureAndStart(DtlsRole::kServer, 5000, 5000);
+  ASSERT_TRUE(cli.IsAssociationEstablished());
+  ASSERT_TRUE(srv.IsAssociationEstablished());
+  ASSERT_NE(cli_obs.last_seen_peer_vtag, 0u);
+
+  // 1) 阻断客户端发送并入队一条消息，使其停留在未确认队列；随后向客户端注入越界 cum_ack SACK。
+  cli_obs.drop_tx = true;
+  const std::string msg1 = "must_survive_bogus_sack";
+  ASSERT_EQ(cli.SendData(0,
+                         MakeArrayView(reinterpret_cast<const uint8_t*>(
+                                           msg1.data()),
+                                       msg1.size()),
+                         false),
+            RTC_OK);
+  EXPECT_TRUE(srv_obs.rx_messages.empty());
+
+  // 构造带合法 CRC32c、但 cum_tsn_ack 越界 (+50000) 的 SACK 报文注入客户端。
+  std::vector<uint8_t> bogus_sack(12 + 16, 0);
+  WriteBigEndian16(bogus_sack.data(), 5000);
+  WriteBigEndian16(bogus_sack.data() + 2, 5000);
+  WriteBigEndian32(bogus_sack.data() + 4, cli_obs.last_seen_peer_vtag);
+  bogus_sack[12] = 0x03u;  // SACK chunk
+  WriteBigEndian16(bogus_sack.data() + 14, 16);
+  WriteBigEndian32(bogus_sack.data() + 16, cli_obs.last_seen_data_tsn + 50000u);
+  WriteBigEndian32(bogus_sack.data() + 20, 1024 * 1024);
+  const uint32_t sack_crc = ComputeSctpPacketCrc32c(bogus_sack);
+  bogus_sack[8] = static_cast<uint8_t>(sack_crc & 0xFFu);
+  bogus_sack[9] = static_cast<uint8_t>((sack_crc >> 8) & 0xFFu);
+  bogus_sack[10] = static_cast<uint8_t>((sack_crc >> 16) & 0xFFu);
+  bogus_sack[11] = static_cast<uint8_t>((sack_crc >> 24) & 0xFFu);
+
+  cli.OnInboundSctpPacket(bogus_sack, sim_clock.CurrentTime());
+
+  // 恢复链路并触发 T3-rtx 超时重传：若越界 SACK 误删了未确认分片则永远无法送达！
+  cli_obs.drop_tx = false;
+  sim_clock.AdvanceTime(TimeDelta::Millis(300));
+  cli.OnPeriodicTick(sim_clock.CurrentTime());
+  ASSERT_EQ(srv_obs.rx_messages.size(), 1u);
+  EXPECT_EQ(srv_obs.rx_messages[0], msg1);
+}
+
+TEST(DefectRegressionTest, SecondPassDeepAuditRegressions) {
+  // 1) Units 正负无穷取反与饱和整数算术无 UB 校验
+  EXPECT_EQ(-TimeDelta::PlusInfinity(), TimeDelta::MinusInfinity());
+  EXPECT_EQ(-TimeDelta::MinusInfinity(), TimeDelta::PlusInfinity());
+  const TimeDelta near_max =
+      TimeDelta::Micros(std::numeric_limits<int64_t>::max() - 10);
+  const TimeDelta saturated = near_max + TimeDelta::Micros(100);
+  EXPECT_TRUE(saturated.IsPlusInfinity());
+  const TimeDelta finite_sum =
+      TimeDelta::Micros(1'000'000) + TimeDelta::Micros(2'500'000);
+  EXPECT_TRUE(finite_sum.IsFinite());
+  EXPECT_EQ(finite_sum.us(), 3'500'000);
+
+  // 2) SeqNumUnwrapper 乱序旧包不回退最高水位基准校验
+  RtpSeqUnwrapper unwrapper;
+  EXPECT_EQ(unwrapper.Unwrap(1000), 1000);
+  EXPECT_EQ(unwrapper.Unwrap(995), 995);
+  EXPECT_EQ(unwrapper.Unwrap(33767), 33767);
+
+  // 3) PacketBuffer 非 2 的幂容量对齐及孤立 FU-A 尾包不跨空洞组帧校验
+  PacketBuffer pbuf(VideoCodec::kH264, /*start_size=*/300, /*max_size=*/1000);
+  RtpPacket fua_tail;
+  fua_tail.set_payload_type(96);
+  fua_tail.set_sequence_number(500);
+  fua_tail.set_timestamp(90000);
+  fua_tail.set_marker(true);
+  const uint8_t fua_tail_payload[] = {0x7C, 0x45, 0xAA, 0xBB};
+  fua_tail.SetPayload(fua_tail_payload);
+  auto orphan_frames = pbuf.InsertPacket(fua_tail, Timestamp::Millis(10));
+  EXPECT_TRUE(orphan_frames.empty());
+  pbuf.ClearTo(500);
+
+  // 4) MoqtSubgroupObject::Decode 64 位 0xFF 长度回绕越界读拦截校验
+  const uint8_t wraparound_obj[] = {
+      0x00,
+      0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+      0x01, 0x02};
+  size_t obj_consumed = 0;
+  bool obj_violation = false;
+  auto bad_obj = MoqtSubgroupObject::Decode(
+      wraparound_obj, std::nullopt, /*header_has_properties=*/false,
+      &obj_consumed, &obj_violation);
+  EXPECT_FALSE(bad_obj.has_value());
+  EXPECT_TRUE(obj_violation);
+
+  // 5) RFC 5389 §15.4 MESSAGE-INTEGRITY 之后未签名注入属性必须忽略校验
+  StunMessage stun_req(StunMessageType::kBindingRequest);
+  stun_req.set_transaction_id(StunMessage::GenerateTransactionId());
+  stun_req.set_username("srv_u:cli_u");
+  stun_req.set_priority(12345);
+  auto stun_wire = stun_req.Serialize("secret_pwd", /*add_fingerprint=*/false);
+  const uint8_t injected_attr[] = {0x00, 0x09, 0x00, 0x04,
+                                   0x00, 0x00, 0x04, 0x57};
+  stun_wire.insert(stun_wire.end(), injected_attr,
+                   injected_attr + sizeof(injected_attr));
+  WriteBigEndian16(stun_wire.data() + 2,
+                   static_cast<uint16_t>(stun_wire.size() - 20));
+  auto parsed_stun = StunMessage::Parse(stun_wire, "secret_pwd");
+  ASSERT_TRUE(parsed_stun.has_value());
+  EXPECT_TRUE(parsed_stun->has_message_integrity());
+  EXPECT_EQ(parsed_stun->priority(), 12345u);
+  EXPECT_FALSE(parsed_stun->error_code().has_value());
+
+  // 6) RFC 3264 多媒体行 Offer 中未支持 m=audio 的端口置 0 拒绝保留校验
+  const std::string multi_m_offer =
+      "v=0\r\n"
+      "o=- 1 1 IN IP4 127.0.0.1\r\n"
+      "s=-\r\n"
+      "t=0 0\r\n"
+      "a=group:BUNDLE audio0 video0\r\n"
+      "m=audio 9 UDP/TLS/RTP/SAVPF 111\r\n"
+      "a=mid:audio0\r\n"
+      "a=ice-ufrag:ufrag1\r\n"
+      "a=ice-pwd:password1234567890123456\r\n"
+      "a=fingerprint:sha-256 "
+      "00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:"
+      "00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF\r\n"
+      "a=setup:actpass\r\n"
+      "m=video 9 UDP/TLS/RTP/SAVPF 96\r\n"
+      "a=mid:video0\r\n"
+      "a=ice-ufrag:ufrag1\r\n"
+      "a=ice-pwd:password1234567890123456\r\n"
+      "a=fingerprint:sha-256 "
+      "00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:"
+      "00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF\r\n"
+      "a=setup:actpass\r\n"
+      "a=rtpmap:96 H264/90000\r\n"
+      "a=sendrecv\r\n";
+  auto parsed_sdp = PureVideoSdpDescription::Parse(multi_m_offer);
+  ASSERT_TRUE(parsed_sdp.has_value());
+  ASSERT_EQ(parsed_sdp->rejected_m_sections.size(), 1u);
+  EXPECT_EQ(parsed_sdp->rejected_m_sections[0].kind, "audio");
+  parsed_sdp->session_type = "answer";
+  parsed_sdp->dtls_setup = "active";
+  const std::string answer_sdp = parsed_sdp->Serialize();
+  EXPECT_NE(answer_sdp.find("m=audio 0 UDP/TLS/RTP/SAVPF 111\r\n"),
+            std::string::npos);
+  EXPECT_LT(answer_sdp.find("m=audio 0"), answer_sdp.find("m=video 9"));
+}
+
+// 全面覆盖全仓审计修复项的单元回归测试（DataSize 负值钳位、flexfec-03 + 乱序回绕、ICE/BUNDLE 多媒体行、SCTP 0字节/PR-SCTP/Shutdown、QUIC 热切与抖动 BWE）
+TEST(DefectRegressionTest, FullCodebaseAuditFixesRegressions) {
+  // 1) DataSize 负字节数钳位至 0，确保 frame_size 差分绝不误判为 !IsFinite()
+  EXPECT_TRUE(DataSize::Bytes(-128).IsZero());
+  EXPECT_TRUE(DataSize::Bytes(-128).IsFinite());
+  const DataSize small = DataSize::Bytes(120);
+  const DataSize large = DataSize::Bytes(480);
+  EXPECT_TRUE((small - large).IsZero());
+  EXPECT_TRUE((small - large).IsFinite());
+
+  // 2) FlexFEC `flexfec-03` 线速格式 + 跨 65535->0 乱序输入组按模 2^16 排序纠错恢复
+  {
+    RtpHeaderExtensionMap ext_map = RtpHeaderExtensionMap::BrowserDefault();
+    FlexfecSender sender_03(118, 0x22334455u, 0x8899AABBu, "0", 10'000'000);
+    sender_03.set_use_flexfec_03(true);
+    EXPECT_TRUE(sender_03.use_flexfec_03());
+
+    FlexfecReceiver rx_auto(0x22334455u, 0x8899AABBu, 10'000'000);
+    rx_auto.set_extension_map(ext_map);
+
+    auto make_pkt = [&](uint16_t seq, uint32_t ts, size_t len) {
+      RtpPacket p;
+      p.set_extension_map(ext_map);
+      p.set_payload_type(96);
+      p.set_ssrc(0x8899AABBu);
+      p.set_sequence_number(seq);
+      p.set_timestamp(ts);
+      p.SetMid("0");
+      std::vector<uint8_t> body(len);
+      for (size_t i = 0; i < len; ++i) {
+        body[i] = static_cast<uint8_t>((seq * 31u + i * 11u) & 0xFFu);
+      }
+      p.SetPayload(body);
+      return p;
+    };
+
+    const RtpPacket p_65535 = make_pkt(65535, 90000, 110);
+    const RtpPacket p_0 = make_pkt(0, 90000, 145);
+    const RtpPacket p_1 = make_pkt(1, 90000, 92);
+    // 故意以乱序 {&p_1, &p_65535, &p_0} 传入，验证模 2^16 最小锚点排序（sn_base 应为 65535）及 flexfec-03 20 字节固定头布局
+    auto fec_03 =
+        sender_03.BuildFlexibleMaskParityPacket({&p_1, &p_65535, &p_0});
+    ASSERT_TRUE(fec_03.has_value());
+    EXPECT_TRUE(fec_03->csrcs().empty());
+    ASSERT_GE(fec_03->payload_size(), 20u);
+    EXPECT_EQ(ReadBigEndian32(fec_03->payload().data() + 12), 0x8899AABBu);
+    EXPECT_EQ(ReadBigEndian16(fec_03->payload().data() + 16), 65535u);
+
+    EXPECT_TRUE(rx_auto.OnRtpPacket(p_65535).empty());
+    EXPECT_TRUE(rx_auto.OnRtpPacket(p_1).empty());
+    auto rec_03 = rx_auto.OnRtpPacket(*fec_03);
+    ASSERT_EQ(rec_03.size(), 1u);
+    EXPECT_EQ(rec_03[0].sequence_number(), 0u);
+    EXPECT_EQ(rec_03[0].payload(), p_0.payload());
+  }
+
+  // 3) ICE `raddr`/`rport` RFC 8839 序列化、BUNDLE 首 `m=audio` 节候选提取与多 `m=video` 附加节端口置 0 拒绝
+  {
+    IceCandidate srflx_cand;
+    srflx_cand.type = IceCandidateType::kSrflx;
+    srflx_cand.address = boost::asio::ip::udp::endpoint(
+        boost::asio::ip::make_address_v4("203.0.113.77"), 54321);
+    srflx_cand.related_address = boost::asio::ip::udp::endpoint(
+        boost::asio::ip::make_address_v4("192.168.1.20"), 41000);
+    srflx_cand.foundation = IceCandidate::ComputeFoundation(
+        IceCandidateType::kSrflx, srflx_cand.related_address.address());
+    srflx_cand.priority = IceCandidate::ComputePriority(IceCandidateType::kSrflx);
+    const std::string cand_attr = srflx_cand.ToSdpAttribute();
+    EXPECT_NE(cand_attr.find(" typ srflx raddr 192.168.1.20 rport 41000"),
+              std::string::npos);
+    const auto reparsed_cand = IceCandidate::FromSdpAttribute(cand_attr);
+    ASSERT_TRUE(reparsed_cand.has_value());
+    EXPECT_EQ(reparsed_cand->related_address, srflx_cand.related_address);
+
+    const std::string bundle_offer =
+        "v=0\r\n"
+        "o=- 9 2 IN IP4 127.0.0.1\r\n"
+        "s=-\r\n"
+        "t=0 0\r\n"
+        "a=group:BUNDLE audio0 cam0 screen1\r\n"
+        "m=audio 9 UDP/TLS/RTP/SAVPF 111\r\n"
+        "a=mid:audio0\r\n"
+        "a=ice-ufrag:ufragB\r\n"
+        "a=ice-pwd:password1234567890123456\r\n"
+        "a=fingerprint:sha-256 "
+        "00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:"
+        "00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF\r\n"
+        "a=setup:actpass\r\n"
+        "a=candidate:1 1 udp 2122260223 192.0.2.55 50123 typ host\r\n"
+        "m=video 9 UDP/TLS/RTP/SAVPF 96\r\n"
+        "a=mid:cam0\r\n"
+        "a=rtpmap:96 H264/90000\r\n"
+        "a=sendrecv\r\n"
+        "m=video 9 UDP/TLS/RTP/SAVPF 96\r\n"
+        "a=mid:screen1\r\n"
+        "a=rtpmap:96 H264/90000\r\n"
+        "a=sendonly\r\n";
+    auto parsed_bundle = PureVideoSdpDescription::Parse(bundle_offer);
+    ASSERT_TRUE(parsed_bundle.has_value());
+    ASSERT_EQ(parsed_bundle->candidates.size(), 1u);
+    EXPECT_EQ(parsed_bundle->candidates[0].address.port(), 50123);
+    // 验证真实引擎 Answer 保留首个活跃视频 m= 节，并将 m=audio 与第二路额外 m=video 均置端口 0 拒绝
+    EngineConfig p2p_cfg;
+    p2p_cfg.transport_mode = RTC_TRANSPORT_MODE_WEBRTC_P2P;
+    p2p_cfg.publish_codec = RTC_CODEC_H264;
+    auto p2p_eng = RtcVideoEngine::Create(p2p_cfg, nullptr);
+    ASSERT_NE(p2p_eng, nullptr);
+    std::string ans_text;
+    ASSERT_EQ(p2p_eng->SetRemoteDescription("offer", bundle_offer, &ans_text),
+              RTC_OK);
+    EXPECT_NE(ans_text.find("m=audio 0 "), std::string::npos);
+    EXPECT_NE(ans_text.find("m=video 9 "), std::string::npos);
+    EXPECT_NE(ans_text.find("m=video 0 "), std::string::npos);
+  }
+
+  // 4) SCTP 0字节 DATA 块拦截、PR-SCTP max_retransmits=0 多分片无损重组 + 丢包 FORWARD-TSN 重传恢复，以及 Shutdown 后二次复用
+  {
+    SimulatedClock clk;
+    struct SctpHarness final : public SctpDataChannelObserver {
+      SctpDataChannelManager* peer = nullptr;
+      SimulatedClock* clock = nullptr;
+      bool drop_data = false;
+      bool drop_forward_tsn_once = false;
+      uint32_t peer_vtag = 0;
+      std::vector<std::vector<uint8_t>> rx_msgs;
+
+      bool SendSctpPacketOverDtls(ArrayView<const uint8_t> pkt) override {
+        if (pkt.size() >= 20 && pkt[12] == 0x01u) {
+          peer_vtag = ReadBigEndian32(pkt.data() + 16);
+        }
+        if (pkt.size() >= 16) {
+          const uint8_t ctype = pkt[12];
+          if (drop_data && ctype == 0x00u) {
+            return true;
+          }
+          if (drop_forward_tsn_once && ctype == 0xC0u) {
+            drop_forward_tsn_once = false;
+            return true;
+          }
+        }
+        if (peer != nullptr) {
+          peer->OnInboundSctpPacket(pkt, clock->CurrentTime());
+        }
+        return true;
+      }
+      void OnSctpDataChannelState(int,
+                                  const std::string&,
+                                  rtc_data_channel_state_e) override {}
+      void OnSctpDataChannelMessage(int,
+                                    bool,
+                                    std::vector<uint8_t> payload) override {
+        rx_msgs.push_back(std::move(payload));
+      }
+    };
+
+    SctpHarness obs_a;
+    SctpHarness obs_b;
+    obs_a.clock = &clk;
+    obs_b.clock = &clk;
+    SctpDataChannelManager sctp_a(&clk, &obs_a);
+    SctpDataChannelManager sctp_b(&clk, &obs_b);
+    obs_a.peer = &sctp_b;
+    obs_b.peer = &sctp_a;
+
+    DataChannelConfig pr_cfg;
+    pr_cfg.label = "pr_zero_rtx";
+    pr_cfg.negotiated = true;
+    pr_cfg.id = 2;
+    pr_cfg.ordered = true;
+    pr_cfg.max_retransmits = 0;
+    const int ch_a = sctp_a.CreateDataChannel(pr_cfg);
+    const int ch_b = sctp_b.CreateDataChannel(pr_cfg);
+    ASSERT_GE(ch_a, 0);
+    ASSERT_GE(ch_b, 0);
+
+    sctp_a.ConfigureAndStart(DtlsRole::kClient, 5000, 5000);
+    sctp_b.ConfigureAndStart(DtlsRole::kServer, 5000, 5000);
+    ASSERT_TRUE(sctp_a.IsAssociationEstablished());
+    ASSERT_TRUE(sctp_b.IsAssociationEstablished());
+
+    // 4a) 注入 0 字节负载的非法 DATA chunk（chunk length = 16），必须安全拒绝且不触发空消息投递
+    std::vector<uint8_t> empty_data_pkt(12 + 16, 0);
+    WriteBigEndian16(empty_data_pkt.data(), 5000);
+    WriteBigEndian16(empty_data_pkt.data() + 2, 5000);
+    WriteBigEndian32(empty_data_pkt.data() + 4, obs_a.peer_vtag);
+    empty_data_pkt[12] = 0x00u;  // DATA
+    empty_data_pkt[13] = 0x03u;  // B|E
+    WriteBigEndian16(empty_data_pkt.data() + 14, 16);  // 0 字节用户数据（RFC 4960 禁止）
+    WriteBigEndian32(empty_data_pkt.data() + 24, 51);  // PPID WebRTC String
+    const uint32_t crc = ComputeSctpPacketCrc32c(empty_data_pkt);
+    empty_data_pkt[8] = static_cast<uint8_t>(crc & 0xFFu);
+    empty_data_pkt[9] = static_cast<uint8_t>((crc >> 8) & 0xFFu);
+    empty_data_pkt[10] = static_cast<uint8_t>((crc >> 16) & 0xFFu);
+    empty_data_pkt[11] = static_cast<uint8_t>((crc >> 24) & 0xFFu);
+    sctp_a.OnInboundSctpPacket(empty_data_pkt, clk.CurrentTime());
+    EXPECT_TRUE(obs_a.rx_msgs.empty());
+
+    // 4b) PR-SCTP max_retransmits=0 多分片大消息（3200B）在无丢包链路上必须完整送达
+    std::vector<uint8_t> multi_frag(3200, 0x5Cu);
+    ASSERT_EQ(sctp_a.SendData(ch_a, multi_frag, true), RTC_OK);
+    ASSERT_EQ(obs_b.rx_msgs.size(), 1u);
+    EXPECT_EQ(obs_b.rx_msgs[0], multi_frag);
+
+    // 4c) 丢弃下一条 max_retransmits=0 有序消息且同时丢弃首个 FORWARD-TSN 包，验证 T3-rtx 重传 FORWARD-TSN 后后续消息不卡死
+    obs_a.drop_data = true;
+    const std::vector<uint8_t> dropped_msg(600, 0xEEu);
+    ASSERT_EQ(sctp_a.SendData(ch_a, dropped_msg, true), RTC_OK);
+    obs_a.drop_data = false;
+    obs_a.drop_forward_tsn_once = true;
+    clk.AdvanceTime(TimeDelta::Millis(300));
+    sctp_a.OnPeriodicTick(clk.CurrentTime());  // 首次 FORWARD-TSN 被丢弃
+
+    const std::vector<uint8_t> follow_msg = {0x11, 0x22, 0x33, 0x44};
+    ASSERT_EQ(sctp_a.SendData(ch_a, follow_msg, true), RTC_OK);
+    // 推进时钟使丢失的 FORWARD-TSN 经 T3-rtx 重传到达，解锁有序流后续 SSN！
+    clk.AdvanceTime(TimeDelta::Millis(600));
+    sctp_a.OnPeriodicTick(clk.CurrentTime());
+    ASSERT_EQ(obs_b.rx_msgs.size(), 2u);
+    EXPECT_EQ(obs_b.rx_msgs[1], follow_msg);
+
+    // 4d) Shutdown() 清空全部关联状态并支持同一实例二次握手连通
+    sctp_a.Shutdown();
+    sctp_b.Shutdown();
+    EXPECT_FALSE(sctp_a.IsAssociationEstablished());
+    ASSERT_GE(sctp_a.CreateDataChannel(pr_cfg), 0);
+    ASSERT_GE(sctp_b.CreateDataChannel(pr_cfg), 0);
+    sctp_a.ConfigureAndStart(DtlsRole::kClient, 5000, 5000);
+    sctp_b.ConfigureAndStart(DtlsRole::kServer, 5000, 5000);
+    EXPECT_TRUE(sctp_a.IsAssociationEstablished());
+    EXPECT_TRUE(sctp_b.IsAssociationEstablished());
+  }
+
+  // 5) MoqBweAdapter 在 ±60ms 网络抖动（smoothed_rtt 抬高但应用受限、0% 丢包）下绝不发生 0.90^k 指数坍塌
+  {
+    MoqBweAdapter adapter(DataRate::KilobitsPerSec(150),
+                          DataRate::KilobitsPerSec(4000));
+    QuicCongestionSnapshot snap;
+    snap.min_rtt = TimeDelta::Millis(30);
+    snap.smoothed_rtt = TimeDelta::Millis(95);  // ±60ms 乱序抖动抬高 SRTT
+    snap.pacing_rate = DataRate::KilobitsPerSec(1500);
+    snap.delivery_rate = DataRate::KilobitsPerSec(1200);
+    snap.cwnd = DataSize::Bytes(32'000);
+    snap.bytes_in_flight = DataSize::Bytes(8'000);  // < 0.7 * cwnd (app-limited)
+    snap.packets_sent = 500;
+    snap.packets_lost = 0;
+
+    TargetTransferRate last_rate;
+    for (int i = 0; i < 40; ++i) {
+      snap.timestamp = Timestamp::Millis(1000 + i * 50);
+      last_rate = adapter.ConvertSnapshot(snap);
+    }
+    EXPECT_GE(last_rate.target_rate.kbps(), 1100);
+  }
+}
+
 }  // namespace
 }  // namespace rtc

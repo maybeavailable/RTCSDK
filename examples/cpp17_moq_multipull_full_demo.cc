@@ -362,6 +362,10 @@ int main(int argc, char** argv) {
   rtc::RtcVideoEngine::SetMinLogSeverity(rtc::LoggingSeverity::kInfo);
   rtc::RingBufferLogSink diag_ring(128);
   rtc::RtcVideoEngine::AddLogSink(&diag_ring, rtc::LoggingSeverity::kInfo);
+  struct LogSinkGuard {
+    rtc::LogSink* sink;
+    ~LogSinkGuard() { rtc::RtcVideoEngine::RemoveLogSink(sink); }
+  } sink_guard{&diag_ring};
 
   std::string relay_url;
   for (int i = 1; i + 1 < argc; ++i) {

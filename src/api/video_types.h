@@ -66,8 +66,14 @@ struct VideoBitrateAllocation {
   }
 };
 
+constexpr uint32_t MicrosToRtp90kHzU64(uint64_t ts_us) {
+  return static_cast<uint32_t>(
+      ((ts_us / 1000ULL) * 90ULL + ((ts_us % 1000ULL) * 90ULL) / 1000ULL) &
+      0xFFFFFFFFULL);
+}
+
 constexpr uint32_t MicrosToRtp90kHz(int64_t ts_us) {
-  return static_cast<uint32_t>((ts_us * 90) / 1000);
+  return ts_us <= 0 ? 0u : MicrosToRtp90kHzU64(static_cast<uint64_t>(ts_us));
 }
 
 }  // namespace rtc

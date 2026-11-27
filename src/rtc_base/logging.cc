@@ -1,14 +1,18 @@
 #include "rtc_base/logging.h"
 
-#include <unistd.h>
+#if defined(__linux__)
 #include <sys/syscall.h>
+#include <unistd.h>
+#endif
 
 #include <algorithm>
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <ctime>
 #include <iomanip>
 #include <iostream>
+#include <memory>
 
 #include "rtc_base/task_queue.h"
 
@@ -17,15 +21,27 @@ namespace rtc {
 namespace {
 
 struct RegisteredSink {
-  LogSink* sink = nullptr;
-  LoggingSeverity min_severity = LoggingSeverity::kInfo;
+  explicit RegisteredSink(LogSink* s, LoggingSeverity sev)
+      : sink(s), min_severity(static_cast<int>(sev)) {}
+
+  LogSink* const sink;
+  std::atomic<int> min_severity;
+  std::atomic<bool> active{true};
+  std::mutex inflight_mu;
+  std::condition_variable inflight_cv;
+  uint32_t inflight_count = 0;
 };
 
 struct GlobalLogRegistry {
   std::mutex mutex;
   LoggingSeverity configured_min_severity = LoggingSeverity::kInfo;
-  std::vector<RegisteredSink> sinks;
+  std::vector<std::shared_ptr<RegisteredSink>> sinks;
 };
+
+thread_local bool g_in_log_sink_dispatch = false;
+thread_local RegisteredSink* g_current_dispatch_sink = nullptr;
+std::atomic<int> g_stderr_min_severity{
+    static_cast<int>(LoggingSeverity::kInfo)};
 
 GlobalLogRegistry& GetLogRegistry() {
   static GlobalLogRegistry* registry = new GlobalLogRegistry();
@@ -74,7 +90,11 @@ std::string FormatTimestampWallClock(int64_t* out_epoch_us) {
   const int millis = static_cast<int>((epoch_us % 1'000'000) / 1000);
 
   struct tm tm_buf {};
+#if defined(_WIN32)
+  localtime_s(&tm_buf, &sec);
+#else
   localtime_r(&sec, &tm_buf);
+#endif
 
   char buf[80];
   std::snprintf(buf, sizeof(buf), "%04d-%02d-%02d %02d:%02d:%02d.%03d",
@@ -87,8 +107,12 @@ std::string FormatTimestampWallClock(int64_t* out_epoch_us) {
 
 // ======================= RingBufferLogSink 环形缓冲日志接收器 =======================
 
+LogSink::~LogSink() { LogMessage::RemoveLogSink(this); }
+
 RingBufferLogSink::RingBufferLogSink(size_t capacity)
     : capacity_(std::max<size_t>(capacity, 16)) {}
+
+RingBufferLogSink::~RingBufferLogSink() { LogMessage::RemoveLogSink(this); }
 
 void RingBufferLogSink::OnLogMessage(const LogEntryView& /*entry*/,
                                      std::string_view formatted_line) {
@@ -143,8 +167,14 @@ LogMessage::~LogMessage() {
        << queue_tag << "] [" << file_name_ << ":" << line_ << "] " << payload;
   const std::string formatted = full.str();
 
-  if (log_to_stderr_.load(std::memory_order_relaxed)) {
+  if (log_to_stderr_.load(std::memory_order_relaxed) &&
+      static_cast<int>(severity_) >=
+          g_stderr_min_severity.load(std::memory_order_relaxed)) {
     std::fprintf(stderr, "%s\n", formatted.c_str());
+  }
+
+  if (g_in_log_sink_dispatch) {
+    return;
   }
 
   LogEntryView view;
@@ -155,12 +185,43 @@ LogMessage::~LogMessage() {
   view.line = line_;
   view.message = payload;
 
-  GlobalLogRegistry& reg = GetLogRegistry();
-  std::lock_guard<std::mutex> lock(reg.mutex);
-  for (const auto& item : reg.sinks) {
-    if (item.sink != nullptr &&
-        static_cast<int>(severity_) >= static_cast<int>(item.min_severity)) {
-      item.sink->OnLogMessage(view, formatted);
+  std::vector<std::shared_ptr<RegisteredSink>> snapshot;
+  {
+    GlobalLogRegistry& reg = GetLogRegistry();
+    std::lock_guard<std::mutex> lock(reg.mutex);
+    snapshot = reg.sinks;
+  }
+
+  struct ReentrancyGuard {
+    ReentrancyGuard() { g_in_log_sink_dispatch = true; }
+    ~ReentrancyGuard() {
+      g_in_log_sink_dispatch = false;
+      g_current_dispatch_sink = nullptr;
+    }
+  } guard;
+
+  for (const auto& item : snapshot) {
+    if (!item || item->sink == nullptr ||
+        !item->active.load(std::memory_order_acquire) ||
+        static_cast<int>(severity_) <
+            item->min_severity.load(std::memory_order_relaxed)) {
+      continue;
+    }
+    {
+      std::lock_guard<std::mutex> lk(item->inflight_mu);
+      if (!item->active.load(std::memory_order_relaxed)) {
+        continue;
+      }
+      ++item->inflight_count;
+    }
+    g_current_dispatch_sink = item.get();
+    item->sink->OnLogMessage(view, formatted);
+    g_current_dispatch_sink = nullptr;
+    {
+      std::lock_guard<std::mutex> lk(item->inflight_mu);
+      if (--item->inflight_count == 0) {
+        item->inflight_cv.notify_all();
+      }
     }
   }
 }
@@ -169,7 +230,10 @@ void LogMessage::RecomputeEffectiveMinSeverityLocked() {
   GlobalLogRegistry& reg = GetLogRegistry();
   int effective = static_cast<int>(reg.configured_min_severity);
   for (const auto& item : reg.sinks) {
-    effective = std::min(effective, static_cast<int>(item.min_severity));
+    if (item) {
+      effective =
+          std::min(effective, item->min_severity.load(std::memory_order_relaxed));
+    }
   }
   min_severity_.store(effective, std::memory_order_relaxed);
 }
@@ -178,6 +242,8 @@ void LogMessage::SetMinLogSeverity(LoggingSeverity severity) noexcept {
   GlobalLogRegistry& reg = GetLogRegistry();
   std::lock_guard<std::mutex> lock(reg.mutex);
   reg.configured_min_severity = severity;
+  g_stderr_min_severity.store(static_cast<int>(severity),
+                              std::memory_order_relaxed);
   RecomputeEffectiveMinSeverityLocked();
 }
 
@@ -201,13 +267,14 @@ void LogMessage::AddLogSink(LogSink* sink, LoggingSeverity min_severity) {
   GlobalLogRegistry& reg = GetLogRegistry();
   std::lock_guard<std::mutex> lock(reg.mutex);
   for (auto& item : reg.sinks) {
-    if (item.sink == sink) {
-      item.min_severity = min_severity;
+    if (item && item->sink == sink) {
+      item->min_severity.store(static_cast<int>(min_severity),
+                               std::memory_order_relaxed);
       RecomputeEffectiveMinSeverityLocked();
       return;
     }
   }
-  reg.sinks.push_back(RegisteredSink{sink, min_severity});
+  reg.sinks.push_back(std::make_shared<RegisteredSink>(sink, min_severity));
   RecomputeEffectiveMinSeverityLocked();
 }
 
@@ -215,13 +282,24 @@ void LogMessage::RemoveLogSink(LogSink* sink) {
   if (sink == nullptr) {
     return;
   }
-  GlobalLogRegistry& reg = GetLogRegistry();
-  std::lock_guard<std::mutex> lock(reg.mutex);
-  reg.sinks.erase(
-      std::remove_if(reg.sinks.begin(), reg.sinks.end(),
-                     [sink](const RegisteredSink& r) { return r.sink == sink; }),
-      reg.sinks.end());
-  RecomputeEffectiveMinSeverityLocked();
+  std::shared_ptr<RegisteredSink> removed;
+  {
+    GlobalLogRegistry& reg = GetLogRegistry();
+    std::lock_guard<std::mutex> lock(reg.mutex);
+    for (auto it = reg.sinks.begin(); it != reg.sinks.end(); ++it) {
+      if (*it && (*it)->sink == sink) {
+        removed = *it;
+        removed->active.store(false, std::memory_order_release);
+        reg.sinks.erase(it);
+        break;
+      }
+    }
+    RecomputeEffectiveMinSeverityLocked();
+  }
+  if (removed && g_current_dispatch_sink != removed.get()) {
+    std::unique_lock<std::mutex> lk(removed->inflight_mu);
+    removed->inflight_cv.wait(lk, [&]() { return removed->inflight_count == 0; });
+  }
 }
 
 }  // namespace rtc

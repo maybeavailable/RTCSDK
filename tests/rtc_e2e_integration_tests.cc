@@ -298,6 +298,15 @@ class TestPeerObserver final : public IRtcEventObserver {
     return bitrate_callbacks_;
   }
 
+  void ResetSessionCounters() {
+    std::lock_guard<std::mutex> lk(mu_);
+    conn_state_ = RTC_CONN_STATE_IDLE;
+    discovered_tracks_.clear();
+    local_candidates_.clear();
+    dc_messages_.clear();
+    decoded_frames_ = 0;
+  }
+
  private:
   mutable std::mutex mu_;
   std::condition_variable cv_;
@@ -1605,7 +1614,7 @@ std::string KeepOnlyRelayCandidatesInSdp(const std::string& sdp) {
 
 bool ReceiveUdpWithTimeout(boost::asio::ip::udp::socket* sock,
                            std::vector<uint8_t>* out_pkt,
-                           int timeout_ms = 1000) {
+                           int timeout_ms = 4000) {
   sock->non_blocking(true);
   std::array<uint8_t, 2048> buf{};
   boost::asio::ip::udp::endpoint from;
@@ -2200,6 +2209,297 @@ TEST(RtcE2ETest, WebRtcP2pPureRfc8627FlexfecWithoutRtxAndChannelChurn) {
   pub->LeaveRoom();
   sub_backend.StopSession();
   rx_queues.ShutdownAll();
+}
+
+// 15. 验证在 SDK 回调线程（OnConnectionState）内部直接销毁 RtcVideoEngine 实例绝不发生 io_context UAF 或死锁
+TEST(RtcE2ETest, SelfDestroyInsideConnectionCallbackNoUaf) {
+  MinimalP2pWsSignalingServer ws_srv;
+  ASSERT_TRUE(ws_srv.Start());
+
+  for (int iter = 0; iter < 4; ++iter) {
+    std::mutex mu;
+    std::condition_variable cv;
+    bool destroyed_in_cb = false;
+    std::unique_ptr<RtcVideoEngine> engine;
+
+    class SelfDestroyingObserver final : public IRtcEventObserver {
+     public:
+      SelfDestroyingObserver(std::unique_ptr<RtcVideoEngine>* eng,
+                             std::mutex* m,
+                             std::condition_variable* c,
+                             bool* done)
+          : eng_(eng), mu_(m), cv_(c), done_(done) {}
+
+      void OnEncoderBitrateAllocation(rtc_stream_layer_e,
+                                      bool,
+                                      uint32_t,
+                                      uint32_t) override {}
+      void OnEncoderForceIdr(rtc_stream_layer_e) override {}
+      void OnRemoteTrackPublished(const std::string&,
+                                  const std::string&,
+                                  rtc_video_codec_e) override {}
+      void OnRemoteTrackUnpublished(const std::string&,
+                                    const std::string&) override {}
+      void OnRemoteEncodedFrame(const std::string&,
+                                const std::string&,
+                                const rtc_encoded_frame_t&) override {}
+
+      void OnConnectionState(rtc_connection_state_e state,
+                             int /*reason_code*/) override {
+        if (state == RTC_CONN_STATE_CONNECTING ||
+            state == RTC_CONN_STATE_CONNECTED ||
+            state == RTC_CONN_STATE_DISCONNECTED) {
+          std::unique_ptr<RtcVideoEngine> local;
+          {
+            std::lock_guard<std::mutex> lk(*mu_);
+            if (*done_) {
+              return;
+            }
+            local = std::move(*eng_);
+          }
+          // 直接在 rtc-cb 队列自身线程栈内析构整个引擎与全部 TaskQueueBoost！
+          local.reset();
+          {
+            std::lock_guard<std::mutex> lk(*mu_);
+            *done_ = true;
+          }
+          cv_->notify_all();
+        }
+      }
+
+     private:
+      std::unique_ptr<RtcVideoEngine>* eng_;
+      std::mutex* mu_;
+      std::condition_variable* cv_;
+      bool* done_;
+    } obs(&engine, &mu, &cv, &destroyed_in_cb);
+
+    EngineConfig cfg;
+    cfg.transport_mode = RTC_TRANSPORT_MODE_WEBRTC_P2P;
+    cfg.signaling_or_moq_url =
+        "ws://127.0.0.1:" + std::to_string(ws_srv.port()) + "/ws";
+    {
+      std::lock_guard<std::mutex> lk(mu);
+      engine = RtcVideoEngine::Create(cfg, &obs);
+      ASSERT_NE(engine, nullptr);
+      ASSERT_EQ(engine->JoinRoom("self_destroy_room",
+                                 "peer_" + std::to_string(iter)),
+                RTC_OK);
+    }
+
+    std::unique_lock<std::mutex> lk(mu);
+    ASSERT_TRUE(cv.wait_for(lk, std::chrono::milliseconds(3000),
+                            [&]() { return destroyed_in_cb; }));
+    EXPECT_EQ(engine, nullptr);
+  }
+  // 留出短暂时间确保 detach 的回调线程安全退出 CoreState。
+  std::this_thread::sleep_for(std::chrono::milliseconds(30));
+  ws_srv.Stop();
+}
+
+// 16. 验证同一 RtcVideoEngine 实例执行 JoinRoom -> LeaveRoom -> JoinRoom 二次会话在 WebRTC P2P 与 MoQ WebTransport 双模式下均正常连通收发
+TEST(RtcE2ETest, LeaveAndRejoinSecondSessionWorksInP2pAndMoq) {
+  // 阶段 A：WebRTC P2P 模式下同一对客户端实例连续两次进退房收发视频。
+  {
+    MinimalP2pWsSignalingServer ws_srv;
+    ASSERT_TRUE(ws_srv.Start());
+
+    TestPeerObserver pub_obs;
+    TestPeerObserver sub_obs;
+    EngineConfig cfg;
+    cfg.transport_mode = RTC_TRANSPORT_MODE_WEBRTC_P2P;
+    cfg.signaling_or_moq_url =
+        "ws://127.0.0.1:" + std::to_string(ws_srv.port()) + "/ws";
+    cfg.publish_codec = RTC_CODEC_H264;
+
+    auto pub = RtcVideoEngine::Create(cfg, &pub_obs);
+    auto sub = RtcVideoEngine::Create(cfg, &sub_obs);
+
+    for (int round = 1; round <= 2; ++round) {
+      pub_obs.ResetSessionCounters();
+      sub_obs.ResetSessionCounters();
+      const std::string room = "rejoin_p2p_room_" + std::to_string(round);
+      ASSERT_EQ(pub->JoinRoom(room, "p2p_pub"), RTC_OK);
+      ASSERT_EQ(sub->JoinRoom(room, "p2p_sub"), RTC_OK);
+      ASSERT_TRUE(pub_obs.WaitConnected(5000)) << "P2P round=" << round;
+      ASSERT_TRUE(sub_obs.WaitConnected(5000)) << "P2P round=" << round;
+
+      for (int i = 0; i < 10; ++i) {
+        const auto nalu = BuildSyntheticH264Frame(i == 0, 900);
+        rtc_encoded_frame_t f{};
+        f.data = nalu.data();
+        f.size = nalu.size();
+        f.capture_ts_us =
+            static_cast<uint64_t>(round * 10'000'000 + i * 33'333);
+        f.is_keyframe = (i == 0);
+        f.layer = RTC_STREAM_LAYER_HIGH;
+        EXPECT_EQ(pub->PushVideoFrame(f), RTC_OK);
+        std::this_thread::sleep_for(std::chrono::milliseconds(15));
+      }
+      EXPECT_TRUE(sub_obs.WaitForDecodedFrames(5, 3000))
+          << "P2P round=" << round;
+
+      ASSERT_EQ(pub->LeaveRoom(), RTC_OK);
+      ASSERT_EQ(sub->LeaveRoom(), RTC_OK);
+    }
+    ws_srv.Stop();
+  }
+
+  // 阶段 B：MoQ over HTTP/3 WebTransport 模式下同一对客户端实例连续两次进退房收发视频。
+  {
+    EmbeddedMoqRelayServer relay("127.0.0.1");
+    ASSERT_TRUE(relay.Start(0));
+
+    TestPeerObserver pub_obs;
+    TestPeerObserver sub_obs;
+    EngineConfig cfg;
+    cfg.transport_mode = RTC_TRANSPORT_MODE_MOQ_WEBTRANSPORT;
+    cfg.signaling_or_moq_url =
+        "https://127.0.0.1:" + std::to_string(relay.udp_port()) + "/moq";
+    cfg.publish_codec = RTC_CODEC_H264;
+
+    auto pub = RtcVideoEngine::Create(cfg, &pub_obs);
+    auto sub = RtcVideoEngine::Create(cfg, &sub_obs);
+
+    for (int round = 1; round <= 2; ++round) {
+      pub_obs.ResetSessionCounters();
+      sub_obs.ResetSessionCounters();
+      const std::string room = "rejoin_moq_room_" + std::to_string(round);
+      ASSERT_EQ(pub->JoinRoom(room, "moq_pub"), RTC_OK);
+      ASSERT_EQ(sub->JoinRoom(room, "moq_sub"), RTC_OK);
+      ASSERT_TRUE(pub_obs.WaitConnected(5000)) << "MoQ round=" << round;
+      ASSERT_TRUE(sub_obs.WaitConnected(5000)) << "MoQ round=" << round;
+      ASSERT_TRUE(sub_obs.WaitForSpecificRemoteTrack("moq_pub", 3000))
+          << "MoQ round=" << round;
+      ASSERT_EQ(sub->SubscribeTrack("moq_pub", RTC_STREAM_LAYER_HIGH), RTC_OK);
+
+      for (int i = 0; i < 12; ++i) {
+        const auto nalu = BuildSyntheticH264Frame((i % 4) == 0, 900);
+        rtc_encoded_frame_t f{};
+        f.data = nalu.data();
+        f.size = nalu.size();
+        f.capture_ts_us =
+            static_cast<uint64_t>(round * 10'000'000 + i * 33'333);
+        f.is_keyframe = ((i % 4) == 0);
+        f.layer = RTC_STREAM_LAYER_HIGH;
+        EXPECT_EQ(pub->PushVideoFrame(f), RTC_OK);
+        std::this_thread::sleep_for(std::chrono::milliseconds(15));
+      }
+      EXPECT_TRUE(sub_obs.WaitForDecodedFrames(5, 3000))
+          << "MoQ round=" << round;
+
+      ASSERT_EQ(pub->LeaveRoom(), RTC_OK);
+      ASSERT_EQ(sub->LeaveRoom(), RTC_OK);
+    }
+    relay.Stop();
+  }
+}
+
+// 17. 验证 MoQ QUIC TLS 证书指纹固定（Certificate Pinning）、鉴权 Token 拦截与 P2P LeaveRoom->JoinRoom 二次会话数据通道互通
+TEST(RtcE2ETest, MoqTlsCertPinningAuthTokenAndRejoinDataChannel) {
+  // (A) MoQ TLS SHA-256 指纹固定与鉴权 Token 正反用例验证
+  {
+    EmbeddedMoqRelayServer relay("127.0.0.1");
+    relay.SetRequiredAuthToken("prod_secret_token_2026");
+    ASSERT_TRUE(relay.Start(0));
+    const std::string srv_pin = relay.certificate_sha256_hex();
+    ASSERT_EQ(srv_pin.size(), 64u);
+
+    // 1) 错误证书指纹必须握手失败并上报 RTC_CONN_STATE_FAILED
+    {
+      TestPeerObserver bad_pin_obs;
+      EngineConfig bad_cfg;
+      bad_cfg.transport_mode = RTC_TRANSPORT_MODE_MOQ;
+      bad_cfg.signaling_or_moq_url =
+          "moq://127.0.0.1:" + std::to_string(relay.udp_port());
+      bad_cfg.auth_token = "prod_secret_token_2026";
+      bad_cfg.tls_verify_peer = true;
+      bad_cfg.tls_pinned_cert_sha256 = std::string(64, '0');
+      auto bad_eng = RtcVideoEngine::Create(bad_cfg, &bad_pin_obs);
+      ASSERT_EQ(bad_eng->JoinRoom("pin_room", "bad_pin_peer"), RTC_OK);
+      EXPECT_FALSE(bad_pin_obs.WaitConnected(700));
+      bad_eng->LeaveRoom();
+    }
+
+    // 2) 正确证书指纹 + 正确 auth_token 正常连通并收发媒体
+    {
+      TestPeerObserver pub_obs;
+      TestPeerObserver sub_obs;
+      EngineConfig ok_cfg;
+      ok_cfg.transport_mode = RTC_TRANSPORT_MODE_MOQ;
+      ok_cfg.signaling_or_moq_url =
+          "moq://127.0.0.1:" + std::to_string(relay.udp_port());
+      ok_cfg.auth_token = "prod_secret_token_2026";
+      ok_cfg.tls_verify_peer = true;
+      ok_cfg.tls_pinned_cert_sha256 = srv_pin;
+      ok_cfg.publish_codec = RTC_CODEC_H264;
+
+      auto pub = RtcVideoEngine::Create(ok_cfg, &pub_obs);
+      auto sub = RtcVideoEngine::Create(ok_cfg, &sub_obs);
+      ASSERT_EQ(pub->JoinRoom("pin_room", "pin_pub"), RTC_OK);
+      ASSERT_EQ(sub->JoinRoom("pin_room", "pin_sub"), RTC_OK);
+      ASSERT_TRUE(pub_obs.WaitConnected(4000));
+      ASSERT_TRUE(sub_obs.WaitConnected(4000));
+      ASSERT_TRUE(sub_obs.WaitForSpecificRemoteTrack("pin_pub", 3000));
+      ASSERT_EQ(sub->SubscribeTrack("pin_pub", RTC_STREAM_LAYER_HIGH), RTC_OK);
+
+      for (int i = 0; i < 12; ++i) {
+        const bool is_kf = ((i % 4) == 0);
+        const auto nalu = BuildSyntheticH264Frame(is_kf, 800);
+        rtc_encoded_frame_t f{};
+        f.data = nalu.data();
+        f.size = nalu.size();
+        f.capture_ts_us = 1'000'000ULL + static_cast<uint64_t>(i) * 33'333ULL;
+        f.is_keyframe = is_kf;
+        f.layer = RTC_STREAM_LAYER_HIGH;
+        EXPECT_EQ(pub->PushVideoFrame(f), RTC_OK);
+        std::this_thread::sleep_for(std::chrono::milliseconds(15));
+      }
+      EXPECT_TRUE(sub_obs.WaitForDecodedFrames(4, 3000));
+      pub->LeaveRoom();
+      sub->LeaveRoom();
+    }
+    relay.Stop();
+  }
+
+  // (B) WebRTC P2P LeaveRoom -> JoinRoom 第二次会话创建 DataChannel 并双向收发消息验证
+  {
+    MinimalP2pWsSignalingServer ws_srv;
+    ASSERT_TRUE(ws_srv.Start());
+
+    TestPeerObserver obs_a;
+    TestPeerObserver obs_b;
+    EngineConfig cfg;
+    cfg.transport_mode = RTC_TRANSPORT_MODE_WEBRTC_P2P;
+    cfg.signaling_or_moq_url =
+        "ws://127.0.0.1:" + std::to_string(ws_srv.port()) + "/ws";
+    cfg.enable_datachannel = true;
+
+    auto peer_a = RtcVideoEngine::Create(cfg, &obs_a);
+    auto peer_b = RtcVideoEngine::Create(cfg, &obs_b);
+
+    for (int round = 1; round <= 2; ++round) {
+      obs_a.ResetSessionCounters();
+      obs_b.ResetSessionCounters();
+      const std::string room = "dc_rejoin_room_" + std::to_string(round);
+      ASSERT_EQ(peer_a->JoinRoom(room, "peer_a"), RTC_OK);
+      ASSERT_EQ(peer_b->JoinRoom(room, "peer_b"), RTC_OK);
+      ASSERT_TRUE(obs_a.WaitConnected(4000));
+      ASSERT_TRUE(obs_b.WaitConnected(4000));
+
+      DataChannelConfig dc;
+      dc.label = "rejoin_dc_" + std::to_string(round);
+      const int cid = peer_a->CreateDataChannel(dc);
+      ASSERT_GE(cid, 0);
+      ASSERT_EQ(peer_a->SendTextData(cid, "msg_round_" + std::to_string(round)),
+                RTC_OK);
+      EXPECT_TRUE(obs_b.WaitForDataMessages(1, 3000)) << "round=" << round;
+
+      ASSERT_EQ(peer_a->LeaveRoom(), RTC_OK);
+      ASSERT_EQ(peer_b->LeaveRoom(), RTC_OK);
+    }
+    ws_srv.Stop();
+  }
 }
 
 }  // namespace

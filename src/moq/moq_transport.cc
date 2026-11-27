@@ -45,7 +45,7 @@ bool QuicVarInt::Read(ArrayView<const uint8_t> data,
   const uint8_t first = data[*offset];
   const uint8_t prefix = first >> 6;
   const size_t nbytes = size_t{1} << prefix;
-  if (*offset + nbytes > data.size()) {
+  if (nbytes > data.size() - *offset) {
     return false;
   }
 
@@ -67,7 +67,7 @@ bool QuicVarInt::ReadString(ArrayView<const uint8_t> data,
                             size_t* offset,
                             std::string* out_str) {
   uint64_t slen = 0;
-  if (!Read(data, offset, &slen) || *offset + slen > data.size()) {
+  if (!Read(data, offset, &slen) || slen > data.size() - *offset) {
     return false;
   }
   out_str->assign(reinterpret_cast<const char*>(data.data() + *offset),
@@ -163,7 +163,7 @@ bool MoqtVarInt::Read(ArrayView<const uint8_t> data,
     first_mask = 0x00u;
   }
 
-  if (*offset + total_len > data.size()) {
+  if (total_len > data.size() - *offset) {
     return false;
   }
   uint64_t val = b0 & first_mask;
@@ -187,7 +187,7 @@ bool MoqtVarInt::ReadBytes(ArrayView<const uint8_t> data,
                            size_t max_len) {
   uint64_t len = 0;
   if (!Read(data, offset, &len) || len > max_len ||
-      *offset + len > data.size()) {
+      len > data.size() - *offset) {
     return false;
   }
   out_bytes->assign(data.data() + *offset,
@@ -207,7 +207,7 @@ bool MoqtVarInt::ReadString(ArrayView<const uint8_t> data,
                             size_t max_len) {
   uint64_t len = 0;
   if (!Read(data, offset, &len) || len > max_len ||
-      *offset + len > data.size()) {
+      len > data.size() - *offset) {
     return false;
   }
   out_str->assign(reinterpret_cast<const char*>(data.data() + *offset),
@@ -744,6 +744,32 @@ std::vector<uint8_t> MoqControlMessage::Encode() const {
       MoqtVarInt::AppendString(track_name, &body);
       break;
     }
+    case MoqControlMessageType::kFetch: {
+      MoqtVarInt::Append(request_id, &body);
+      MoqtVarInt::Append(required_request_id_delta, &body);
+      MoqtVarInt::Append(fetch_type, &body);
+      if (fetch_type == 0x01) {
+        track_namespace.Encode(&body);
+        MoqtVarInt::AppendString(track_name, &body);
+        MoqtVarInt::Append(fetch_start_location.group, &body);
+        MoqtVarInt::Append(fetch_start_location.object, &body);
+        MoqtVarInt::Append(fetch_end_location.group, &body);
+        MoqtVarInt::Append(fetch_end_location.object, &body);
+      } else {
+        MoqtVarInt::Append(joining_request_id, &body);
+        MoqtVarInt::Append(joining_start, &body);
+      }
+      parameters.Encode(&body);
+      break;
+    }
+    case MoqControlMessageType::kFetchOk: {
+      body.push_back(end_of_track ? 1 : 0);
+      MoqtVarInt::Append(end_location.group, &body);
+      MoqtVarInt::Append(end_location.object, &body);
+      parameters.Encode(&body);
+      MoqtKeyValuePair::EncodeList(track_properties, &body);
+      break;
+    }
     default:
       break;
   }
@@ -765,25 +791,34 @@ std::vector<uint8_t> MoqControlMessage::Encode() const {
 std::optional<MoqControlMessage> MoqControlMessage::Decode(
     ArrayView<const uint8_t> data,
     size_t* consumed,
-    bool* out_protocol_violation) {
+    bool* out_protocol_violation,
+    uint64_t* out_error_code) {
   if (out_protocol_violation != nullptr) {
     *out_protocol_violation = false;
+  }
+  if (out_error_code != nullptr) {
+    *out_error_code = kMoqtErrNoError;
   }
   size_t off = 0;
   uint64_t raw_type = 0;
   bool bad_vi = false;
   if (!MoqtVarInt::Read(data, &off, &raw_type, &bad_vi)) {
-    if (bad_vi && out_protocol_violation != nullptr) {
-      *out_protocol_violation = true;
+    if (bad_vi) {
+      if (out_protocol_violation != nullptr) {
+        *out_protocol_violation = true;
+      }
+      if (out_error_code != nullptr) {
+        *out_error_code = kMoqtErrProtocolViolation;
+      }
     }
     return std::nullopt;
   }
-  if (off + 2 > data.size()) {
+  if (data.size() - off < 2) {
     return std::nullopt;
   }
   const uint16_t body_len = ReadBigEndian16(data.data() + off);
   off += 2;
-  if (off + body_len > data.size()) {
+  if (body_len > data.size() - off) {
     return std::nullopt;
   }
 
@@ -792,17 +827,23 @@ std::optional<MoqControlMessage> MoqControlMessage::Decode(
   MoqControlMessage msg;
   msg.type = static_cast<MoqControlMessageType>(raw_type);
 
-  auto fail_violation = [&]() -> std::optional<MoqControlMessage> {
+  auto fail_with = [&](uint64_t code) -> std::optional<MoqControlMessage> {
     if (out_protocol_violation != nullptr) {
       *out_protocol_violation = true;
     }
+    if (out_error_code != nullptr) {
+      *out_error_code = code;
+    }
     return std::nullopt;
+  };
+  auto fail_violation = [&]() -> std::optional<MoqControlMessage> {
+    return fail_with(kMoqtErrProtocolViolation);
   };
 
   switch (msg.type) {
     case MoqControlMessageType::kSetup:
       if (!MoqtKeyValuePair::DecodeList(body, &boff, &msg.setup_options)) {
-        return fail_violation();
+        return fail_with(kMoqtErrKeyValueFormattingError);
       }
       break;
     case MoqControlMessageType::kGoaway:
@@ -828,9 +869,14 @@ std::optional<MoqControlMessage> MoqControlMessage::Decode(
     case MoqControlMessageType::kSubscribe:
     case MoqControlMessageType::kTrackStatus:
       if (!MoqtVarInt::Read(body, &boff, &msg.request_id) ||
-          !MoqtVarInt::Read(body, &boff, &msg.required_request_id_delta) ||
-          2 * msg.required_request_id_delta > msg.request_id ||
-          !MoqtTrackNamespace::Decode(body, &boff, &msg.track_namespace) ||
+          !MoqtVarInt::Read(body, &boff, &msg.required_request_id_delta)) {
+        return fail_violation();
+      }
+      if (msg.required_request_id_delta > msg.request_id / 2) {
+        return fail_with(kMoqtErrInvalidRequiredRequestId);
+      }
+      if (!MoqtTrackNamespace::Decode(body, &boff, &msg.track_namespace) ||
+          msg.track_namespace.empty() ||
           !MoqtVarInt::ReadString(body, &boff, &msg.track_name, 4096) ||
           !MoqtMessageParameters::Decode(body, &boff, &msg.parameters)) {
         return fail_violation();
@@ -838,45 +884,67 @@ std::optional<MoqControlMessage> MoqControlMessage::Decode(
       break;
     case MoqControlMessageType::kSubscribeOk:
       if (!MoqtVarInt::Read(body, &boff, &msg.track_alias) ||
-          !MoqtMessageParameters::Decode(body, &boff, &msg.parameters) ||
-          !MoqtKeyValuePair::DecodeList(body, &boff, &msg.track_properties)) {
+          !MoqtMessageParameters::Decode(body, &boff, &msg.parameters)) {
         return fail_violation();
+      }
+      if (!MoqtKeyValuePair::DecodeList(body, &boff, &msg.track_properties)) {
+        return fail_with(kMoqtErrKeyValueFormattingError);
       }
       break;
     case MoqControlMessageType::kRequestUpdate:
       if (!MoqtVarInt::Read(body, &boff, &msg.request_id) ||
-          !MoqtVarInt::Read(body, &boff, &msg.required_request_id_delta) ||
-          2 * msg.required_request_id_delta > msg.request_id ||
-          !MoqtMessageParameters::Decode(body, &boff, &msg.parameters)) {
+          !MoqtVarInt::Read(body, &boff, &msg.required_request_id_delta)) {
+        return fail_violation();
+      }
+      if (msg.required_request_id_delta > msg.request_id / 2) {
+        return fail_with(kMoqtErrInvalidRequiredRequestId);
+      }
+      if (!MoqtMessageParameters::Decode(body, &boff, &msg.parameters)) {
         return fail_violation();
       }
       break;
     case MoqControlMessageType::kPublish:
       if (!MoqtVarInt::Read(body, &boff, &msg.request_id) ||
-          !MoqtVarInt::Read(body, &boff, &msg.required_request_id_delta) ||
-          2 * msg.required_request_id_delta > msg.request_id ||
-          !MoqtTrackNamespace::Decode(body, &boff, &msg.track_namespace) ||
+          !MoqtVarInt::Read(body, &boff, &msg.required_request_id_delta)) {
+        return fail_violation();
+      }
+      if (msg.required_request_id_delta > msg.request_id / 2) {
+        return fail_with(kMoqtErrInvalidRequiredRequestId);
+      }
+      if (!MoqtTrackNamespace::Decode(body, &boff, &msg.track_namespace) ||
+          msg.track_namespace.empty() ||
           !MoqtVarInt::ReadString(body, &boff, &msg.track_name, 4096) ||
           !MoqtVarInt::Read(body, &boff, &msg.track_alias) ||
-          !MoqtMessageParameters::Decode(body, &boff, &msg.parameters) ||
-          !MoqtKeyValuePair::DecodeList(body, &boff, &msg.track_properties)) {
+          !MoqtMessageParameters::Decode(body, &boff, &msg.parameters)) {
         return fail_violation();
+      }
+      if (!MoqtKeyValuePair::DecodeList(body, &boff, &msg.track_properties)) {
+        return fail_with(kMoqtErrKeyValueFormattingError);
       }
       break;
     case MoqControlMessageType::kPublishNamespace:
       if (!MoqtVarInt::Read(body, &boff, &msg.request_id) ||
-          !MoqtVarInt::Read(body, &boff, &msg.required_request_id_delta) ||
-          2 * msg.required_request_id_delta > msg.request_id ||
-          !MoqtTrackNamespace::Decode(body, &boff, &msg.track_namespace) ||
+          !MoqtVarInt::Read(body, &boff, &msg.required_request_id_delta)) {
+        return fail_violation();
+      }
+      if (msg.required_request_id_delta > msg.request_id / 2) {
+        return fail_with(kMoqtErrInvalidRequiredRequestId);
+      }
+      if (!MoqtTrackNamespace::Decode(body, &boff, &msg.track_namespace) ||
+          msg.track_namespace.empty() ||
           !MoqtMessageParameters::Decode(body, &boff, &msg.parameters)) {
         return fail_violation();
       }
       break;
     case MoqControlMessageType::kSubscribeNamespace:
       if (!MoqtVarInt::Read(body, &boff, &msg.request_id) ||
-          !MoqtVarInt::Read(body, &boff, &msg.required_request_id_delta) ||
-          2 * msg.required_request_id_delta > msg.request_id ||
-          !MoqtTrackNamespace::Decode(body, &boff, &msg.track_namespace) ||
+          !MoqtVarInt::Read(body, &boff, &msg.required_request_id_delta)) {
+        return fail_violation();
+      }
+      if (msg.required_request_id_delta > msg.request_id / 2) {
+        return fail_with(kMoqtErrInvalidRequiredRequestId);
+      }
+      if (!MoqtTrackNamespace::Decode(body, &boff, &msg.track_namespace) ||
           !MoqtVarInt::Read(body, &boff, &msg.subscribe_options) ||
           msg.subscribe_options > 0x02 ||
           !MoqtMessageParameters::Decode(body, &boff, &msg.parameters)) {
@@ -891,10 +959,62 @@ std::optional<MoqControlMessage> MoqControlMessage::Decode(
       break;
     case MoqControlMessageType::kPublishBlocked:
       if (!MoqtTrackNamespace::Decode(body, &boff, &msg.track_namespace) ||
+          msg.track_namespace.empty() ||
           !MoqtVarInt::ReadString(body, &boff, &msg.track_name, 4096)) {
         return fail_violation();
       }
       break;
+    case MoqControlMessageType::kFetch:
+      if (!MoqtVarInt::Read(body, &boff, &msg.request_id) ||
+          !MoqtVarInt::Read(body, &boff, &msg.required_request_id_delta)) {
+        return fail_violation();
+      }
+      if (msg.required_request_id_delta > msg.request_id / 2) {
+        return fail_with(kMoqtErrInvalidRequiredRequestId);
+      }
+      if (!MoqtVarInt::Read(body, &boff, &msg.fetch_type) ||
+          msg.fetch_type < 0x01 || msg.fetch_type > 0x03) {
+        return fail_violation();
+      }
+      if (msg.fetch_type == 0x01) {
+        if (!MoqtTrackNamespace::Decode(body, &boff, &msg.track_namespace) ||
+            msg.track_namespace.empty() ||
+            !MoqtVarInt::ReadString(body, &boff, &msg.track_name, 4096) ||
+            !MoqtVarInt::Read(body, &boff, &msg.fetch_start_location.group) ||
+            !MoqtVarInt::Read(body, &boff, &msg.fetch_start_location.object) ||
+            !MoqtVarInt::Read(body, &boff, &msg.fetch_end_location.group) ||
+            !MoqtVarInt::Read(body, &boff, &msg.fetch_end_location.object)) {
+          return fail_violation();
+        }
+      } else {
+        if (!MoqtVarInt::Read(body, &boff, &msg.joining_request_id) ||
+            !MoqtVarInt::Read(body, &boff, &msg.joining_start)) {
+          return fail_violation();
+        }
+      }
+      if (!MoqtMessageParameters::Decode(body, &boff, &msg.parameters)) {
+        return fail_violation();
+      }
+      break;
+    case MoqControlMessageType::kFetchOk: {
+      if (boff >= body.size()) {
+        return fail_violation();
+      }
+      const uint8_t eot = body[boff++];
+      if (eot > 1) {
+        return fail_violation();
+      }
+      msg.end_of_track = (eot == 1);
+      if (!MoqtVarInt::Read(body, &boff, &msg.end_location.group) ||
+          !MoqtVarInt::Read(body, &boff, &msg.end_location.object) ||
+          !MoqtMessageParameters::Decode(body, &boff, &msg.parameters)) {
+        return fail_violation();
+      }
+      if (!MoqtKeyValuePair::DecodeList(body, &boff, &msg.track_properties)) {
+        return fail_with(kMoqtErrKeyValueFormattingError);
+      }
+      break;
+    }
     default:
       return fail_violation();
   }
@@ -1029,41 +1149,70 @@ std::optional<MoqtSubgroupObject> MoqtSubgroupObject::Decode(
     std::optional<uint64_t> prev_object_id,
     bool header_has_properties,
     size_t* consumed,
-    bool* out_protocol_violation) {
+    bool* out_protocol_violation,
+    uint64_t* out_error_code) {
   if (out_protocol_violation != nullptr) {
     *out_protocol_violation = false;
   }
+  if (out_error_code != nullptr) {
+    *out_error_code = kMoqtErrNoError;
+  }
+  auto mark_violation = [&](uint64_t code) -> std::optional<MoqtSubgroupObject> {
+    if (out_protocol_violation != nullptr) {
+      *out_protocol_violation = true;
+    }
+    if (out_error_code != nullptr) {
+      *out_error_code = code;
+    }
+    return std::nullopt;
+  };
+
   size_t off = 0;
   uint64_t delta = 0;
   bool bad_vi = false;
   if (!MoqtVarInt::Read(data, &off, &delta, &bad_vi)) {
-    if (bad_vi && out_protocol_violation != nullptr) {
-      *out_protocol_violation = true;
+    if (bad_vi) {
+      return mark_violation(kMoqtErrProtocolViolation);
     }
     return std::nullopt;
+  }
+
+  if (prev_object_id.has_value() &&
+      delta >= std::numeric_limits<uint64_t>::max() - *prev_object_id) {
+    return mark_violation(kMoqtErrProtocolViolation);
   }
 
   MoqtSubgroupObject obj;
   obj.object_id = prev_object_id.has_value() ? (*prev_object_id + delta + 1)
                                              : delta;
   if (header_has_properties) {
-    std::vector<uint8_t> prop_bytes;
-    if (!MoqtVarInt::ReadBytes(data, &off, &prop_bytes, 65535)) {
-      return std::nullopt;
-    }
-    size_t poff = 0;
-    if (!MoqtKeyValuePair::DecodeList(prop_bytes, &poff, &obj.properties)) {
-      if (out_protocol_violation != nullptr) {
-        *out_protocol_violation = true;
+    uint64_t prop_len = 0;
+    if (!MoqtVarInt::Read(data, &off, &prop_len, &bad_vi)) {
+      if (bad_vi) {
+        return mark_violation(kMoqtErrProtocolViolation);
       }
       return std::nullopt;
+    }
+    if (prop_len > 65535) {
+      return mark_violation(kMoqtErrKeyValueFormattingError);
+    }
+    if (prop_len > data.size() - off) {
+      return std::nullopt;
+    }
+    const ArrayView<const uint8_t> prop_slice =
+        data.subview(off, static_cast<size_t>(prop_len));
+    off += static_cast<size_t>(prop_len);
+    size_t poff = 0;
+    if (!MoqtKeyValuePair::DecodeList(prop_slice, &poff, &obj.properties) ||
+        poff != prop_slice.size()) {
+      return mark_violation(kMoqtErrKeyValueFormattingError);
     }
   }
 
   uint64_t payload_len = 0;
   if (!MoqtVarInt::Read(data, &off, &payload_len, &bad_vi)) {
-    if (bad_vi && out_protocol_violation != nullptr) {
-      *out_protocol_violation = true;
+    if (bad_vi) {
+      return mark_violation(kMoqtErrProtocolViolation);
     }
     return std::nullopt;
   }
@@ -1071,21 +1220,21 @@ std::optional<MoqtSubgroupObject> MoqtSubgroupObject::Decode(
   if (payload_len == 0) {
     uint64_t raw_status = 0;
     if (!MoqtVarInt::Read(data, &off, &raw_status, &bad_vi)) {
-      if (bad_vi && out_protocol_violation != nullptr) {
-        *out_protocol_violation = true;
+      if (bad_vi) {
+        return mark_violation(kMoqtErrProtocolViolation);
       }
       return std::nullopt;
     }
     if ((raw_status != 0x00 && raw_status != 0x03 && raw_status != 0x04) ||
         (raw_status != 0x00 && !obj.properties.empty())) {
-      if (out_protocol_violation != nullptr) {
-        *out_protocol_violation = true;
-      }
-      return std::nullopt;
+      return mark_violation(kMoqtErrProtocolViolation);
     }
     obj.status = static_cast<MoqtObjectStatus>(raw_status);
   } else {
-    if (off + payload_len > data.size()) {
+    if (payload_len > 16 * 1024 * 1024) {
+      return mark_violation(kMoqtErrProtocolViolation);
+    }
+    if (payload_len > data.size() - off) {
       return std::nullopt;
     }
     obj.status = MoqtObjectStatus::kNormal;
@@ -1143,27 +1292,35 @@ std::vector<uint8_t> MoqtObjectDatagram::Encode() const {
 
 std::optional<MoqtObjectDatagram> MoqtObjectDatagram::Decode(
     ArrayView<const uint8_t> data,
-    bool* out_protocol_violation) {
+    bool* out_protocol_violation,
+    uint64_t* out_error_code) {
   if (out_protocol_violation != nullptr) {
     *out_protocol_violation = false;
   }
+  if (out_error_code != nullptr) {
+    *out_error_code = kMoqtErrNoError;
+  }
+  auto mark_violation = [&](uint64_t code) -> std::optional<MoqtObjectDatagram> {
+    if (out_protocol_violation != nullptr) {
+      *out_protocol_violation = true;
+    }
+    if (out_error_code != nullptr) {
+      *out_error_code = code;
+    }
+    return std::nullopt;
+  };
+
   size_t off = 0;
   uint64_t dtype = 0;
   bool bad_vi = false;
   if (!MoqtVarInt::Read(data, &off, &dtype, &bad_vi)) {
-    if (bad_vi && out_protocol_violation != nullptr) {
-      *out_protocol_violation = true;
-    }
-    return std::nullopt;
+    return mark_violation(kMoqtErrProtocolViolation);
   }
   const bool valid_range =
       (dtype <= 0x0Fu) || (dtype >= 0x20u && dtype <= 0x2Fu);
   const bool status_and_eog = ((dtype & 0x22u) == 0x22u);
   if (!valid_range || status_and_eog) {
-    if (out_protocol_violation != nullptr) {
-      *out_protocol_violation = true;
-    }
-    return std::nullopt;
+    return mark_violation(kMoqtErrProtocolViolation);
   }
 
   MoqtObjectDatagram dg;
@@ -1173,48 +1330,48 @@ std::optional<MoqtObjectDatagram> MoqtObjectDatagram::Decode(
   const bool has_status = (dtype & 0x20u) != 0;
   const bool has_props = (dtype & 0x01u) != 0;
 
-  if (!MoqtVarInt::Read(data, &off, &dg.track_alias) ||
-      !MoqtVarInt::Read(data, &off, &dg.group_id)) {
-    return std::nullopt;
+  if (!MoqtVarInt::Read(data, &off, &dg.track_alias, &bad_vi) ||
+      !MoqtVarInt::Read(data, &off, &dg.group_id, &bad_vi)) {
+    return mark_violation(kMoqtErrProtocolViolation);
   }
   if (zero_obj_id) {
     dg.object_id = 0;
-  } else if (!MoqtVarInt::Read(data, &off, &dg.object_id)) {
-    return std::nullopt;
+  } else if (!MoqtVarInt::Read(data, &off, &dg.object_id, &bad_vi)) {
+    return mark_violation(kMoqtErrProtocolViolation);
   }
   if (!dg.default_priority) {
     if (off >= data.size()) {
-      return std::nullopt;
+      return mark_violation(kMoqtErrProtocolViolation);
     }
     dg.publisher_priority = data[off++];
   }
   if (has_props) {
-    std::vector<uint8_t> pbytes;
-    if (!MoqtVarInt::ReadBytes(data, &off, &pbytes, 65535) || pbytes.empty()) {
-      if (out_protocol_violation != nullptr) {
-        *out_protocol_violation = true;
-      }
-      return std::nullopt;
+    uint64_t prop_len = 0;
+    if (!MoqtVarInt::Read(data, &off, &prop_len, &bad_vi)) {
+      return mark_violation(kMoqtErrProtocolViolation);
     }
+    if (prop_len == 0 || prop_len > 65535 || prop_len > data.size() - off) {
+      return mark_violation(prop_len > 65535 ? kMoqtErrKeyValueFormattingError
+                                             : kMoqtErrProtocolViolation);
+    }
+    const ArrayView<const uint8_t> pslice =
+        data.subview(off, static_cast<size_t>(prop_len));
+    off += static_cast<size_t>(prop_len);
     size_t poff = 0;
-    if (!MoqtKeyValuePair::DecodeList(pbytes, &poff, &dg.properties)) {
-      if (out_protocol_violation != nullptr) {
-        *out_protocol_violation = true;
-      }
-      return std::nullopt;
+    if (!MoqtKeyValuePair::DecodeList(pslice, &poff, &dg.properties) ||
+        poff != pslice.size()) {
+      return mark_violation(kMoqtErrKeyValueFormattingError);
     }
   }
   if (has_status) {
     uint64_t raw_status = 0;
-    if (!MoqtVarInt::Read(data, &off, &raw_status) || off != data.size()) {
-      return std::nullopt;
+    if (!MoqtVarInt::Read(data, &off, &raw_status, &bad_vi) ||
+        off != data.size()) {
+      return mark_violation(kMoqtErrProtocolViolation);
     }
     if ((raw_status != 0x00 && raw_status != 0x03 && raw_status != 0x04) ||
         (raw_status != 0x00 && has_props)) {
-      if (out_protocol_violation != nullptr) {
-        *out_protocol_violation = true;
-      }
-      return std::nullopt;
+      return mark_violation(kMoqtErrProtocolViolation);
     }
     dg.status = static_cast<MoqtObjectStatus>(raw_status);
   } else {
@@ -1261,7 +1418,7 @@ std::optional<MoqDataObject> MoqDataPackager::UnpackObject(
       !MoqtVarInt::ReadString(data, &off, &obj.label, 1024) ||
       !MoqtVarInt::ReadString(data, &off, &obj.protocol, 1024) ||
       !MoqtVarInt::Read(data, &off, &obj.timestamp_us) ||
-      off + 1 > data.size()) {
+      data.size() - off < 1) {
     return std::nullopt;
   }
   const uint8_t flags = data[off++];
@@ -1271,7 +1428,7 @@ std::optional<MoqDataObject> MoqDataPackager::UnpackObject(
 
   uint64_t payload_len = 0;
   if (!MoqtVarInt::Read(data, &off, &payload_len) ||
-      off + payload_len > data.size()) {
+      payload_len > 16 * 1024 * 1024 || payload_len > data.size() - off) {
     return std::nullopt;
   }
   obj.payload.assign(data.data() + off,
@@ -1328,8 +1485,8 @@ std::optional<EncodedVideoFrame> LocFramePackager::UnpackPayload(
     ArrayView<const uint8_t> payload) {
   size_t off = 0;
   uint64_t meta_len = 0;
-  if (!MoqtVarInt::Read(payload, &off, &meta_len) ||
-      off + meta_len > payload.size()) {
+  if (!MoqtVarInt::Read(payload, &off, &meta_len) || meta_len > 4096 ||
+      meta_len > payload.size() - off) {
     return std::nullopt;
   }
 
@@ -1342,7 +1499,10 @@ std::optional<EncodedVideoFrame> LocFramePackager::UnpackPayload(
   if (!MoqtVarInt::Read(meta_slice, &moff, &cap_us) ||
       !MoqtVarInt::Read(meta_slice, &moff, &rtp_ts) ||
       !MoqtVarInt::Read(meta_slice, &moff, &frame_id) ||
-      moff + 2 > meta_slice.size()) {
+      cap_us >= static_cast<uint64_t>(std::numeric_limits<int64_t>::max()) ||
+      frame_id >
+          static_cast<uint64_t>(std::numeric_limits<int64_t>::max() / 2) ||
+      meta_slice.size() - moff < 2) {
     return std::nullopt;
   }
 
@@ -1363,7 +1523,8 @@ std::optional<EncodedVideoFrame> LocFramePackager::UnpackPayload(
   frame.dep.num_references = nrefs;
   for (uint8_t i = 0; i < nrefs; ++i) {
     uint64_t diff = 0;
-    if (!MoqtVarInt::Read(meta_slice, &moff, &diff)) {
+    if (!MoqtVarInt::Read(meta_slice, &moff, &diff) || diff == 0 ||
+        diff > frame_id) {
       return std::nullopt;
     }
     frame.dep.references[i] = frame.dep.frame_id - static_cast<int64_t>(diff);
@@ -1416,20 +1577,31 @@ TargetTransferRate MoqBweAdapter::ConvertSnapshot(
   DataRate target = (snap.cc_bandwidth_estimate > DataRate::Zero())
                         ? std::min(snap.cc_bandwidth_estimate, cwnd_rate)
                         : cwnd_rate;
+  const bool app_limited =
+      (snap.unsent_stream_bytes == DataSize::Zero()) &&
+      (snap.bytes_in_flight.bytes() * 2 < snap.cwnd.bytes());
+  const bool has_real_queue =
+      (snap.unsent_stream_bytes > DataSize::Zero()) ||
+      (snap.bytes_in_flight >= snap.cwnd);
   const bool pipe_saturated =
-      (snap.bytes_in_flight.bytes() * 2 >= snap.cwnd.bytes()) ||
-      (snap.unsent_stream_bytes > snap.cwnd) ||
-      (snap.min_rtt > TimeDelta::Zero() &&
-       snap.smoothed_rtt > snap.min_rtt * 1.35 + TimeDelta::Millis(5));
+      !app_limited &&
+      ((snap.bytes_in_flight.bytes() * 2 >= snap.cwnd.bytes()) ||
+       (snap.unsent_stream_bytes > snap.cwnd) ||
+       (has_real_queue && snap.min_rtt > TimeDelta::Zero() &&
+        snap.smoothed_rtt > snap.min_rtt * 1.35 + TimeDelta::Millis(5)));
   if (snap.delivery_rate > DataRate::Zero() && pipe_saturated) {
-    // 当管道饱和或出现排队时，立即向真实 1-RTT 交付速率收敛，防止 BBR 10 轮最大值窗口在带宽骤降时滞后；
-    // 若发送流缓冲区已出现积压或显著驻留排队，则施加 0.90 回推系数加速排空旧队列。
+    // [QCC-01] 仅当发送流缓冲区积压或飞行字节真正填满拥塞窗口时才判定为实质排队并施加 0.90 回推，
+    // 彻底避免应用受限或纯抖动（如 ±60ms 抖动 0% 丢包）场景下因 RTT 波动触发 0.90^k 级联塌陷至 min_bitrate_。
     const bool heavy_queue =
         (snap.unsent_stream_bytes > snap.cwnd) ||
-        (snap.min_rtt > TimeDelta::Zero() &&
+        (has_real_queue && snap.min_rtt > TimeDelta::Zero() &&
          snap.smoothed_rtt > snap.min_rtt * 1.60 + TimeDelta::Millis(10));
     const double gain = heavy_queue ? 0.90 : 1.03;
-    target = std::min(target, snap.delivery_rate * gain);
+    if (heavy_queue || snap.cc_bandwidth_estimate == DataRate::Zero() ||
+        snap.unsent_stream_bytes > DataSize::Zero() ||
+        snap.bytes_in_flight.bytes() * 4 >= snap.cwnd.bytes() * 3) {
+      target = std::min(target, snap.delivery_rate * gain);
+    }
     app_limited_probe_rate_ = DataRate::Zero();
     last_probe_step_ = snap.timestamp;
   } else if (!pipe_saturated && snap.unsent_stream_bytes == DataSize::Zero() &&
@@ -1489,6 +1661,8 @@ std::shared_ptr<IMoqQuicEngine> BuildDefaultMoqTransportEngine(
     const ParsedMoqUrl& parsed_url) {
   auto raw_quic = std::make_shared<AsioQuicClientEngine>(
       clock, queues->network(), MakeInitialMoqCc(config));
+  raw_quic->SetTlsVerifyConfig(config.tls_verify_peer, config.tls_ca_cert_path,
+                               config.tls_pinned_cert_sha256);
   if (parsed_url.use_webtransport ||
       config.transport_mode == RTC_TRANSPORT_MODE_MOQ_WEBTRANSPORT) {
     return std::make_shared<WebTransportClientEngine>(
@@ -1538,6 +1712,21 @@ ParsedMoqUrl MoqRelayBackend::ParseMoqUrl(std::string_view url) {
     out.path = "/moq";
   }
 
+  if (!auth.empty() && auth.front() == '[') {
+    const size_t close_bracket = auth.find(']');
+    if (close_bracket != std::string_view::npos) {
+      out.host = std::string(auth.substr(1, close_bracket - 1));
+      if (close_bracket + 2 < auth.size() && auth[close_bracket + 1] == ':') {
+        uint16_t parsed_port = out.port;
+        if (ParseUint16(auth.substr(close_bracket + 2), &parsed_port)) {
+          out.port = parsed_port;
+        }
+      }
+      out.authority = "[" + out.host + "]:" + std::to_string(out.port);
+      return out;
+    }
+  }
+
   const size_t colon = auth.rfind(':');
   if (colon != std::string_view::npos) {
     out.host = std::string(auth.substr(0, colon));
@@ -1574,7 +1763,12 @@ MoqRelayBackend::MoqRelayBackend(Clock* clock,
   }
 }
 
-MoqRelayBackend::~MoqRelayBackend() { StopSession(); }
+MoqRelayBackend::~MoqRelayBackend() {
+  if (quic_engine_) {
+    quic_engine_->SetObserver(nullptr);
+  }
+  StopSession();
+}
 
 uint64_t MoqRelayBackend::AllocateClientRequestId() {
   const uint64_t id = next_client_request_id_;
@@ -1603,11 +1797,16 @@ int MoqRelayBackend::StartSession(const std::string& room_id,
     RTC_LOG(kError) << "MoqRelayBackend started without IMoqQuicEngine";
     return RTC_ERR_NOT_INITIALIZED;
   }
+  quic_engine_->SetObserver(this);
   queues_->worker()->PostTask(
       SafeTask(safety_.flag(), [this, room_id, local_peer_id]() {
         RTC_DCHECK_RUN_ON(&work_checker_);
         room_id_ = room_id;
         local_peer_id_ = local_peer_id;
+        session_started_ = true;
+        reconnecting_ = false;
+        reconnect_attempt_ = 0;
+        ++reconnect_generation_;
         last_stats_time_ = clock_->CurrentTime();
         if (observer_ != nullptr) {
           observer_->OnBackendConnectionState(RTC_CONN_STATE_CONNECTING, 0);
@@ -1621,18 +1820,30 @@ int MoqRelayBackend::StartSession(const std::string& room_id,
         quic_engine_->Connect(
             parsed_url_.host, parsed_url_.port,
             quic_engine_->is_webtransport() ? kHttp3Alpn : kMoqtDraft17Alpn);
-        OnPeriodicMaintenanceTick();
+        if (!tick_scheduled_) {
+          tick_scheduled_ = true;
+          OnPeriodicMaintenanceTick();
+        }
       }));
   return RTC_OK;
 }
 
 void MoqRelayBackend::StopSession() {
+  if (quic_engine_) {
+    quic_engine_->SetObserver(nullptr);
+  }
   if (queues_->worker()->IsStopped()) {
     return;
   }
   queues_->worker()->Invoke([this]() {
     RTC_DCHECK_RUN_ON(&work_checker_);
     safety_.flag()->SetNotAlive();
+    safety_.Reset(PendingTaskSafetyFlag::CreateDetached());
+    session_started_ = false;
+    reconnecting_ = false;
+    reconnect_attempt_ = 0;
+    ++reconnect_generation_;
+    tick_scheduled_ = false;
     if (quic_engine_) {
       if (connected_) {
         // draft-17 第 3.3.1 节与第 9.5 节：重置所有活跃双向请求流并在控制流上发送 GOAWAY 后关闭会话。
@@ -1655,10 +1866,43 @@ void MoqRelayBackend::StopSession() {
       quic_engine_->Close(kMoqtErrNoError);
     }
     connected_ = false;
+    session_ready_.store(false, std::memory_order_release);
     peer_setup_received_ = false;
+    peer_control_stream_id_.reset();
+    local_control_stream_id_ = 0;
+    next_client_request_id_ = 0;
+    sub_ns_stream_id_ = 0;
+    pub_video_ns_stream_id_ = 0;
+    sub_data_stream_id_ = 0;
+    downstream_data_alias_ = kMoqDownstreamDataTrackAlias;
+    layer_active_[0] = true;
+    layer_active_[1] = true;
+    current_group_id_[0] = 0;
+    current_group_id_[1] = 0;
+    next_frame_id_[0] = 0;
+    next_frame_id_[1] = 0;
+    last_base_frame_id_[0].reset();
+    last_base_frame_id_[1].reset();
+    for (size_t l = 0; l < 2; ++l) {
+      for (size_t t = 0; t < 8; ++t) {
+        last_tl_frame_id_[l][t].reset();
+      }
+    }
+    active_group_[0].reset();
+    active_group_[1].reset();
+    had_local_video_published_ = false;
+    frames_decoded_ = 0;
+    keyframe_requests_sent_ = 0;
+    last_target_bps_ = 0;
+    last_stats_time_ = Timestamp::MinusInfinity();
     outbound_requests_.clear();
     inbound_requests_.clear();
     inbound_uni_streams_.clear();
+    seen_server_request_ids_.clear();
+    active_inbound_req_id_to_stream_.clear();
+    active_track_alias_to_stream_.clear();
+    inbound_published_aliases_.clear();
+    pending_pre_setup_frames_.clear();
     subscriptions_.clear();
     alias_to_track_id_.clear();
     data_channels_.clear();
@@ -1675,8 +1919,29 @@ void MoqRelayBackend::StopSession() {
 void MoqRelayBackend::OnQuicConnected() {
   queues_->worker()->PostTask(SafeTask(safety_.flag(), [this]() {
     RTC_DCHECK_RUN_ON(&work_checker_);
+    if (!session_started_ || !quic_engine_) {
+      return;
+    }
+    const bool was_reconnecting = reconnecting_;
     connected_ = true;
+    reconnecting_ = false;
+    reconnect_attempt_ = 0;
+    ++reconnect_generation_;
+    session_ready_.store(true, std::memory_order_release);
+    peer_setup_received_ = false;
+    peer_control_stream_id_.reset();
     next_client_request_id_ = 0;
+    outbound_requests_.clear();
+    inbound_requests_.clear();
+    inbound_uni_streams_.clear();
+    seen_server_request_ids_.clear();
+    active_inbound_req_id_to_stream_.clear();
+    active_track_alias_to_stream_.clear();
+    inbound_published_aliases_.clear();
+    alias_to_track_id_.clear();
+    ttl_data_streams_.clear();
+    active_group_[0].reset();
+    active_group_[1].reset();
 
     // 1. 打开持久化单向控制流并发送 draft-17 SETUP (0x2F00) 消息。
     local_control_stream_id_ = quic_engine_->OpenUnidirectionalStream(
@@ -1733,7 +1998,8 @@ void MoqRelayBackend::OnQuicConnected() {
     quic_engine_->WriteStream(pub_video_ns_stream_id_, pub_ns.Encode(),
                               /*fin=*/false);
 
-    // 4. 若启用了数据通道，则订阅房间级数据轨道并声明已预创建的本地数据通道命名空间。
+    // 4. 若启用了数据通道，则订阅房间级数据轨道并声明已预创建的本地数据通道命名空间；
+    //    待发送数据对象暂存至收到服务端 SETUP 后再由 FlushPendingPreSetupTraffic 发送。
     if (config_.enable_datachannel) {
       sub_data_stream_id_ = quic_engine_->OpenBidirectionalStream();
       MoqControlMessage sub_data;
@@ -1766,25 +2032,31 @@ void MoqRelayBackend::OnQuicConnected() {
           observer_->OnBackendDataChannelState(
               local_peer_id_, cid, dch.config.label, RTC_DATA_CHANNEL_OPEN);
         }
-        while (!dch.pending_messages.empty()) {
-          PendingMoqDataMsg msg = std::move(dch.pending_messages.front());
-          dch.pending_messages.pop_front();
-          TransmitMoqDataMessageOnWorker(cid, msg.payload, msg.is_binary,
-                                         /*is_close=*/false);
-        }
       }
     }
 
     for (auto& [tid, sub_ctx] : subscriptions_) {
       (void)tid;
+      sub_ctx->low_track_alias.reset();
+      sub_ctx->high_track_alias.reset();
+      sub_ctx->min_valid_group_id[0] = 0;
+      sub_ctx->min_valid_group_id[1] = 0;
       SendSubscribePairForTrack(sub_ctx.get());
     }
 
-    RTC_LOG(kInfo) << "MOQT draft-17 session connected (ALPN="
-                   << quic_engine_->negotiated_alpn() << ", namespace="
-                   << pub_ns.track_namespace.ToSlashString() << ")";
+    RTC_LOG(kInfo) << "MOQT draft-17 session "
+                   << (was_reconnecting ? "reconnected" : "connected")
+                   << " (ALPN=" << quic_engine_->negotiated_alpn()
+                   << ", namespace=" << pub_ns.track_namespace.ToSlashString()
+                   << ")";
     if (observer_ != nullptr) {
       observer_->OnBackendConnectionState(RTC_CONN_STATE_CONNECTED, 0);
+      if (was_reconnecting && had_local_video_published_) {
+        observer_->OnBackendForceKeyFrame(SpatialLayer::kHigh);
+        if (config_.enable_simulcast) {
+          observer_->OnBackendForceKeyFrame(SpatialLayer::kLow);
+        }
+      }
     }
   }));
 }
@@ -1793,12 +2065,97 @@ void MoqRelayBackend::OnQuicDisconnected(int error_code) {
   queues_->worker()->PostTask(SafeTask(safety_.flag(), [this, error_code]() {
     RTC_DCHECK_RUN_ON(&work_checker_);
     connected_ = false;
+    session_ready_.store(false, std::memory_order_release);
+    peer_setup_received_ = false;
+    peer_control_stream_id_.reset();
+    local_control_stream_id_ = 0;
+    sub_ns_stream_id_ = 0;
+    pub_video_ns_stream_id_ = 0;
+    sub_data_stream_id_ = 0;
+    outbound_requests_.clear();
+    inbound_requests_.clear();
+    inbound_uni_streams_.clear();
+    seen_server_request_ids_.clear();
+    active_inbound_req_id_to_stream_.clear();
+    active_track_alias_to_stream_.clear();
+    inbound_published_aliases_.clear();
+    alias_to_track_id_.clear();
+    pending_pre_setup_frames_.clear();
+    ttl_data_streams_.clear();
+    active_group_[0].reset();
+    active_group_[1].reset();
+    for (auto& [cid, dch] : data_channels_) {
+      (void)cid;
+      dch.announced = false;
+      dch.publish_ns_stream_id.reset();
+      dch.ordered_stream_id.reset();
+      dch.ordered_prev_obj_id.reset();
+    }
+
+    if (!session_started_) {
+      return;
+    }
+
+    const bool fatal_auth_reject =
+        (error_code == static_cast<int>(kMoqtErrUnauthorized) ||
+         error_code == -107 || error_code == 401 || error_code == 403 ||
+         error_code == 406);
+    constexpr uint32_t kMaxReconnectAttempts = 5;
+    if (fatal_auth_reject || reconnect_attempt_ >= kMaxReconnectAttempts) {
+      session_started_ = false;
+      reconnecting_ = false;
+      RTC_LOG(kError) << "MOQT draft-17 session failed permanently (code="
+                      << error_code << ", attempts=" << reconnect_attempt_
+                      << ")";
+      if (observer_ != nullptr) {
+        observer_->OnBackendConnectionState(RTC_CONN_STATE_FAILED, error_code);
+      }
+      return;
+    }
+
+    ++reconnect_attempt_;
+    reconnecting_ = true;
+    const uint64_t gen = ++reconnect_generation_;
+    const int64_t backoff_ms = std::min<int64_t>(
+        3000, int64_t{150} << (reconnect_attempt_ - 1));
     RTC_LOG(kWarning) << "MOQT draft-17 session disconnected (code="
-                      << error_code << ")";
+                      << error_code << "), scheduling reconnect attempt "
+                      << reconnect_attempt_ << "/" << kMaxReconnectAttempts
+                      << " in " << backoff_ms << " ms";
     if (observer_ != nullptr) {
-      observer_->OnBackendConnectionState(RTC_CONN_STATE_DISCONNECTED,
+      observer_->OnBackendConnectionState(RTC_CONN_STATE_RECONNECTING,
                                           error_code);
     }
+
+    queues_->worker()->PostDelayedTask(
+        SafeTask(safety_.flag(), [this, gen]() {
+          RTC_DCHECK_RUN_ON(&work_checker_);
+          if (!session_started_ || !reconnecting_ ||
+              reconnect_generation_ != gen || !quic_engine_) {
+            return;
+          }
+          quic_engine_->Close(0);
+          quic_engine_->SetObserver(this);
+          const int rc = quic_engine_->Connect(
+              parsed_url_.host, parsed_url_.port,
+              quic_engine_->is_webtransport() ? kHttp3Alpn : kMoqtDraft17Alpn);
+          if (rc != RTC_OK) {
+            OnQuicDisconnected(rc);
+            return;
+          }
+          // 若重连握手在对端不可达时超时未响应，自动推进至下一次退避重试。
+          queues_->worker()->PostDelayedTask(
+              SafeTask(safety_.flag(), [this, gen]() {
+                RTC_DCHECK_RUN_ON(&work_checker_);
+                if (session_started_ && reconnecting_ && !connected_ &&
+                    reconnect_generation_ == gen && quic_engine_) {
+                  quic_engine_->Close(0);
+                  OnQuicDisconnected(RTC_ERR_NOT_CONNECTED);
+                }
+              }),
+              TimeDelta::Millis(2000));
+        }),
+        TimeDelta::Millis(backoff_ms));
   }));
 }
 
@@ -1815,123 +2172,212 @@ void MoqRelayBackend::SetLayerActive(SpatialLayer layer, bool active) {
       }));
 }
 
+void MoqRelayBackend::FlushPendingPreSetupTraffic() {
+  RTC_DCHECK_RUN_ON(&work_checker_);
+  if (!connected_ || !peer_setup_received_ || !quic_engine_) {
+    return;
+  }
+  if (config_.enable_datachannel) {
+    for (auto& [cid, dch] : data_channels_) {
+      if (dch.state == RTC_DATA_CHANNEL_CLOSED) {
+        continue;
+      }
+      while (!dch.pending_messages.empty()) {
+        PendingMoqDataMsg msg = std::move(dch.pending_messages.front());
+        dch.pending_messages.pop_front();
+        TransmitMoqDataMessageOnWorker(cid, msg.payload, msg.is_binary,
+                                       /*is_close=*/false);
+      }
+    }
+  }
+  while (!pending_pre_setup_frames_.empty()) {
+    EncodedVideoFrame f = std::move(pending_pre_setup_frames_.front());
+    pending_pre_setup_frames_.pop_front();
+    SendEncodedFrameOnWorker(std::move(f));
+  }
+}
+
+void MoqRelayBackend::SendEncodedFrameOnWorker(EncodedVideoFrame f) {
+  RTC_DCHECK_RUN_ON(&work_checker_);
+  if (!connected_ || !quic_engine_) {
+    return;
+  }
+  const size_t layer_idx = (f.layer == SpatialLayer::kHigh) ? 1 : 0;
+  if (config_.enable_simulcast && !layer_active_[layer_idx]) {
+    return;
+  }
+  had_local_video_published_ = true;
+
+  // 在对端 SETUP 尚未完成前暂存媒体帧，防止首包 SETUP 丢包重传期间媒体单向流早于 SETUP 到达中继触发 PROTOCOL_VIOLATION。
+  if (!peer_setup_received_) {
+    if (f.dep.is_keyframe) {
+      for (auto it = pending_pre_setup_frames_.begin();
+           it != pending_pre_setup_frames_.end();) {
+        if (it->layer == f.layer) {
+          it = pending_pre_setup_frames_.erase(it);
+        } else {
+          ++it;
+        }
+      }
+    }
+    if (pending_pre_setup_frames_.size() < 64) {
+      pending_pre_setup_frames_.push_back(std::move(f));
+    }
+    return;
+  }
+
+  const Timestamp now = clock_->CurrentTime();
+  if (active_group_[layer_idx].has_value()) {
+    auto& prev_grp = *active_group_[layer_idx];
+    const QuicCongestionSnapshot qsnap = quic_engine_->GetCongestionSnapshot();
+    const DataRate drain_rate = std::max(
+        DataRate::KilobitsPerSec(150),
+        qsnap.delivery_rate > DataRate::Zero() ? qsnap.delivery_rate
+                                               : qsnap.pacing_rate);
+    const TimeDelta est_delivery_delay =
+        qsnap.smoothed_rtt + (qsnap.unsent_stream_bytes / drain_rate);
+    // 仅当 GOP 持续时间与实际排队时延均超过 moq_delivery_timeout_ms 时才判定为投递超时，
+    // 使用 draft-17 表 16 DELIVERY_TIMEOUT (0x02) 错误码重置旧子组流。
+    const bool expired =
+        (now - prev_grp.started_at) >
+            TimeDelta::Millis(config_.moq_delivery_timeout_ms) &&
+        est_delivery_delay >
+            TimeDelta::Millis(config_.moq_delivery_timeout_ms);
+    if (f.dep.is_keyframe) {
+      for (const auto& [sg_tid, sg_st] : prev_grp.subgroup_streams) {
+        (void)sg_tid;
+        if (expired) {
+          quic_engine_->ResetStream(sg_st.stream_id, 0x02);
+          ++streams_reset_on_timeout_;
+        } else {
+          quic_engine_->WriteStream(sg_st.stream_id, ArrayView<const uint8_t>(),
+                                    /*fin=*/true);
+        }
+      }
+      active_group_[layer_idx].reset();
+    } else if (expired) {
+      RTC_LOG(kWarning)
+          << "MOQT GOP group_id=" << prev_grp.group_id
+          << " exceeded delivery_timeout_ms=" << config_.moq_delivery_timeout_ms
+          << ", issuing RESET_STREAM(DELIVERY_TIMEOUT=0x02) and IDR";
+      for (const auto& [sg_tid, sg_st] : prev_grp.subgroup_streams) {
+        (void)sg_tid;
+        quic_engine_->ResetStream(sg_st.stream_id, 0x02);
+        ++streams_reset_on_timeout_;
+      }
+      active_group_[layer_idx].reset();
+      if (observer_ != nullptr) {
+        observer_->OnBackendForceKeyFrame(f.layer);
+      }
+      return;
+    }
+  }
+
+  if (!active_group_[layer_idx].has_value()) {
+    if (!f.dep.is_keyframe) {
+      if (observer_ != nullptr) {
+        observer_->OnBackendForceKeyFrame(f.layer);
+      }
+      return;
+    }
+    ActiveOutboundGroup grp;
+    grp.group_id = ++current_group_id_[layer_idx];
+    grp.next_object_id = 0;
+    grp.started_at = now;
+    active_group_[layer_idx] = std::move(grp);
+  }
+
+  // [MOQ-1] 严格按时间层维护参考链：基础层（temporal_id == 0）仅能参考上一个非可丢弃的 T0 帧，
+  // 严禁指向高时间层或 discardable 帧，避免接收端丢弃 T1/T2 后基础层解码卡死。
+  const int64_t fid = ++next_frame_id_[layer_idx];
+  const uint8_t tid =
+      f.dep.is_keyframe ? 0u : static_cast<uint8_t>(f.dep.temporal_id & 0x07u);
+  f.dep.temporal_id = tid;
+  f.dep.frame_id = fid;
+  if (f.dep.is_keyframe) {
+    f.dep.num_references = 0;
+    f.dep.discardable = false;
+    last_base_frame_id_[layer_idx] = fid;
+    last_tl_frame_id_[layer_idx][0] = fid;
+    for (size_t t = 1; t < 8; ++t) {
+      last_tl_frame_id_[layer_idx][t].reset();
+    }
+  } else if (tid == 0) {
+    f.dep.discardable = false;
+    if (last_base_frame_id_[layer_idx].has_value()) {
+      f.dep.num_references = 1;
+      f.dep.references[0] = *last_base_frame_id_[layer_idx];
+    } else {
+      f.dep.num_references = 0;
+    }
+    last_base_frame_id_[layer_idx] = fid;
+    last_tl_frame_id_[layer_idx][0] = fid;
+    for (size_t t = 1; t < 8; ++t) {
+      last_tl_frame_id_[layer_idx][t].reset();
+    }
+  } else {
+    std::optional<int64_t> ref_id;
+    for (int t = static_cast<int>(tid); t >= 0; --t) {
+      if (last_tl_frame_id_[layer_idx][t].has_value()) {
+        ref_id = last_tl_frame_id_[layer_idx][t];
+        break;
+      }
+    }
+    if (!ref_id.has_value()) {
+      ref_id = last_base_frame_id_[layer_idx];
+    }
+    if (ref_id.has_value()) {
+      f.dep.num_references = 1;
+      f.dep.references[0] = *ref_id;
+    } else {
+      f.dep.num_references = 0;
+    }
+    if (!f.dep.discardable) {
+      last_tl_frame_id_[layer_idx][tid] = fid;
+    }
+  }
+
+  auto& grp = *active_group_[layer_idx];
+  auto sg_it = grp.subgroup_streams.find(tid);
+  if (sg_it == grp.subgroup_streams.end()) {
+    const uint8_t pub_prio =
+        static_cast<uint8_t>((layer_idx == 0 ? 16 : 32) + tid * 8);
+    const uint64_t clamped_gid = std::min<uint64_t>(
+        grp.group_id,
+        static_cast<uint64_t>(std::numeric_limits<int64_t>::max() / 200));
+    const int64_t send_order =
+        static_cast<int64_t>(clamped_gid * 100) + (layer_idx == 0 ? 50 : 20) -
+        tid;
+    const uint64_t sid =
+        quic_engine_->OpenUnidirectionalStream(pub_prio, send_order);
+
+    MoqSubgroupHeader shdr;
+    shdr.track_alias = layer_idx + 1;
+    shdr.group_id = grp.group_id;
+    shdr.subgroup_id = tid;
+    shdr.publisher_priority = pub_prio;
+    const auto hdr_bytes = shdr.Encode();
+    quic_engine_->WriteStream(sid, hdr_bytes, /*fin=*/false);
+
+    sg_it = grp.subgroup_streams
+                .emplace(tid, OutboundSubgroupStream{sid, std::nullopt})
+                .first;
+  }
+
+  const uint64_t obj_id = grp.next_object_id++;
+  const auto obj_wire =
+      LocFramePackager::PackObject(obj_id, f, sg_it->second.prev_object_id);
+  sg_it->second.prev_object_id = obj_id;
+  quic_engine_->WriteStream(sg_it->second.stream_id, obj_wire, /*fin=*/false);
+}
+
 int MoqRelayBackend::SendEncodedFrame(EncodedVideoFrame frame) {
+  if (!session_ready_.load(std::memory_order_acquire)) {
+    return RTC_ERR_NOT_CONNECTED;
+  }
   queues_->worker()->PostTask(
       SafeTask(safety_.flag(), [this, f = std::move(frame)]() mutable {
-        RTC_DCHECK_RUN_ON(&work_checker_);
-        if (!connected_ || !quic_engine_) {
-          return;
-        }
-
-        const size_t layer_idx = (f.layer == SpatialLayer::kHigh) ? 1 : 0;
-        if (config_.enable_simulcast && !layer_active_[layer_idx]) {
-          return;
-        }
-        const Timestamp now = clock_->CurrentTime();
-
-        const int64_t fid = ++next_frame_id_[layer_idx];
-        f.dep.frame_id = fid;
-        if (f.dep.is_keyframe) {
-          f.dep.num_references = 0;
-        } else if (fid > 1) {
-          f.dep.num_references = 1;
-          f.dep.references[0] = fid - 1;
-        }
-
-        if (active_group_[layer_idx].has_value()) {
-          auto& prev_grp = *active_group_[layer_idx];
-          const QuicCongestionSnapshot qsnap =
-              quic_engine_->GetCongestionSnapshot();
-          const DataRate drain_rate = std::max(
-              DataRate::KilobitsPerSec(150),
-              qsnap.delivery_rate > DataRate::Zero() ? qsnap.delivery_rate
-                                                     : qsnap.pacing_rate);
-          const TimeDelta est_delivery_delay =
-              qsnap.smoothed_rtt + (qsnap.unsent_stream_bytes / drain_rate);
-          // 仅当 GOP 持续时间与实际排队时延均超过 moq_delivery_timeout_ms 时才判定为投递超时，
-          // 使用 draft-17 表 16 DELIVERY_TIMEOUT (0x02) 错误码重置旧子组流。
-          const bool expired =
-              (now - prev_grp.started_at) >
-                  TimeDelta::Millis(config_.moq_delivery_timeout_ms) &&
-              est_delivery_delay >
-                  TimeDelta::Millis(config_.moq_delivery_timeout_ms);
-          if (f.dep.is_keyframe) {
-            for (const auto& [tid, sg_st] : prev_grp.subgroup_streams) {
-              (void)tid;
-              if (expired) {
-                quic_engine_->ResetStream(sg_st.stream_id, 0x02);
-                ++streams_reset_on_timeout_;
-              } else {
-                quic_engine_->WriteStream(
-                    sg_st.stream_id, ArrayView<const uint8_t>(), /*fin=*/true);
-              }
-            }
-            active_group_[layer_idx].reset();
-          } else if (expired) {
-            RTC_LOG(kWarning)
-                << "MOQT GOP group_id=" << prev_grp.group_id
-                << " exceeded delivery_timeout_ms="
-                << config_.moq_delivery_timeout_ms
-                << ", issuing RESET_STREAM(DELIVERY_TIMEOUT=0x02) and IDR";
-            for (const auto& [tid, sg_st] : prev_grp.subgroup_streams) {
-              (void)tid;
-              quic_engine_->ResetStream(sg_st.stream_id, 0x02);
-              ++streams_reset_on_timeout_;
-            }
-            active_group_[layer_idx].reset();
-            if (observer_ != nullptr) {
-              observer_->OnBackendForceKeyFrame(f.layer);
-            }
-            return;
-          }
-        }
-
-        if (!active_group_[layer_idx].has_value()) {
-          if (!f.dep.is_keyframe) {
-            if (observer_ != nullptr) {
-              observer_->OnBackendForceKeyFrame(f.layer);
-            }
-            return;
-          }
-          ActiveOutboundGroup grp;
-          grp.group_id = ++current_group_id_[layer_idx];
-          grp.next_object_id = 0;
-          grp.started_at = now;
-          active_group_[layer_idx] = std::move(grp);
-        }
-
-        auto& grp = *active_group_[layer_idx];
-        const uint8_t tid = f.dep.temporal_id;
-        auto sg_it = grp.subgroup_streams.find(tid);
-        if (sg_it == grp.subgroup_streams.end()) {
-          const uint8_t pub_prio =
-              static_cast<uint8_t>((layer_idx == 0 ? 16 : 32) + tid * 8);
-          const int64_t send_order =
-              static_cast<int64_t>(grp.group_id * 100) +
-              (layer_idx == 0 ? 50 : 20) - tid;
-          const uint64_t sid =
-              quic_engine_->OpenUnidirectionalStream(pub_prio, send_order);
-
-          MoqSubgroupHeader shdr;
-          shdr.track_alias = layer_idx + 1;
-          shdr.group_id = grp.group_id;
-          shdr.subgroup_id = tid;
-          shdr.publisher_priority = pub_prio;
-          const auto hdr_bytes = shdr.Encode();
-          quic_engine_->WriteStream(sid, hdr_bytes, /*fin=*/false);
-
-          sg_it =
-              grp.subgroup_streams
-                  .emplace(tid, OutboundSubgroupStream{sid, std::nullopt})
-                  .first;
-        }
-
-        const uint64_t obj_id = grp.next_object_id++;
-        const auto obj_wire =
-            LocFramePackager::PackObject(obj_id, f, sg_it->second.prev_object_id);
-        sg_it->second.prev_object_id = obj_id;
-        quic_engine_->WriteStream(sg_it->second.stream_id, obj_wire,
-                                  /*fin=*/false);
+        SendEncodedFrameOnWorker(std::move(f));
       }));
   return RTC_OK;
 }
@@ -1981,12 +2427,34 @@ int MoqRelayBackend::SubscribeRemoteTrack(const std::string& track_id,
       SafeTask(safety_.flag(), [this, track_id, preferred_layer]() {
         RTC_DCHECK_RUN_ON(&work_checker_);
         const std::string canonical_id = ExtractPeerIdFromIdOrSlash(track_id);
+        const auto old_it = subscriptions_.find(canonical_id);
+        if (old_it != subscriptions_.end()) {
+          SubscribedTrackContext* old_ctx = old_it->second.get();
+          if (connected_ && quic_engine_) {
+            for (uint64_t sid :
+                 {old_ctx->low_req_stream_id, old_ctx->high_req_stream_id}) {
+              quic_engine_->StopSending(sid, 0);
+              quic_engine_->ResetStream(sid, 0);
+              outbound_requests_.erase(sid);
+            }
+          }
+          if (old_ctx->low_track_alias.has_value()) {
+            alias_to_track_id_.erase(*old_ctx->low_track_alias);
+            active_track_alias_to_stream_.erase(*old_ctx->low_track_alias);
+          }
+          if (old_ctx->high_track_alias.has_value()) {
+            alias_to_track_id_.erase(*old_ctx->high_track_alias);
+            active_track_alias_to_stream_.erase(*old_ctx->high_track_alias);
+          }
+          subscriptions_.erase(old_it);
+        }
         auto ctx = std::make_unique<SubscribedTrackContext>(
             clock_->CurrentTime(), config_.zero_playout_delay);
         ctx->track_id = canonical_id;
         ctx->remote_namespace =
             MoqtTrackNamespace::MakePeerNamespace(room_id_, canonical_id);
         ctx->preferred_layer = preferred_layer;
+        ctx->active_subscribed_layer = preferred_layer;
         SubscribedTrackContext* raw_ctx = ctx.get();
         subscriptions_[canonical_id] = std::move(ctx);
 
@@ -2015,12 +2483,24 @@ int MoqRelayBackend::SwitchSubscribedLayer(const std::string& track_id,
         }
         SubscribedTrackContext* ctx = it->second.get();
         ctx->preferred_layer = preferred_layer;
+        ctx->active_subscribed_layer = preferred_layer;
+        const size_t target_idx =
+            (preferred_layer == SpatialLayer::kHigh) ? 1 : 0;
+        if (ctx->current_spatial_id.has_value() &&
+            *ctx->current_spatial_id !=
+                static_cast<uint8_t>(preferred_layer) &&
+            ctx->last_group_id_seen_per_layer[target_idx].has_value()) {
+          ctx->min_valid_group_id[target_idx] =
+              *ctx->last_group_id_seen_per_layer[target_idx] + 1;
+        }
         if (!connected_ || !quic_engine_) {
           return;
         }
 
         const uint64_t next_grp_req =
-            ctx->has_received_group ? (ctx->largest_group_seen + 1) : 0;
+            ctx->last_group_id_seen_per_layer[target_idx].has_value()
+                ? (*ctx->last_group_id_seen_per_layer[target_idx] + 1)
+                : 0;
 
         // 在目标空间层的 SUBSCRIBE 双向流上发送 REQUEST_UPDATE(FORWARD=1, NEW_GROUP_REQUEST)，
         // 并在旧空间层的双向流上发送 REQUEST_UPDATE(FORWARD=0)。
@@ -2073,9 +2553,11 @@ int MoqRelayBackend::UnsubscribeRemoteTrack(const std::string& track_id) {
     }
     if (ctx->low_track_alias.has_value()) {
       alias_to_track_id_.erase(*ctx->low_track_alias);
+      active_track_alias_to_stream_.erase(*ctx->low_track_alias);
     }
     if (ctx->high_track_alias.has_value()) {
       alias_to_track_id_.erase(*ctx->high_track_alias);
+      active_track_alias_to_stream_.erase(*ctx->high_track_alias);
     }
     subscriptions_.erase(it);
   }));
@@ -2130,9 +2612,13 @@ int MoqRelayBackend::EnsureDataChannelForLabelOnWorker(
     return cid;
   }
 
+  if (data_channels_.size() >= 256) {
+    return RTC_ERR_NO_MEMORY;
+  }
+
   int cid = next_dc_id_++;
   if (explicit_cfg != nullptr && explicit_cfg->negotiated &&
-      explicit_cfg->id >= 0 &&
+      explicit_cfg->id >= 0 && explicit_cfg->id < 65535 &&
       data_channels_.find(explicit_cfg->id) == data_channels_.end()) {
     cid = explicit_cfg->id;
     next_dc_id_ = std::max(next_dc_id_, cid + 1);
@@ -2215,12 +2701,14 @@ void MoqRelayBackend::TransmitMoqDataMessageOnWorker(
 
   // 若通道配置为无序零重传（max_retransmits == 0）且负载尺寸不超过单包数据报上限，
   // 直接使用 draft-17 OBJECT_DATAGRAM 承载于 QUIC/WebTransport 不可靠数据报上以获得零队头阻塞延迟。
+  const uint64_t dc_group_id =
+      static_cast<uint64_t>(std::max(0, channel_id)) + 1;
   const size_t max_dgram = quic_engine_->max_datagram_size();
   if (!dch.config.ordered && dch.config.max_retransmits == 0 && !is_close &&
       max_dgram > 32 && packed_data.size() + 24 <= max_dgram) {
     MoqtObjectDatagram dg;
     dg.track_alias = kMoqUpstreamDataTrackAlias;
-    dg.group_id = static_cast<uint64_t>(channel_id + 1);
+    dg.group_id = dc_group_id;
     dg.object_id = obj.object_id;
     dg.publisher_priority = 10;
     dg.payload = packed_data;
@@ -2237,14 +2725,14 @@ void MoqRelayBackend::TransmitMoqDataMessageOnWorker(
   if (persistent_ordered) {
     if (!dch.ordered_stream_id.has_value()) {
       const int64_t send_order =
-          (int64_t{1} << 50) - static_cast<int64_t>(channel_id);
+          (int64_t{1} << 50) - static_cast<int64_t>(std::max(0, channel_id));
       const uint64_t sid = quic_engine_->OpenUnidirectionalStream(
           /*publisher_priority=*/8, send_order);
       dch.ordered_stream_id = sid;
       dch.ordered_prev_obj_id.reset();
       MoqSubgroupHeader shdr;
       shdr.track_alias = kMoqUpstreamDataTrackAlias;
-      shdr.group_id = static_cast<uint64_t>(channel_id + 1);
+      shdr.group_id = dc_group_id;
       shdr.subgroup_id = 0;
       shdr.publisher_priority = 8;
       quic_engine_->WriteStream(sid, shdr.Encode(), /*fin=*/false);
@@ -2253,14 +2741,17 @@ void MoqRelayBackend::TransmitMoqDataMessageOnWorker(
     dch.ordered_prev_obj_id = obj.object_id;
     quic_engine_->WriteStream(*dch.ordered_stream_id, wire, /*fin=*/false);
   } else {
-    const int64_t send_order =
-        (int64_t{1} << 48) + static_cast<int64_t>(obj.object_id);
+    const int64_t clamped_obj_id = static_cast<int64_t>(
+        std::min<uint64_t>(obj.object_id, uint64_t{1} << 46));
+    const int64_t send_order = (int64_t{1} << 48) + clamped_obj_id;
     const uint64_t sid = quic_engine_->OpenUnidirectionalStream(
         /*publisher_priority=*/10, send_order);
     MoqSubgroupHeader shdr;
     shdr.track_alias = kMoqUpstreamDataTrackAlias;
-    shdr.group_id = static_cast<uint64_t>(channel_id + 1);
-    shdr.subgroup_id = obj.object_id + 1;
+    shdr.group_id = dc_group_id;
+    shdr.subgroup_id =
+        obj.object_id < std::numeric_limits<uint64_t>::max() ? obj.object_id + 1
+                                                             : obj.object_id;
     shdr.publisher_priority = 10;
     shdr.end_of_group = true;
     std::vector<uint8_t> combined = shdr.Encode();
@@ -2271,12 +2762,15 @@ void MoqRelayBackend::TransmitMoqDataMessageOnWorker(
     if (!is_close && (dch.config.max_packet_lifetime_ms >= 0 ||
                       dch.config.max_retransmits >= 0)) {
       const auto snap = quic_engine_->GetCongestionSnapshot();
+      const int64_t clamped_rtx =
+          std::clamp<int64_t>(dch.config.max_retransmits, 0, 60);
+      const int64_t rtt_ms =
+          std::clamp<int64_t>(snap.smoothed_rtt.ms(), 1, 60000);
       const int64_t ttl_ms =
           (dch.config.max_packet_lifetime_ms >= 0)
-              ? dch.config.max_packet_lifetime_ms
-              : std::max<int64_t>(
-                    25,
-                    snap.smoothed_rtt.ms() * (1 + dch.config.max_retransmits));
+              ? std::clamp<int64_t>(dch.config.max_packet_lifetime_ms, 0,
+                                    300000)
+              : std::max<int64_t>(25, rtt_ms * (1 + clamped_rtx));
       ttl_data_streams_.emplace_back(sid, now + TimeDelta::Millis(ttl_ms));
     }
   }
@@ -2286,13 +2780,16 @@ int MoqRelayBackend::CreateDataChannel(const DataChannelConfig& config) {
   if (!config_.enable_datachannel) {
     return RTC_ERR_PROTOCOL;
   }
-  if (config.negotiated && config.id < 0) {
+  if (config.negotiated && (config.id < 0 || config.id >= 65535)) {
     return RTC_ERR_INVALID_ARG;
   }
   int cid = RTC_ERR_INTERNAL;
   queues_->worker()->Invoke([this, &config, &cid]() {
     RTC_DCHECK_RUN_ON(&work_checker_);
     cid = EnsureDataChannelForLabelOnWorker(config.label, &config);
+    if (cid < 0) {
+      return;
+    }
     auto& dch = data_channels_[cid];
     if (connected_ && quic_engine_) {
       AnnounceDataChannelNamespaceOnWorker(&dch);
@@ -2332,7 +2829,7 @@ int MoqRelayBackend::SendData(int channel_id,
             it->second.state == RTC_DATA_CHANNEL_CLOSED) {
           return;
         }
-        if (!connected_ || !quic_engine_) {
+        if (!connected_ || !peer_setup_received_ || !quic_engine_) {
           if (it->second.pending_messages.size() < 512) {
             it->second.pending_messages.push_back(
                 PendingMoqDataMsg{std::move(buf), is_binary});
@@ -2435,9 +2932,24 @@ void MoqRelayBackend::OnStreamOpened(uint64_t stream_id, bool unidirectional) {
       SafeTask(safety_.flag(), [this, stream_id, unidirectional]() {
         RTC_DCHECK_RUN_ON(&work_checker_);
         if (unidirectional) {
+          if (inbound_uni_streams_.find(stream_id) ==
+                  inbound_uni_streams_.end() &&
+              inbound_uni_streams_.size() >= 512) {
+            if (quic_engine_) {
+              quic_engine_->StopSending(stream_id, 0);
+            }
+            return;
+          }
           inbound_uni_streams_.try_emplace(stream_id);
         } else if (outbound_requests_.find(stream_id) ==
                    outbound_requests_.end()) {
+          if (inbound_requests_.find(stream_id) == inbound_requests_.end() &&
+              inbound_requests_.size() >= 256) {
+            if (quic_engine_) {
+              quic_engine_->ResetStream(stream_id, 0);
+            }
+            return;
+          }
           inbound_requests_.try_emplace(stream_id);
         }
       }));
@@ -2459,15 +2971,19 @@ void MoqRelayBackend::OnStreamData(uint64_t stream_id,
         if (out_it != outbound_requests_.end()) {
           HandleOutboundRequestResponseBytes(&out_it->second, buf, fin);
           if (fin) {
-            outbound_requests_.erase(out_it);
+            outbound_requests_.erase(stream_id);
+          }
+          return;
+        }
+        if (inbound_requests_.find(stream_id) == inbound_requests_.end() &&
+            inbound_requests_.size() >= 256) {
+          if (quic_engine_) {
+            quic_engine_->ResetStream(stream_id, 0);
           }
           return;
         }
         auto& in_req = inbound_requests_[stream_id];
         HandleInboundBidiRequestBytes(stream_id, &in_req, buf, fin);
-        if (fin) {
-          inbound_requests_.erase(stream_id);
-        }
       }));
 }
 
@@ -2475,19 +2991,41 @@ void MoqRelayBackend::OnStreamReset(uint64_t stream_id,
                                     uint64_t /*app_error_code*/) {
   queues_->worker()->PostTask(SafeTask(safety_.flag(), [this, stream_id]() {
     RTC_DCHECK_RUN_ON(&work_checker_);
+    if (peer_control_stream_id_.has_value() &&
+        *peer_control_stream_id_ == stream_id) {
+      if (quic_engine_) {
+        quic_engine_->Close(kMoqtErrProtocolViolation);
+      }
+      return;
+    }
     inbound_uni_streams_.erase(stream_id);
     const auto in_it = inbound_requests_.find(stream_id);
     if (in_it != inbound_requests_.end()) {
-      if (in_it->second.initial_parsed &&
-          in_it->second.initial_type ==
-              MoqControlMessageType::kPublishNamespace) {
-        const auto room_pfx = MoqtTrackNamespace::MakeRoomPrefix(room_id_);
-        if (in_it->second.ns.StartsWith(room_pfx)) {
-          HandleNamespaceSuffixNotification(
-              in_it->second.ns.SuffixAfter(room_pfx), /*is_done=*/true);
+      if (in_it->second.initial_parsed) {
+        active_inbound_req_id_to_stream_.erase(
+            in_it->second.initial_request_id);
+        if (in_it->second.published_track_alias.has_value()) {
+          inbound_published_aliases_.erase(
+              *in_it->second.published_track_alias);
+        }
+        if (in_it->second.initial_type ==
+            MoqControlMessageType::kPublishNamespace) {
+          const auto room_pfx = MoqtTrackNamespace::MakeRoomPrefix(room_id_);
+          if (in_it->second.ns.StartsWith(room_pfx)) {
+            HandleNamespaceSuffixNotification(
+                in_it->second.ns.SuffixAfter(room_pfx), /*is_done=*/true);
+          }
         }
       }
       inbound_requests_.erase(in_it);
+    }
+    for (auto ait = active_track_alias_to_stream_.begin();
+         ait != active_track_alias_to_stream_.end();) {
+      if (ait->second == stream_id) {
+        ait = active_track_alias_to_stream_.erase(ait);
+      } else {
+        ++ait;
+      }
     }
     outbound_requests_.erase(stream_id);
   }));
@@ -2497,8 +3035,33 @@ void MoqRelayBackend::OnStreamStopSending(uint64_t stream_id,
                                           uint64_t /*app_error_code*/) {
   queues_->worker()->PostTask(SafeTask(safety_.flag(), [this, stream_id]() {
     RTC_DCHECK_RUN_ON(&work_checker_);
+    if (connected_ && stream_id == local_control_stream_id_) {
+      if (quic_engine_) {
+        quic_engine_->Close(kMoqtErrProtocolViolation);
+      }
+      return;
+    }
+    const auto in_it = inbound_requests_.find(stream_id);
+    if (in_it != inbound_requests_.end()) {
+      if (in_it->second.initial_parsed) {
+        active_inbound_req_id_to_stream_.erase(
+            in_it->second.initial_request_id);
+        if (in_it->second.published_track_alias.has_value()) {
+          inbound_published_aliases_.erase(
+              *in_it->second.published_track_alias);
+        }
+      }
+      inbound_requests_.erase(in_it);
+    }
+    for (auto ait = active_track_alias_to_stream_.begin();
+         ait != active_track_alias_to_stream_.end();) {
+      if (ait->second == stream_id) {
+        ait = active_track_alias_to_stream_.erase(ait);
+      } else {
+        ++ait;
+      }
+    }
     outbound_requests_.erase(stream_id);
-    inbound_requests_.erase(stream_id);
   }));
 }
 
@@ -2508,10 +3071,13 @@ void MoqRelayBackend::OnDatagramReceived(ArrayView<const uint8_t> data) {
       SafeTask(safety_.flag(), [this, buf = std::move(copy)]() {
         RTC_DCHECK_RUN_ON(&work_checker_);
         bool violation = false;
-        auto dg = MoqtObjectDatagram::Decode(buf, &violation);
+        uint64_t decode_err = kMoqtErrProtocolViolation;
+        auto dg = MoqtObjectDatagram::Decode(buf, &violation, &decode_err);
         if (violation) {
           if (quic_engine_) {
-            quic_engine_->Close(kMoqtErrProtocolViolation);
+            quic_engine_->Close(decode_err != kMoqtErrNoError
+                                    ? decode_err
+                                    : kMoqtErrProtocolViolation);
           }
           return;
         }
@@ -2534,10 +3100,13 @@ void MoqRelayBackend::HandleControlStreamBytes(std::vector<uint8_t>* buf) {
   while (!buf->empty()) {
     size_t consumed = 0;
     bool violation = false;
-    auto msg = MoqControlMessage::Decode(*buf, &consumed, &violation);
+    uint64_t decode_err = kMoqtErrProtocolViolation;
+    auto msg = MoqControlMessage::Decode(*buf, &consumed, &violation, &decode_err);
     if (violation) {
       if (quic_engine_) {
-        quic_engine_->Close(kMoqtErrProtocolViolation);
+        quic_engine_->Close(decode_err != kMoqtErrNoError
+                                ? decode_err
+                                : kMoqtErrProtocolViolation);
       }
       buf->clear();
       return;
@@ -2553,7 +3122,12 @@ void MoqRelayBackend::HandleControlStreamBytes(std::vector<uint8_t>* buf) {
         return;
       }
       peer_setup_received_ = true;
+      FlushPendingPreSetupTraffic();
     } else if (msg->type == MoqControlMessageType::kGoaway) {
+      if (!peer_setup_received_) {
+        quic_engine_->Close(kMoqtErrProtocolViolation);
+        return;
+      }
       RTC_LOG(kInfo) << "MOQT received GOAWAY (new_uri=" << msg->new_session_uri
                      << ", timeout_ms=" << msg->goaway_timeout_ms << ")";
     } else {
@@ -2585,7 +3159,7 @@ void MoqRelayBackend::HandleNamespaceSuffixNotification(
         (suffix.fields.size() >= 3) ? suffix.fields[2] : "data";
     if (!is_done) {
       const int cid = EnsureDataChannelForLabelOnWorker(label, nullptr);
-      if (notified_remote_dc_peers_.emplace(remote_peer, cid).second &&
+      if (cid >= 0 && notified_remote_dc_peers_.emplace(remote_peer, cid).second &&
           observer_ != nullptr) {
         observer_->OnBackendDataChannelState(remote_peer, cid, label,
                                              RTC_DATA_CHANNEL_OPEN);
@@ -2602,6 +3176,15 @@ void MoqRelayBackend::HandleNamespaceSuffixNotification(
       }
     }
     return;
+  }
+
+  if (!is_done) {
+    const auto sub_it = subscriptions_.find(remote_peer);
+    if (sub_it != subscriptions_.end()) {
+      sub_it->second->min_valid_group_id[0] = 0;
+      sub_it->second->min_valid_group_id[1] = 0;
+      sub_it->second->last_keyframe_rtp_ts.reset();
+    }
   }
 
   if (observer_ != nullptr) {
@@ -2625,14 +3208,25 @@ void MoqRelayBackend::HandleOutboundRequestResponseBytes(
     OutboundBidiRequestState* req_st,
     ArrayView<const uint8_t> data,
     bool /*fin*/) {
+  if (req_st->rx_buf.size() + data.size() > 256 * 1024) {
+    if (quic_engine_) {
+      quic_engine_->Close(kMoqtErrProtocolViolation);
+    }
+    req_st->rx_buf.clear();
+    return;
+  }
   req_st->rx_buf.insert(req_st->rx_buf.end(), data.begin(), data.end());
   while (!req_st->rx_buf.empty()) {
     size_t consumed = 0;
     bool violation = false;
-    auto msg = MoqControlMessage::Decode(req_st->rx_buf, &consumed, &violation);
+    uint64_t decode_err = kMoqtErrProtocolViolation;
+    auto msg = MoqControlMessage::Decode(req_st->rx_buf, &consumed, &violation,
+                                         &decode_err);
     if (violation) {
       if (quic_engine_) {
-        quic_engine_->Close(kMoqtErrProtocolViolation);
+        quic_engine_->Close(decode_err != kMoqtErrNoError
+                                ? decode_err
+                                : kMoqtErrProtocolViolation);
       }
       req_st->rx_buf.clear();
       return;
@@ -2646,20 +3240,43 @@ void MoqRelayBackend::HandleOutboundRequestResponseBytes(
 
     switch (msg->type) {
       case MoqControlMessageType::kSubscribeOk: {
+        const auto existing_alias_it =
+            active_track_alias_to_stream_.find(msg->track_alias);
+        if (existing_alias_it != active_track_alias_to_stream_.end() &&
+            existing_alias_it->second != req_st->stream_id) {
+          if (quic_engine_) {
+            quic_engine_->Close(kMoqtErrDuplicateTrackAlias);
+          }
+          req_st->rx_buf.clear();
+          return;
+        }
+        active_track_alias_to_stream_[msg->track_alias] = req_st->stream_id;
         req_st->ok_received = true;
         if (req_st->kind == OutboundRequestKind::kSubscribeData) {
           downstream_data_alias_ = msg->track_alias;
         } else if (req_st->kind == OutboundRequestKind::kSubscribeVideoLow ||
                    req_st->kind == OutboundRequestKind::kSubscribeVideoHigh) {
-          alias_to_track_id_[msg->track_alias] = req_st->target_track_id;
           const auto sit = subscriptions_.find(req_st->target_track_id);
           if (sit != subscriptions_.end()) {
             if (req_st->kind == OutboundRequestKind::kSubscribeVideoLow) {
+              if (sit->second->low_track_alias.has_value() &&
+                  *sit->second->low_track_alias != msg->track_alias) {
+                alias_to_track_id_.erase(*sit->second->low_track_alias);
+                active_track_alias_to_stream_.erase(
+                    *sit->second->low_track_alias);
+              }
               sit->second->low_track_alias = msg->track_alias;
             } else {
+              if (sit->second->high_track_alias.has_value() &&
+                  *sit->second->high_track_alias != msg->track_alias) {
+                alias_to_track_id_.erase(*sit->second->high_track_alias);
+                active_track_alias_to_stream_.erase(
+                    *sit->second->high_track_alias);
+              }
               sit->second->high_track_alias = msg->track_alias;
             }
           }
+          alias_to_track_id_[msg->track_alias] = req_st->target_track_id;
         }
         break;
       }
@@ -2691,15 +3308,26 @@ void MoqRelayBackend::HandleInboundBidiRequestBytes(
     uint64_t stream_id,
     InboundBidiRequestState* req_st,
     ArrayView<const uint8_t> data,
-    bool /*fin*/) {
+    bool fin) {
+  if (req_st->rx_buf.size() + data.size() > 256 * 1024) {
+    if (quic_engine_) {
+      quic_engine_->Close(kMoqtErrProtocolViolation);
+    }
+    req_st->rx_buf.clear();
+    return;
+  }
   req_st->rx_buf.insert(req_st->rx_buf.end(), data.begin(), data.end());
   while (!req_st->rx_buf.empty()) {
     size_t consumed = 0;
     bool violation = false;
-    auto msg = MoqControlMessage::Decode(req_st->rx_buf, &consumed, &violation);
+    uint64_t decode_err = kMoqtErrProtocolViolation;
+    auto msg = MoqControlMessage::Decode(req_st->rx_buf, &consumed, &violation,
+                                         &decode_err);
     if (violation) {
       if (quic_engine_) {
-        quic_engine_->Close(kMoqtErrProtocolViolation);
+        quic_engine_->Close(decode_err != kMoqtErrNoError
+                                ? decode_err
+                                : kMoqtErrProtocolViolation);
       }
       req_st->rx_buf.clear();
       return;
@@ -2711,11 +3339,143 @@ void MoqRelayBackend::HandleInboundBidiRequestBytes(
                          req_st->rx_buf.begin() +
                              static_cast<ptrdiff_t>(consumed));
 
+    // draft-17 第 9.1 节：服务端向客户端发起的 Request ID 必须为奇数 (1, 3, 5, ...)。
+    const bool carries_request_id =
+        (msg->type == MoqControlMessageType::kSubscribe ||
+         msg->type == MoqControlMessageType::kPublish ||
+         msg->type == MoqControlMessageType::kPublishNamespace ||
+         msg->type == MoqControlMessageType::kSubscribeNamespace ||
+         msg->type == MoqControlMessageType::kRequestUpdate ||
+         msg->type == MoqControlMessageType::kTrackStatus ||
+         msg->type == MoqControlMessageType::kFetch);
+    if (!carries_request_id) {
+      if (quic_engine_) {
+        quic_engine_->Close(kMoqtErrProtocolViolation);
+      }
+      req_st->rx_buf.clear();
+      return;
+    }
+    if ((msg->request_id & 1u) == 0) {
+      if (quic_engine_) {
+        quic_engine_->Close(kMoqtErrInvalidRequestId);
+      }
+      req_st->rx_buf.clear();
+      return;
+    }
+
+    InboundBidiRequestState* target_req_st = req_st;
     if (!req_st->initial_parsed) {
-      req_st->initial_parsed = true;
-      req_st->initial_type = msg->type;
-      req_st->ns = msg->track_namespace;
-      req_st->track_name = msg->track_name;
+      if (msg->type == MoqControlMessageType::kRequestUpdate) {
+        // [MOQ-5] 支持在新双向流上通过引用活跃 request_id 发送 REQUEST_UPDATE。
+        uint64_t target_req_id = 0;
+        if (msg->required_request_id_delta > 0) {
+          if (!seen_server_request_ids_.insert(msg->request_id).second) {
+            if (quic_engine_) {
+              quic_engine_->Close(kMoqtErrInvalidRequestId);
+            }
+            req_st->rx_buf.clear();
+            return;
+          }
+          target_req_id =
+              msg->request_id - 2 * msg->required_request_id_delta;
+          if (seen_server_request_ids_.count(target_req_id) == 0) {
+            if (quic_engine_) {
+              quic_engine_->Close(kMoqtErrInvalidRequiredRequestId);
+            }
+            req_st->rx_buf.clear();
+            return;
+          }
+        } else if (active_inbound_req_id_to_stream_.count(msg->request_id) > 0) {
+          target_req_id = msg->request_id;
+        } else {
+          if (quic_engine_) {
+            quic_engine_->Close(
+                seen_server_request_ids_.count(msg->request_id) > 0
+                    ? kMoqtErrInvalidRequestId
+                    : kMoqtErrProtocolViolation);
+          }
+          req_st->rx_buf.clear();
+          return;
+        }
+
+        const auto active_it =
+            active_inbound_req_id_to_stream_.find(target_req_id);
+        if (active_it == active_inbound_req_id_to_stream_.end()) {
+          MoqControlMessage err;
+          err.type = MoqControlMessageType::kRequestError;
+          err.error_or_status_code = kMoqtReqErrDoesNotExist;
+          err.reason_phrase = "request closed";
+          quic_engine_->WriteStream(stream_id, err.Encode(), /*fin=*/true);
+          inbound_requests_.erase(stream_id);
+          return;
+        }
+        const auto orig_it = inbound_requests_.find(active_it->second);
+        if (orig_it == inbound_requests_.end()) {
+          MoqControlMessage err;
+          err.type = MoqControlMessageType::kRequestError;
+          err.error_or_status_code = kMoqtReqErrDoesNotExist;
+          err.reason_phrase = "request closed";
+          quic_engine_->WriteStream(stream_id, err.Encode(), /*fin=*/true);
+          inbound_requests_.erase(stream_id);
+          return;
+        }
+        req_st->initial_parsed = true;
+        req_st->initial_request_id = msg->request_id;
+        req_st->initial_type = MoqControlMessageType::kRequestUpdate;
+        req_st->ns = orig_it->second.ns;
+        req_st->track_name = orig_it->second.track_name;
+        target_req_st = &orig_it->second;
+      } else {
+        if (!seen_server_request_ids_.insert(msg->request_id).second) {
+          if (quic_engine_) {
+            quic_engine_->Close(kMoqtErrInvalidRequestId);
+          }
+          req_st->rx_buf.clear();
+          return;
+        }
+        if (msg->required_request_id_delta > 0) {
+          const uint64_t dep_id =
+              msg->request_id - 2 * msg->required_request_id_delta;
+          if (seen_server_request_ids_.count(dep_id) == 0) {
+            if (quic_engine_) {
+              quic_engine_->Close(kMoqtErrInvalidRequiredRequestId);
+            }
+            req_st->rx_buf.clear();
+            return;
+          }
+        }
+        req_st->initial_parsed = true;
+        req_st->initial_request_id = msg->request_id;
+        req_st->initial_type = msg->type;
+        req_st->ns = msg->track_namespace;
+        req_st->track_name = msg->track_name;
+        active_inbound_req_id_to_stream_[msg->request_id] = stream_id;
+      }
+    } else if (msg->type != MoqControlMessageType::kRequestUpdate) {
+      if (quic_engine_) {
+        quic_engine_->Close(kMoqtErrProtocolViolation);
+      }
+      req_st->rx_buf.clear();
+      return;
+    } else {
+      if (!seen_server_request_ids_.insert(msg->request_id).second) {
+        if (quic_engine_) {
+          quic_engine_->Close(kMoqtErrInvalidRequestId);
+        }
+        req_st->rx_buf.clear();
+        return;
+      }
+      if (msg->required_request_id_delta > 0) {
+        const uint64_t dep_id =
+            msg->request_id - 2 * msg->required_request_id_delta;
+        if (seen_server_request_ids_.count(dep_id) == 0) {
+          if (quic_engine_) {
+            quic_engine_->Close(kMoqtErrInvalidRequiredRequestId);
+          }
+          req_st->rx_buf.clear();
+          return;
+        }
+      }
     }
 
     switch (msg->type) {
@@ -2746,13 +3506,17 @@ void MoqRelayBackend::HandleInboundBidiRequestBytes(
       case MoqControlMessageType::kRequestUpdate: {
         MoqControlMessage rok;
         rok.type = MoqControlMessageType::kRequestOk;
-        quic_engine_->WriteStream(stream_id, rok.Encode(), /*fin=*/false);
+        const bool close_update_stream =
+            (req_st->initial_type == MoqControlMessageType::kRequestUpdate &&
+             fin);
+        quic_engine_->WriteStream(stream_id, rok.Encode(),
+                                  /*fin=*/close_update_stream);
 
         if (msg->parameters.new_group_request.has_value() &&
             observer_ != nullptr) {
-          if (req_st->track_name == "video/low") {
+          if (target_req_st->track_name == "video/low") {
             observer_->OnBackendForceKeyFrame(SpatialLayer::kLow);
-          } else if (req_st->track_name == "video/high") {
+          } else if (target_req_st->track_name == "video/high") {
             observer_->OnBackendForceKeyFrame(SpatialLayer::kHigh);
           } else {
             observer_->OnBackendForceKeyFrame(SpatialLayer::kHigh);
@@ -2761,6 +3525,24 @@ void MoqRelayBackend::HandleInboundBidiRequestBytes(
             }
           }
         }
+        if (close_update_stream) {
+          inbound_requests_.erase(stream_id);
+          return;
+        }
+        break;
+      }
+      case MoqControlMessageType::kPublish: {
+        if (!inbound_published_aliases_.insert(msg->track_alias).second) {
+          if (quic_engine_) {
+            quic_engine_->Close(kMoqtErrDuplicateTrackAlias);
+          }
+          req_st->rx_buf.clear();
+          return;
+        }
+        req_st->published_track_alias = msg->track_alias;
+        MoqControlMessage pok;
+        pok.type = MoqControlMessageType::kPublishOk;
+        quic_engine_->WriteStream(stream_id, pok.Encode(), /*fin=*/false);
         break;
       }
       case MoqControlMessageType::kPublishNamespace: {
@@ -2796,13 +3578,16 @@ void MoqRelayBackend::HandleInboundBidiRequestBytes(
         quic_engine_->WriteStream(stream_id, resp, /*fin=*/false);
         break;
       }
+      case MoqControlMessageType::kFetch:
       default: {
+        active_inbound_req_id_to_stream_.erase(msg->request_id);
         MoqControlMessage err;
         err.type = MoqControlMessageType::kRequestError;
         err.error_or_status_code = kMoqtReqErrNotSupported;
         err.reason_phrase = "not supported";
         quic_engine_->WriteStream(stream_id, err.Encode(), /*fin=*/true);
-        break;
+        inbound_requests_.erase(stream_id);
+        return;
       }
     }
   }
@@ -2812,8 +3597,32 @@ void MoqRelayBackend::HandleInboundUnidirectionalData(
     uint64_t stream_id,
     ArrayView<const uint8_t> data,
     bool fin) {
+  if (inbound_uni_streams_.find(stream_id) == inbound_uni_streams_.end() &&
+      inbound_uni_streams_.size() >= 512) {
+    if (quic_engine_) {
+      quic_engine_->StopSending(stream_id, 0);
+    }
+    return;
+  }
   auto& st = inbound_uni_streams_[stream_id];
+  if (st.kind == InboundUniStreamState::Kind::kIgnoredFetch) {
+    if (fin) {
+      inbound_uni_streams_.erase(stream_id);
+    }
+    return;
+  }
   if (!data.empty()) {
+    const size_t max_uni_buf =
+        (st.kind == InboundUniStreamState::Kind::kControl)
+            ? (256 * 1024)
+            : (8 * 1024 * 1024);
+    if (st.buffer.size() + data.size() > max_uni_buf) {
+      if (quic_engine_) {
+        quic_engine_->Close(kMoqtErrProtocolViolation);
+      }
+      st.buffer.clear();
+      return;
+    }
     st.buffer.insert(st.buffer.end(), data.begin(), data.end());
   }
 
@@ -2825,10 +3634,33 @@ void MoqRelayBackend::HandleInboundUnidirectionalData(
       if (bad_vi && quic_engine_) {
         quic_engine_->Close(kMoqtErrProtocolViolation);
       }
+      if (fin) {
+        inbound_uni_streams_.erase(stream_id);
+      }
       return;
     }
     if (stype == static_cast<uint64_t>(MoqControlMessageType::kSetup)) {
+      if (peer_control_stream_id_.has_value() &&
+          *peer_control_stream_id_ != stream_id) {
+        if (quic_engine_) {
+          quic_engine_->Close(kMoqtErrProtocolViolation);
+        }
+        inbound_uni_streams_.erase(stream_id);
+        return;
+      }
+      peer_control_stream_id_ = stream_id;
       st.kind = InboundUniStreamState::Kind::kControl;
+    } else if (stype == kMoqtStreamTypeFetchHeader) {
+      // [MOQ-3] 忽略/终止不支持的 FETCH_HEADER (0x05) 单向流，绝不以 PROTOCOL_VIOLATION 断开整条会话。
+      st.kind = InboundUniStreamState::Kind::kIgnoredFetch;
+      st.buffer.clear();
+      if (quic_engine_) {
+        quic_engine_->StopSending(stream_id, kMoqtReqErrNotSupported);
+      }
+      if (fin) {
+        inbound_uni_streams_.erase(stream_id);
+      }
+      return;
     } else {
       size_t hdr_consumed = 0;
       bool violation = false;
@@ -2840,6 +3672,9 @@ void MoqRelayBackend::HandleInboundUnidirectionalData(
         return;
       }
       if (!hdr.has_value()) {
+        if (fin) {
+          inbound_uni_streams_.erase(stream_id);
+        }
         return;
       }
       st.kind = InboundUniStreamState::Kind::kSubgroupData;
@@ -2867,28 +3702,39 @@ void MoqRelayBackend::HandleInboundUnidirectionalData(
        st.header.track_alias == kMoqUpstreamDataTrackAlias);
 
   const Timestamp now = clock_->CurrentTime();
-  while (!st.buffer.empty()) {
+  while (true) {
+    const auto st_it = inbound_uni_streams_.find(stream_id);
+    if (st_it == inbound_uni_streams_.end() || st_it->second.buffer.empty()) {
+      break;
+    }
+    InboundUniStreamState& cur_st = st_it->second;
     size_t obj_consumed = 0;
     bool violation = false;
+    uint64_t obj_err = kMoqtErrProtocolViolation;
     auto sg_obj = MoqtSubgroupObject::Decode(
-        st.buffer, st.prev_object_id, st.header.has_properties, &obj_consumed,
-        &violation);
+        cur_st.buffer, cur_st.prev_object_id, cur_st.header.has_properties,
+        &obj_consumed, &violation, &obj_err);
     if (violation) {
       if (quic_engine_) {
-        quic_engine_->Close(kMoqtErrProtocolViolation);
+        quic_engine_->Close(obj_err != kMoqtErrNoError
+                                ? obj_err
+                                : kMoqtErrProtocolViolation);
       }
       return;
     }
     if (!sg_obj.has_value()) {
       break;
     }
-    st.buffer.erase(st.buffer.begin(),
-                    st.buffer.begin() + static_cast<ptrdiff_t>(obj_consumed));
-    if (!st.prev_object_id.has_value() &&
-        st.header.subgroup_id_from_first_object) {
-      st.header.subgroup_id = sg_obj->object_id;
+    cur_st.buffer.erase(
+        cur_st.buffer.begin(),
+        cur_st.buffer.begin() + static_cast<ptrdiff_t>(obj_consumed));
+    if (!cur_st.prev_object_id.has_value() &&
+        cur_st.header.subgroup_id_from_first_object) {
+      cur_st.header.subgroup_id = sg_obj->object_id;
     }
-    st.prev_object_id = sg_obj->object_id;
+    cur_st.prev_object_id = sg_obj->object_id;
+    const uint64_t track_alias = cur_st.header.track_alias;
+    const uint64_t group_id = cur_st.header.group_id;
 
     if (sg_obj->status != MoqtObjectStatus::kNormal ||
         sg_obj->payload.empty()) {
@@ -2900,6 +3746,9 @@ void MoqRelayBackend::HandleInboundUnidirectionalData(
       auto data_obj = MoqDataPackager::UnpackObject(sg_obj->payload, &d_consumed);
       if (data_obj.has_value()) {
         DeliverUnpackedDataObject(std::move(*data_obj));
+        if (!connected_) {
+          return;
+        }
       }
       continue;
     }
@@ -2910,13 +3759,13 @@ void MoqRelayBackend::HandleInboundUnidirectionalData(
     }
 
     SubscribedTrackContext* sub_ctx = nullptr;
-    const auto alias_it = alias_to_track_id_.find(st.header.track_alias);
+    const auto alias_it = alias_to_track_id_.find(track_alias);
     if (alias_it != alias_to_track_id_.end()) {
       const auto sub_it = subscriptions_.find(alias_it->second);
       if (sub_it != subscriptions_.end()) {
         sub_ctx = sub_it->second.get();
       }
-    } else if ((st.header.track_alias == 1 || st.header.track_alias == 2) &&
+    } else if ((track_alias == 1 || track_alias == 2) &&
                subscriptions_.size() == 1) {
       sub_ctx = subscriptions_.begin()->second.get();
     }
@@ -2924,9 +3773,86 @@ void MoqRelayBackend::HandleInboundUnidirectionalData(
       continue;
     }
 
+    const size_t sidx =
+        (frame->dep.spatial_id == static_cast<uint8_t>(SpatialLayer::kHigh))
+            ? 1
+            : 0;
+    const bool frame_id_reset =
+        frame->dep.is_keyframe &&
+        ((sub_ctx->last_seen_frame_id_per_layer[sidx].has_value() &&
+          frame->dep.frame_id <= *sub_ctx->last_seen_frame_id_per_layer[sidx]) ||
+         (sub_ctx->last_group_id_seen_per_layer[sidx].has_value() &&
+          group_id < *sub_ctx->last_group_id_seen_per_layer[sidx] &&
+          group_id <= 1));
+
+    // [MOQ-2] Simulcast 切层防乱序与发布者重启 frame_id 回退恢复：
+    //   1) 已完成新空间层关键帧切换后，严格丢弃来自旧空间层的乱序尾随非关键帧，防止篡改 current_spatial_id 与污染 FrameBuffer3；
+    //   2) 丢弃低于当前空间层最小合法 group_id 纪元的旧帧（发布者重启 group_id 回退时除外）；
+    //   3) 检测到发布者重启 / frame_id 跳变回退时立即清空 FrameBuffer3，使 DecodedFramesHistory 重新接纳新流。
+    if (!frame->dep.is_keyframe) {
+      if (!sub_ctx->current_spatial_id.has_value() ||
+          *sub_ctx->current_spatial_id != frame->dep.spatial_id) {
+        continue;
+      }
+      if (group_id < sub_ctx->min_valid_group_id[sidx]) {
+        continue;
+      }
+    } else {
+      if (!frame_id_reset && group_id < sub_ctx->min_valid_group_id[sidx]) {
+        continue;
+      }
+      if (!frame_id_reset && sub_ctx->current_spatial_id.has_value() &&
+          frame->dep.spatial_id != *sub_ctx->current_spatial_id &&
+          sub_ctx->last_keyframe_rtp_ts.has_value()) {
+        if (AheadOf<uint32_t>(*sub_ctx->last_keyframe_rtp_ts,
+                              frame->rtp_timestamp)) {
+          continue;
+        }
+        if (frame->rtp_timestamp == *sub_ctx->last_keyframe_rtp_ts &&
+            *sub_ctx->current_spatial_id ==
+                static_cast<uint8_t>(sub_ctx->active_subscribed_layer)) {
+          continue;
+        }
+      }
+    }
+
     sub_ctx->has_received_group = true;
     sub_ctx->largest_group_seen =
-        std::max(sub_ctx->largest_group_seen, st.header.group_id);
+        std::max(sub_ctx->largest_group_seen, group_id);
+
+    if (frame->dep.is_keyframe) {
+      const bool spatial_switched =
+          sub_ctx->current_spatial_id.has_value() &&
+          *sub_ctx->current_spatial_id != frame->dep.spatial_id;
+      const bool history_backward =
+          sub_ctx->last_inserted_frame_id.has_value() &&
+          frame->dep.frame_id <= *sub_ctx->last_inserted_frame_id;
+      if (spatial_switched || frame_id_reset || history_backward) {
+        sub_ctx->frame_buffer.Clear();
+      }
+      if (spatial_switched) {
+        const size_t prev_sidx = 1 - sidx;
+        if (sub_ctx->last_group_id_seen_per_layer[prev_sidx].has_value()) {
+          sub_ctx->min_valid_group_id[prev_sidx] =
+              *sub_ctx->last_group_id_seen_per_layer[prev_sidx] + 1;
+        }
+      }
+      if (frame_id_reset) {
+        sub_ctx->min_valid_group_id[sidx] = group_id;
+      }
+      sub_ctx->current_spatial_id = frame->dep.spatial_id;
+      sub_ctx->last_keyframe_rtp_ts = frame->rtp_timestamp;
+    }
+
+    sub_ctx->last_group_id_seen_per_layer[sidx] =
+        sub_ctx->last_group_id_seen_per_layer[sidx].has_value()
+            ? std::max(*sub_ctx->last_group_id_seen_per_layer[sidx], group_id)
+            : group_id;
+    if (frame_id_reset) {
+      sub_ctx->last_group_id_seen_per_layer[sidx] = group_id;
+    }
+    sub_ctx->last_seen_frame_id_per_layer[sidx] = frame->dep.frame_id;
+    sub_ctx->last_inserted_frame_id = frame->dep.frame_id;
 
     const DataSize fsize = DataSize::Bytes(frame->data.size());
     if (sub_ctx->prev_recv_time.has_value() &&
@@ -2939,12 +3865,6 @@ void MoqRelayBackend::HandleInboundUnidirectionalData(
     sub_ctx->prev_frame_size = fsize;
     sub_ctx->vcm_timing.IncomingTimestamp(frame->rtp_timestamp, now);
 
-    if (frame->dep.is_keyframe && sub_ctx->current_spatial_id.has_value() &&
-        *sub_ctx->current_spatial_id != frame->dep.spatial_id) {
-      sub_ctx->frame_buffer.Clear();
-    }
-    sub_ctx->current_spatial_id = frame->dep.spatial_id;
-
     AssembledRtpFrame rtp_frame;
     rtp_frame.rtp_timestamp = frame->rtp_timestamp;
     rtp_frame.received_time = now;
@@ -2955,6 +3875,9 @@ void MoqRelayBackend::HandleInboundUnidirectionalData(
 
     sub_ctx->frame_buffer.InsertFrame(std::move(rtp_frame));
     DrainDecodableFrames(sub_ctx);
+    if (!connected_) {
+      return;
+    }
   }
 
   if (fin) {
@@ -2967,6 +3890,9 @@ void MoqRelayBackend::DeliverUnpackedDataObject(MoqDataObject obj) {
     return;
   }
   const int cid = EnsureDataChannelForLabelOnWorker(obj.label, nullptr);
+  if (cid < 0) {
+    return;
+  }
   const std::string peer =
       obj.sender_peer_id.empty() ? "remote_peer" : obj.sender_peer_id;
   if (obj.is_close) {
@@ -2989,7 +3915,19 @@ void MoqRelayBackend::DeliverUnpackedDataObject(MoqDataObject obj) {
 }
 
 void MoqRelayBackend::DrainDecodableFrames(SubscribedTrackContext* sub) {
-  while (auto dec = sub->frame_buffer.ExtractNextDecodableFrame()) {
+  if (sub == nullptr) {
+    return;
+  }
+  const std::string track_id = sub->track_id;
+  while (connected_) {
+    const auto sit = subscriptions_.find(track_id);
+    if (sit == subscriptions_.end()) {
+      break;
+    }
+    auto dec = sit->second->frame_buffer.ExtractNextDecodableFrame();
+    if (!dec.has_value()) {
+      break;
+    }
     ++frames_decoded_;
     EncodedVideoFrame out;
     out.data = std::move(dec->annexb_bitstream);
@@ -2999,8 +3937,7 @@ void MoqRelayBackend::DrainDecodableFrames(SubscribedTrackContext* sub) {
     out.layer = static_cast<SpatialLayer>(dec->dep.spatial_id);
     out.dep = dec->dep;
     if (observer_ != nullptr) {
-      observer_->OnBackendDecodableFrame(sub->track_id, sub->track_id,
-                                         std::move(out));
+      observer_->OnBackendDecodableFrame(track_id, track_id, std::move(out));
     }
   }
 }
@@ -3044,6 +3981,7 @@ void MoqRelayBackend::OnPeriodicMaintenanceTick() {
           static_cast<uint32_t>(snap.pacing_rate.bps());
       stats.uplink_packet_loss = static_cast<float>(rate.loss_rate_ratio);
       stats.packets_sent = snap.packets_sent;
+      stats.packets_retransmitted = snap.packets_retransmitted;
       stats.frames_decoded = frames_decoded_;
       stats.keyframe_requests_sent = keyframe_requests_sent_;
       last_stats_time_ = now;
@@ -3060,6 +3998,27 @@ void MoqRelayBackend::OnPeriodicMaintenanceTick() {
 // ======================= InMemoryMoqQuicPair 内存回环 QUIC 测试对 =======================
 
 namespace {
+thread_local std::vector<const void*> g_active_loopback_cb_endpoints;
+
+bool IsLoopbackEndpointInCallback(const void* ep) {
+  return std::find(g_active_loopback_cb_endpoints.begin(),
+                   g_active_loopback_cb_endpoints.end(),
+                   ep) != g_active_loopback_cb_endpoints.end();
+}
+
+struct ScopedLoopbackCbGuard {
+  explicit ScopedLoopbackCbGuard(const void* e) : ep(e) {
+    g_active_loopback_cb_endpoints.push_back(ep);
+  }
+  ~ScopedLoopbackCbGuard() {
+    if (!g_active_loopback_cb_endpoints.empty() &&
+        g_active_loopback_cb_endpoints.back() == ep) {
+      g_active_loopback_cb_endpoints.pop_back();
+    }
+  }
+  const void* ep;
+};
+
 class LoopbackQuicEndpoint final
     : public IMoqQuicEngine,
       public std::enable_shared_from_this<LoopbackQuicEndpoint> {
@@ -3069,6 +4028,7 @@ class LoopbackQuicEndpoint final
                        DataRate bw,
                        TimeDelta rtt)
       : net_q_(net_q),
+        is_client_(is_client),
         next_bidi_id_(is_client ? 0 : 1),
         next_uni_id_(is_client ? 2 : 3),
         bw_(bw),
@@ -3078,33 +4038,73 @@ class LoopbackQuicEndpoint final
     peer_ = std::move(peer);
   }
 
-  void SetObserver(IMoqQuicEngineObserver* obs) override { observer_ = obs; }
+  void SetObserver(IMoqQuicEngineObserver* obs) override {
+    std::unique_lock<std::mutex> lock(obs_mu_);
+    observer_ = obs;
+    if (obs == nullptr && !IsLoopbackEndpointInCallback(this)) {
+      obs_cv_.wait(lock, [this]() { return active_cb_count_ == 0; });
+    }
+  }
+
+  void InvokeObserver(
+      const std::function<void(IMoqQuicEngineObserver*)>& fn) {
+    IMoqQuicEngineObserver* obs = nullptr;
+    {
+      std::lock_guard<std::mutex> lock(obs_mu_);
+      if (observer_ == nullptr) {
+        return;
+      }
+      obs = observer_;
+      ++active_cb_count_;
+    }
+    {
+      ScopedLoopbackCbGuard guard(this);
+      fn(obs);
+    }
+    {
+      std::lock_guard<std::mutex> lock(obs_mu_);
+      if (--active_cb_count_ == 0) {
+        obs_cv_.notify_all();
+      }
+    }
+  }
 
   int Connect(const std::string& /*host*/,
               uint16_t /*port*/,
               const std::string& alpn) override {
-    alpn_ = alpn;
+    {
+      std::lock_guard<std::mutex> lock(alpn_mu_);
+      alpn_ = alpn;
+    }
+    is_open_.store(true, std::memory_order_release);
+    next_bidi_id_.store(is_client_ ? 0 : 1);
+    next_uni_id_.store(is_client_ ? 2 : 3);
     auto self = shared_from_this();
-    net_q_->PostTask([self]() {
-      if (self->observer_ != nullptr) {
-        self->observer_->OnQuicConnected();
-      }
+    net_q_->PostTask([self, alpn]() {
+      self->InvokeObserver(
+          [](IMoqQuicEngineObserver* obs) { obs->OnQuicConnected(); });
       if (auto p = self->peer_.lock()) {
-        p->alpn_ = self->alpn_;
-        if (p->observer_ != nullptr) {
-          p->observer_->OnQuicConnected();
+        {
+          std::lock_guard<std::mutex> lock(p->alpn_mu_);
+          p->alpn_ = alpn;
         }
+        p->is_open_.store(true, std::memory_order_release);
+        p->InvokeObserver(
+            [](IMoqQuicEngineObserver* p_obs) { p_obs->OnQuicConnected(); });
       }
     });
     return 0;
   }
 
   void Close(uint64_t code) override {
+    if (!is_open_.exchange(false, std::memory_order_acq_rel)) {
+      return;
+    }
     auto self = shared_from_this();
     net_q_->PostTask([self, code]() {
-      if (self->observer_ != nullptr) {
-        self->observer_->OnQuicDisconnected(static_cast<int>(code));
-      }
+      self->InvokeObserver([code](IMoqQuicEngineObserver* obs) {
+        obs->OnQuicDisconnected(static_cast<int>(code));
+      });
     });
   }
 
@@ -3112,9 +4112,9 @@ class LoopbackQuicEndpoint final
     const uint64_t id = next_bidi_id_.fetch_add(4);
     if (auto peer = peer_.lock()) {
       net_q_->PostTask([peer, id]() {
-        if (peer->observer_ != nullptr) {
-          peer->observer_->OnStreamOpened(id, false);
-        }
+        peer->InvokeObserver([id](IMoqQuicEngineObserver* p_obs) {
+          p_obs->OnStreamOpened(id, false);
+        });
       });
     }
     return id;
@@ -3125,9 +4125,9 @@ class LoopbackQuicEndpoint final
     const uint64_t id = next_uni_id_.fetch_add(4);
     if (auto peer = peer_.lock()) {
       net_q_->PostTask([peer, id]() {
-        if (peer->observer_ != nullptr) {
-          peer->observer_->OnStreamOpened(id, true);
-        }
+        peer->InvokeObserver([id](IMoqQuicEngineObserver* p_obs) {
+          p_obs->OnStreamOpened(id, true);
+        });
       });
     }
     return id;
@@ -3143,9 +4143,9 @@ class LoopbackQuicEndpoint final
     std::vector<uint8_t> buf(data.begin(), data.end());
     pkts_sent_.fetch_add(1);
     net_q_->PostTask([peer, stream_id, b = std::move(buf), fin]() {
-      if (peer->observer_ != nullptr) {
-        peer->observer_->OnStreamData(stream_id, b, fin);
-      }
+      peer->InvokeObserver([stream_id, &b, fin](IMoqQuicEngineObserver* p_obs) {
+        p_obs->OnStreamData(stream_id, b, fin);
+      });
     });
     return static_cast<int>(data.size());
   }
@@ -3153,9 +4153,10 @@ class LoopbackQuicEndpoint final
   void ResetStream(uint64_t stream_id, uint64_t app_error_code) override {
     if (auto peer = peer_.lock()) {
       net_q_->PostTask([peer, stream_id, app_error_code]() {
-        if (peer->observer_ != nullptr) {
-          peer->observer_->OnStreamReset(stream_id, app_error_code);
-        }
+        peer->InvokeObserver(
+            [stream_id, app_error_code](IMoqQuicEngineObserver* p_obs) {
+              p_obs->OnStreamReset(stream_id, app_error_code);
+            });
       });
     }
   }
@@ -3163,9 +4164,10 @@ class LoopbackQuicEndpoint final
   void StopSending(uint64_t stream_id, uint64_t app_error_code) override {
     if (auto peer = peer_.lock()) {
       net_q_->PostTask([peer, stream_id, app_error_code]() {
-        if (peer->observer_ != nullptr) {
-          peer->observer_->OnStreamStopSending(stream_id, app_error_code);
-        }
+        peer->InvokeObserver(
+            [stream_id, app_error_code](IMoqQuicEngineObserver* p_obs) {
+              p_obs->OnStreamStopSending(stream_id, app_error_code);
+            });
       });
     }
   }
@@ -3178,15 +4180,18 @@ class LoopbackQuicEndpoint final
     std::vector<uint8_t> buf(data.begin(), data.end());
     pkts_sent_.fetch_add(1);
     net_q_->PostTask([peer, b = std::move(buf)]() {
-      if (peer->observer_ != nullptr) {
-        peer->observer_->OnDatagramReceived(b);
-      }
+      peer->InvokeObserver([&b](IMoqQuicEngineObserver* p_obs) {
+        p_obs->OnDatagramReceived(b);
+      });
     });
     return RTC_OK;
   }
 
   size_t max_datagram_size() const override { return 1160; }
-  std::string negotiated_alpn() const override { return alpn_; }
+  std::string negotiated_alpn() const override {
+    std::lock_guard<std::mutex> lock(alpn_mu_);
+    return alpn_;
+  }
 
   QuicCongestionSnapshot GetCongestionSnapshot() const override {
     QuicCongestionSnapshot s;
@@ -3201,12 +4206,18 @@ class LoopbackQuicEndpoint final
 
  private:
   TaskQueueBoost* net_q_;
+  const bool is_client_;
+  std::mutex obs_mu_;
+  std::condition_variable obs_cv_;
+  uint32_t active_cb_count_ = 0;
   IMoqQuicEngineObserver* observer_ = nullptr;
+  std::atomic<bool> is_open_{false};
   std::weak_ptr<LoopbackQuicEndpoint> peer_;
   std::atomic<uint64_t> next_bidi_id_;
   std::atomic<uint64_t> next_uni_id_;
   DataRate bw_;
   TimeDelta rtt_;
+  mutable std::mutex alpn_mu_;
   std::string alpn_ = kMoqtDraft17Alpn;
   std::atomic<uint64_t> pkts_sent_{0};
 };

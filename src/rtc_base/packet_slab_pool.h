@@ -18,7 +18,7 @@
 
 namespace rtc {
 
-constexpr size_t kMaxSlabPacketCapacity = 1600;
+constexpr size_t kMaxSlabPacketCapacity = 2048;
 constexpr size_t kDefaultSlabHeadroomBytes = 16;
 
 struct SlabPacketBuffer : public boost::intrusive::slist_base_hook<> {
@@ -35,21 +35,22 @@ struct SlabPacketBuffer : public boost::intrusive::slist_base_hook<> {
     head_offset = kDefaultSlabHeadroomBytes;
   }
 
-  void Assign(ArrayView<const uint8_t> src) {
+  bool Assign(ArrayView<const uint8_t> src) {
     Reset();
-    const size_t copy_len =
-        (src.size() <= Tailroom()) ? src.size() : Tailroom();
+    const bool fits = (src.size() <= Tailroom());
+    const size_t copy_len = fits ? src.size() : Tailroom();
     if (copy_len > 0 && src.data() != nullptr) {
       std::memcpy(MutableData(), src.data(), copy_len);
     }
     size = copy_len;
+    return fits;
   }
 };
 
 class PacketSlabPool : public std::enable_shared_from_this<PacketSlabPool> {
  public:
   struct Deleter {
-    std::weak_ptr<PacketSlabPool> pool;
+    std::shared_ptr<PacketSlabPool> pool;
     bool from_arena = true;
 
     void operator()(SlabPacketBuffer* buf) const noexcept;

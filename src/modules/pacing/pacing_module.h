@@ -14,6 +14,7 @@
 #include <memory>
 #include <optional>
 #include <queue>
+#include <set>
 #include <utility>
 #include <vector>
 
@@ -66,6 +67,7 @@ class BitrateProber {
   std::optional<PacedPacketInfo> CurrentCluster(Timestamp now);
   size_t RecommendedMinProbeSize() const;
   void ProbeSent(Timestamp now, DataSize size);
+  void PauseUntilIncomingPacket();
 
  private:
   enum class ProbingState {
@@ -116,6 +118,9 @@ class RoundRobinPacketQueue {
   TimeDelta AverageQueueTime() const;
   void UpdateQueueTime(Timestamp now);
   void Clear(Timestamp now);
+  void PurgeStalePacketsForKeyframe(Timestamp now,
+                                    uint32_t keyframe_ssrc,
+                                    uint32_t keyframe_rtp_ts);
 
  private:
   struct StreamPrioKey {
@@ -154,6 +159,7 @@ class RoundRobinPacketQueue {
   Timestamp time_last_updated_;
   TimeDelta queue_time_sum_ = TimeDelta::Zero();
 
+  std::multiset<Timestamp> enqueue_times_;
   std::map<uint32_t, Stream> streams_;
   std::priority_queue<StreamPrioKey> stream_priorities_;
 };
@@ -254,6 +260,7 @@ class TaskQueuePacedSender {
   TaskQueueBoost* const pacer_queue_;
   SequenceChecker pacer_checker_;
   PacingController pacing_controller_;
+  boost::asio::steady_timer process_timer_;
   Timestamp next_process_time_ = Timestamp::MinusInfinity();
   ScopedTaskSafety safety_;
 };

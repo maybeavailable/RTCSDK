@@ -5,6 +5,9 @@
 // 扩展 CONNECT（RFC 9220）、HTTP 数据报与 Capsule 协议（RFC 9297）以及
 // WebTransport over HTTP/3（draft-ietf-webtrans-http3-14）完整协议栈实现。
 
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
@@ -62,16 +65,26 @@ inline constexpr uint64_t kH3SettingsWtInitialMaxStreamsBidi = 0x2B65ULL;
 inline constexpr uint64_t kH3NoError = 0x0100;
 inline constexpr uint64_t kH3GeneralProtocolError = 0x0101;
 inline constexpr uint64_t kH3StreamCreationError = 0x0103;
+inline constexpr uint64_t kH3ClosedCriticalStream = 0x0104;
 inline constexpr uint64_t kH3FrameUnexpected = 0x0105;
 inline constexpr uint64_t kH3FrameError = 0x0106;
+inline constexpr uint64_t kH3ExcessiveLoad = 0x0107;
 inline constexpr uint64_t kH3IdError = 0x0108;
 inline constexpr uint64_t kH3SettingsError = 0x0109;
+inline constexpr uint64_t kH3MissingSettings = 0x010A;
 inline constexpr uint64_t kH3RequestRejected = 0x010B;
 inline constexpr uint64_t kH3RequestCancelled = 0x010C;
 inline constexpr uint64_t kH3MessageError = 0x010E;
 inline constexpr uint64_t kWtFlowControlError = 0x045D4487ULL;
 inline constexpr uint64_t kWtSessionGone = 0x170D7B68ULL;
 inline constexpr uint64_t kWtBufferedStreamRejected = 0x3994BD84ULL;
+
+// 64 位虚拟 WebTransport 会话 ID 标记位（第 62 位），确保与原生 QUIC 会话 ID 永久零碰撞。
+inline constexpr uint64_t kWtVirtualSessionBit = uint64_t{1} << 62;
+inline constexpr bool IsWtVirtualSessionId(uint64_t session_id) noexcept {
+  return (session_id & kWtVirtualSessionBit) != 0;
+}
+uint64_t AllocateWtVirtualSessionId() noexcept;
 
 // WebTransport Capsule 类型常量（draft-ietf-webtrans-http3-14 第 9.6 节）。
 inline constexpr uint64_t kWtCapsuleCloseSession = 0x2843ULL;
@@ -117,7 +130,8 @@ class QpackCodec {
       const std::vector<HttpHeaderField>& headers,
       bool use_huffman = true);
   static bool DecodeFieldSection(ArrayView<const uint8_t> data,
-                                 std::vector<HttpHeaderField>* out_headers);
+                                 std::vector<HttpHeaderField>* out_headers,
+                                 size_t max_field_section_size = 65536);
 };
 
 // HTTP/3 帧与 SETTINGS 编解码工具。
@@ -164,6 +178,14 @@ struct WebTransportCapsule {
   static bool DecodeCloseSession(ArrayView<const uint8_t> value,
                                  uint32_t* out_error_code,
                                  std::string* out_error_msg);
+  static std::vector<uint8_t> EncodeDrainSession();
+  static std::vector<uint8_t> EncodeMaxData(uint64_t max_data);
+  static bool DecodeMaxData(ArrayView<const uint8_t> value,
+                            uint64_t* out_max_data);
+  static std::vector<uint8_t> EncodeMaxStreams(uint64_t max_streams,
+                                               bool unidirectional);
+  static bool DecodeMaxStreams(ArrayView<const uint8_t> value,
+                               uint64_t* out_max_streams);
 };
 
 // WebTransport 应用错误码与协议协商头部工具函数（draft-ietf-webtrans-http3-14 第 3.3 / 4.4 节）。
@@ -194,8 +216,10 @@ class WebTransportClientEngine final
   using Http3ResponseCallback = std::function<void(const Http3Response&)>;
 
   explicit WebTransportClientEngine(
+      std::shared_ptr<IMoqQuicEngine> inner_quic);
+  WebTransportClientEngine(
       std::shared_ptr<IMoqQuicEngine> inner_quic,
-      std::string authority = "127.0.0.1:4433",
+      std::string authority,
       std::string path = "/moq",
       std::vector<std::string> available_protocols = {"moqt-17"});
   ~WebTransportClientEngine() override;
@@ -262,6 +286,10 @@ class WebTransportClientEngine final
     bool wt_session_parsed = false;
     uint64_t wt_session_id = 0;
     bool opened_notified = false;
+    bool fin_received = false;
+    bool rejected = false;
+    std::chrono::steady_clock::time_point created_at =
+        std::chrono::steady_clock::now();
     std::vector<uint8_t> buf;
   };
 
@@ -269,17 +297,30 @@ class WebTransportClientEngine final
     bool prefix_parsed = false;
     uint64_t wt_session_id = 0;
     bool opened_notified = false;
+    bool fin_received = false;
+    bool rejected = false;
+    std::chrono::steady_clock::time_point created_at =
+        std::chrono::steady_clock::now();
     std::vector<uint8_t> buf;
   };
 
   void TrySendExtendedConnectLocked();
-  void HandleControlStreamFramesLocked(std::vector<uint8_t>* buf);
+  void HandleControlStreamFramesLocked(std::vector<uint8_t>* buf,
+                                       uint64_t* out_h3_error);
   void HandleConnectStreamBytesLocked(ArrayView<const uint8_t> data, bool fin);
+  std::vector<uint8_t> MaybeBuildFlowControlDataFrameLocked();
+  size_t ComputeTotalEarlyBufferedBytesLocked() const;
+  void SweepExpiredOrMismatchedEarlyStreamsLocked(
+      std::vector<std::function<void()>>* actions);
+  void InvokeObserver(const std::function<void(IMoqQuicEngineObserver*)>& fn);
 
   std::shared_ptr<IMoqQuicEngine> inner_quic_;
   mutable std::mutex mu_;
+  std::condition_variable observer_cv_;
+  uint32_t active_observer_calls_ = 0;
   IMoqQuicEngineObserver* observer_ = nullptr;
   std::string authority_;
+  bool explicit_authority_ = false;
   std::string path_;
   std::vector<std::string> available_protocols_;
   std::string negotiated_wt_protocol_;
@@ -288,13 +329,30 @@ class WebTransportClientEngine final
   bool peer_settings_received_ = false;
   bool connect_sent_ = false;
   bool wt_established_ = false;
+  bool wt_draining_ = false;
+  bool wt_pending_flushed_ = false;
   bool closed_ = false;
+  bool disconnect_notified_ = false;
+  int connect_close_error_ = 0;
   Http3Settings peer_settings_;
 
+  bool local_ctrl_stream_opened_ = false;
   uint64_t local_ctrl_stream_id_ = 0;
+  std::optional<uint64_t> peer_ctrl_stream_id_;
   uint64_t connect_stream_id_ = 0;
   std::vector<uint8_t> connect_rx_buf_;
   std::vector<uint8_t> capsule_rx_buf_;
+
+  // WebTransport draft-14 会话级接收流控窗口追踪与自动补充状态。
+  uint64_t wt_rx_bytes_consumed_ = 0;
+  uint64_t wt_local_max_data_ = 16 * 1024 * 1024;
+  uint64_t wt_closed_peer_uni_streams_ = 0;
+  uint64_t wt_local_max_streams_uni_ = 16384;
+  uint64_t wt_closed_peer_bidi_streams_ = 0;
+  uint64_t wt_local_max_streams_bidi_ = 1024;
+  uint64_t wt_peer_max_data_ = 16 * 1024 * 1024;
+  uint64_t wt_peer_max_streams_uni_ = 16384;
+  uint64_t wt_peer_max_streams_bidi_ = 1024;
 
   struct LocalWtStreamState {
     bool is_uni = false;
@@ -330,7 +388,7 @@ class Http3ServerConnection final
                         IQuicServerVisitor* wt_visitor,
                         std::vector<std::string> supported_wt_protocols,
                         Http3RequestHandler http_handler,
-                        uint64_t virtual_session_id_base);
+                        uint64_t virtual_session_id_base = 0);
   ~Http3ServerConnection();
 
   void Start();
@@ -357,6 +415,10 @@ class Http3ServerConnection final
     uint64_t wt_connect_stream_id = 0;
     bool opened_notified = false;
     bool headers_received = false;
+    bool fin_received = false;
+    bool rejected = false;
+    std::chrono::steady_clock::time_point created_at =
+        std::chrono::steady_clock::now();
     Http3Request h3_req;
     std::vector<uint8_t> rx_buf;
     std::vector<uint8_t> capsule_buf;
@@ -368,6 +430,10 @@ class Http3ServerConnection final
     bool wt_session_parsed = false;
     uint64_t wt_connect_stream_id = 0;
     bool opened_notified = false;
+    bool fin_received = false;
+    bool rejected = false;
+    std::chrono::steady_clock::time_point created_at =
+        std::chrono::steady_clock::now();
     std::vector<uint8_t> rx_buf;
   };
 
@@ -378,6 +444,12 @@ class Http3ServerConnection final
   void FlushEarlyBufferedSessionTraffic(uint64_t connect_sid,
                                         WtSessionHandle* wt_sess);
   void TerminateWtSession(uint64_t connect_sid, int error_code);
+  void CleanupServerStreamsForConnectSid(uint64_t connect_sid);
+  void CloseConnectionWithError(uint64_t h3_error_code);
+  void RecordClosedWtConnectSid(uint64_t connect_sid);
+  void RejectEarlyStreamsForConnectSid(uint64_t connect_sid, uint64_t h3_err);
+  size_t ComputeTotalUnclaimedEarlyBytes() const;
+  void SweepStaleUnclaimedStreams();
 
   std::shared_ptr<QuicServerSessionHandle> raw_quic_;
   IQuicServerVisitor* const wt_visitor_;
@@ -385,13 +457,18 @@ class Http3ServerConnection final
   Http3RequestHandler http_handler_;
   uint64_t next_virtual_session_id_ = 0;
 
+  bool conn_closed_ = false;
   bool peer_settings_received_ = false;
   Http3Settings peer_settings_;
+  bool local_ctrl_stream_opened_ = false;
   uint64_t local_ctrl_stream_id_ = 0;
+  std::optional<uint64_t> peer_ctrl_stream_id_;
 
   // connect_stream_id -> 虚拟 WebTransport 服务端会话句柄
   std::map<uint64_t, std::shared_ptr<WtSessionHandle>> wt_sessions_;
-  // raw QUIC stream_id -> 归属的 connect_stream_id（用于服务端主动打开的流）
+  std::set<uint64_t> closed_wt_connect_sids_;
+  // raw QUIC stream_id -> 归属的 connect_stream_id（用于服务端主动打开的流，跨线程互斥保护）
+  mutable std::mutex server_streams_mu_;
   std::map<uint64_t, uint64_t> server_stream_to_connect_sid_;
   std::map<uint64_t, ClientBidiStream> client_bidi_streams_;
   std::map<uint64_t, ClientUniStream> client_uni_streams_;

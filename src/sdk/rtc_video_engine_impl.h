@@ -3,12 +3,12 @@
 
 #include <atomic>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <string_view>
 
 #include "api/session_backend_interface.h"
 #include "modules/video_coding/video_coding_module.h"
-#include "rtc_base/packet_slab_pool.h"
 #include "rtc_base/pending_task_safety_flag.h"
 #include "rtc_base/sequence_checker.h"
 #include "rtc_base/task_queue.h"
@@ -87,13 +87,15 @@ class RtcVideoEngineImpl final : public RtcVideoEngine,
   IRtcEventObserver* const observer_;
 
   std::unique_ptr<SdkTaskQueues> queues_;
-  std::shared_ptr<PacketSlabPool> slab_pool_;
+  std::mutex lifecycle_mu_;
+  std::mutex bwe_alloc_mu_;
   SimulcastRateAllocator rate_allocator_;
   VideoBitrateAllocation last_allocation_{};
   bool has_last_allocation_ = false;
 
   std::unique_ptr<ISessionBackend> backend_;
   std::atomic<bool> joined_{false};
+  std::atomic<bool> direct_sdp_active_{false};
   SequenceChecker cb_checker_;
   ScopedTaskSafety cb_safety_;
 };

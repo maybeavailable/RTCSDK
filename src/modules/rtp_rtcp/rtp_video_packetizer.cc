@@ -19,6 +19,9 @@ constexpr uint8_t kH264StapA = 24;
 constexpr uint8_t kH264FuA = 28;
 
 // H.265 NALU 类型定义（RFC 7798）
+constexpr uint8_t kH265BlaWLp = 16;
+constexpr uint8_t kH265BlaWRadl = 17;
+constexpr uint8_t kH265BlaNLp = 18;
 constexpr uint8_t kH265IdrWRadl = 19;
 constexpr uint8_t kH265IdrNLp = 20;
 constexpr uint8_t kH265Cra = 21;
@@ -27,6 +30,10 @@ constexpr uint8_t kH265Sps = 33;
 constexpr uint8_t kH265Pps = 34;
 constexpr uint8_t kH265Ap = 48;
 constexpr uint8_t kH265Fu = 49;
+
+constexpr bool IsH265IrapSlice(uint8_t type) {
+  return type >= kH265BlaWLp && type <= kH265Cra;
+}
 
 void AppendAnnexBNalu(ArrayView<const uint8_t> nalu,
                       std::vector<uint8_t>* dst) {
@@ -217,7 +224,7 @@ std::vector<PacketizedPayload> H264Packetizer::PacketizeAnnexB(
 
 std::optional<DepacketizedUnit> H264Depacketizer::ParsePayload(
     ArrayView<const uint8_t> payload) {
-  if (payload.empty()) {
+  if (payload.empty() || (payload[0] & 0x80u) != 0) {
     return std::nullopt;
   }
   DepacketizedUnit out;
@@ -225,7 +232,10 @@ std::optional<DepacketizedUnit> H264Depacketizer::ParsePayload(
 
   if (nal_type >= 1 && nal_type <= 23) {
     out.is_first_in_frame = true;
-    out.is_keyframe = (nal_type == kH264NaluIdr || nal_type == kH264NaluSps);
+    out.nalu_type = nal_type;
+    out.has_sps = (nal_type == kH264NaluSps);
+    out.has_pps = (nal_type == kH264NaluPps);
+    out.is_keyframe = (nal_type == kH264NaluIdr);
     AppendAnnexBNalu(payload, &out.annexb_bytes);
     return out;
   }
@@ -235,6 +245,7 @@ std::optional<DepacketizedUnit> H264Depacketizer::ParsePayload(
       return std::nullopt;
     }
     out.is_first_in_frame = true;
+    out.nalu_type = kH264StapA;
     size_t offset = 1;
     while (offset + 2 <= payload.size()) {
       const uint16_t nalu_len = ReadBigEndian16(payload.data() + offset);
@@ -243,12 +254,25 @@ std::optional<DepacketizedUnit> H264Depacketizer::ParsePayload(
         RTC_LOG(kWarning) << "Malformed H.264 STAP-A NALU length=" << nalu_len;
         return std::nullopt;
       }
+      if ((payload[offset] & 0x80u) != 0) {
+        return std::nullopt;
+      }
       const uint8_t inner_type = payload[offset] & 0x1F;
-      if (inner_type == kH264NaluIdr || inner_type == kH264NaluSps) {
+      if (inner_type == 0 || inner_type >= 24) {
+        return std::nullopt;
+      }
+      if (inner_type == kH264NaluSps) {
+        out.has_sps = true;
+      } else if (inner_type == kH264NaluPps) {
+        out.has_pps = true;
+      } else if (inner_type == kH264NaluIdr) {
         out.is_keyframe = true;
       }
       AppendAnnexBNalu(payload.subview(offset, nalu_len), &out.annexb_bytes);
       offset += nalu_len;
+    }
+    if (offset != payload.size()) {
+      return std::nullopt;
     }
     return out;
   }
@@ -257,8 +281,18 @@ std::optional<DepacketizedUnit> H264Depacketizer::ParsePayload(
       return std::nullopt;
     }
     const bool start_bit = (payload[1] & 0x80) != 0;
+    const bool end_bit = (payload[1] & 0x40) != 0;
     const uint8_t orig_type = payload[1] & 0x1F;
-    const uint8_t reconstructed_hdr = (payload[0] & 0xE0) | orig_type;
+    if ((start_bit && end_bit) || orig_type == 0 || orig_type >= 24) {
+      return std::nullopt;
+    }
+    out.is_fu = true;
+    out.is_fu_start = start_bit;
+    out.is_fu_end = end_bit;
+    out.nalu_type = orig_type;
+    out.has_sps = (orig_type == kH264NaluSps);
+    out.has_pps = (orig_type == kH264NaluPps);
+    const uint8_t reconstructed_hdr = (payload[0] & 0x60) | orig_type;
 
     if (start_bit) {
       out.is_first_in_frame = true;
@@ -305,8 +339,7 @@ std::vector<PacketizedPayload> H265Packetizer::PacketizeAnnexB(
     } else if (type == kH265Pps) {
       cached_pps_.assign(nalu.begin(), nalu.end());
       has_pps = true;
-    } else if (type == kH265IdrWRadl || type == kH265IdrNLp ||
-               type == kH265Cra) {
+    } else if (IsH265IrapSlice(type)) {
       has_irap = true;
     }
   }
@@ -430,19 +463,20 @@ std::vector<PacketizedPayload> H265Packetizer::PacketizeAnnexB(
 
 std::optional<DepacketizedUnit> H265Depacketizer::ParsePayload(
     ArrayView<const uint8_t> payload) {
-  if (payload.size() < 2) {
+  if (payload.size() < 2 || (payload[0] & 0x80u) != 0 ||
+      (payload[1] & 0x07u) == 0) {
     return std::nullopt;
   }
   DepacketizedUnit out;
   const uint8_t nal_type = (payload[0] >> 1) & 0x3F;
-  auto is_irap = [](uint8_t t) {
-    return t == kH265IdrWRadl || t == kH265IdrNLp || t == kH265Cra ||
-           t == kH265Vps;
-  };
 
   if (nal_type < 48) {
     out.is_first_in_frame = true;
-    out.is_keyframe = is_irap(nal_type);
+    out.nalu_type = nal_type;
+    out.has_vps = (nal_type == kH265Vps);
+    out.has_sps = (nal_type == kH265Sps);
+    out.has_pps = (nal_type == kH265Pps);
+    out.is_keyframe = IsH265IrapSlice(nal_type);
     AppendAnnexBNalu(payload, &out.annexb_bytes);
     return out;
   }
@@ -452,6 +486,7 @@ std::optional<DepacketizedUnit> H265Depacketizer::ParsePayload(
       return std::nullopt;
     }
     out.is_first_in_frame = true;
+    out.nalu_type = kH265Ap;
     size_t offset = 2;
     while (offset + 2 <= payload.size()) {
       const uint16_t nalu_len = ReadBigEndian16(payload.data() + offset);
@@ -460,12 +495,28 @@ std::optional<DepacketizedUnit> H265Depacketizer::ParsePayload(
         RTC_LOG(kWarning) << "Malformed H.265 AP NALU length=" << nalu_len;
         return std::nullopt;
       }
+      if ((payload[offset] & 0x80u) != 0 ||
+          (payload[offset + 1] & 0x07u) == 0) {
+        return std::nullopt;
+      }
       const uint8_t inner_type = (payload[offset] >> 1) & 0x3F;
-      if (is_irap(inner_type)) {
+      if (inner_type >= 48) {
+        return std::nullopt;
+      }
+      if (inner_type == kH265Vps) {
+        out.has_vps = true;
+      } else if (inner_type == kH265Sps) {
+        out.has_sps = true;
+      } else if (inner_type == kH265Pps) {
+        out.has_pps = true;
+      } else if (IsH265IrapSlice(inner_type)) {
         out.is_keyframe = true;
       }
       AppendAnnexBNalu(payload.subview(offset, nalu_len), &out.annexb_bytes);
       offset += nalu_len;
+    }
+    if (offset != payload.size()) {
+      return std::nullopt;
     }
     return out;
   }
@@ -474,12 +525,23 @@ std::optional<DepacketizedUnit> H265Depacketizer::ParsePayload(
       return std::nullopt;
     }
     const bool start_bit = (payload[2] & 0x80) != 0;
+    const bool end_bit = (payload[2] & 0x40) != 0;
     const uint8_t orig_type = payload[2] & 0x3F;
+    if ((start_bit && end_bit) || orig_type >= 48) {
+      return std::nullopt;
+    }
+    out.is_fu = true;
+    out.is_fu_start = start_bit;
+    out.is_fu_end = end_bit;
+    out.nalu_type = orig_type;
+    out.has_vps = (orig_type == kH265Vps);
+    out.has_sps = (orig_type == kH265Sps);
+    out.has_pps = (orig_type == kH265Pps);
     if (start_bit) {
       out.is_first_in_frame = true;
-      out.is_keyframe = is_irap(orig_type);
+      out.is_keyframe = IsH265IrapSlice(orig_type);
       const uint8_t rec_hdr0 =
-          static_cast<uint8_t>((payload[0] & 0x81) | (orig_type << 1));
+          static_cast<uint8_t>((payload[0] & 0x01) | (orig_type << 1));
       const uint8_t rec_hdr1 = payload[1];
       out.annexb_bytes.insert(out.annexb_bytes.end(), kAnnexBStartCode,
                               kAnnexBStartCode + 4);

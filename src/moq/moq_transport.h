@@ -10,6 +10,7 @@
 //   - MoqRelayBackend：同时支持原生 QUIC（moqt://，ALPN "moqt-17"）与
 //     WebTransport over HTTP/3（https:// 或 wt://，ALPN "h3"）的双栖会话后端
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
@@ -117,6 +118,9 @@ inline constexpr uint64_t kMoqtPropMaxCacheDuration = 0x04;
 inline constexpr uint64_t kMoqtPropDefaultPublisherPriority = 0x0E;
 inline constexpr uint64_t kMoqtPropDefaultPublisherGroupOrder = 0x22;
 inline constexpr uint64_t kMoqtPropDynamicGroups = 0x30;
+
+// draft-17 第 10.4.4 节 FETCH_HEADER 单向数据流类型标识。
+inline constexpr uint64_t kMoqtStreamTypeFetchHeader = 0x05;
 
 // draft-17 第 14.5 节会话级与请求级错误码常量。
 inline constexpr uint64_t kMoqtErrNoError = 0x00;
@@ -261,11 +265,21 @@ struct MoqControlMessage {
   std::string new_session_uri;
   uint64_t goaway_timeout_ms = 0;
 
+  // FETCH (0x16) / FETCH_OK (0x18) 字段（draft-17 第 9.14 / 9.15 节）。
+  uint64_t fetch_type = 0x01;  // 0x01=Standalone, 0x02=RelativeJoining, 0x03=AbsoluteJoining
+  MoqtLocation fetch_start_location{};
+  MoqtLocation fetch_end_location{};
+  uint64_t joining_request_id = 0;
+  uint64_t joining_start = 0;
+  bool end_of_track = false;
+  MoqtLocation end_location{};
+
   std::vector<uint8_t> Encode() const;
   static std::optional<MoqControlMessage> Decode(
       ArrayView<const uint8_t> data,
       size_t* consumed,
-      bool* out_protocol_violation = nullptr);
+      bool* out_protocol_violation = nullptr,
+      uint64_t* out_error_code = nullptr);
 };
 
 // draft-17 第 10.4.2 节 SUBGROUP_HEADER 子组数据流头部（Type = 0x10..0x15 / 0x18..0x1D / 0x30..0x35 / 0x38..0x3D）。
@@ -307,7 +321,8 @@ struct MoqtSubgroupObject {
       std::optional<uint64_t> prev_object_id,
       bool header_has_properties,
       size_t* consumed,
-      bool* out_protocol_violation = nullptr);
+      bool* out_protocol_violation = nullptr,
+      uint64_t* out_error_code = nullptr);
 };
 
 // draft-17 第 10.3.1 节图 23 OBJECT_DATAGRAM（用于低延迟不可靠对象数据报传输）。
@@ -325,7 +340,8 @@ struct MoqtObjectDatagram {
   std::vector<uint8_t> Encode() const;
   static std::optional<MoqtObjectDatagram> Decode(
       ArrayView<const uint8_t> data,
-      bool* out_protocol_violation = nullptr);
+      bool* out_protocol_violation = nullptr,
+      uint64_t* out_error_code = nullptr);
 };
 
 // MoQ 数据轨道固定轨道别名约定（与视频低清层=1、高清层=2 隔离解复用）。
@@ -455,6 +471,7 @@ class MoqRelayBackend final : public ISessionBackend,
       kUnknown,
       kControl,
       kSubgroupData,
+      kIgnoredFetch,
     };
     Kind kind = Kind::kUnknown;
     MoqSubgroupHeader header;
@@ -484,9 +501,11 @@ class MoqRelayBackend final : public ISessionBackend,
 
   struct InboundBidiRequestState {
     bool initial_parsed = false;
+    uint64_t initial_request_id = 0;
     MoqControlMessageType initial_type = MoqControlMessageType::kSubscribe;
     MoqtTrackNamespace ns;
     std::string track_name;
+    std::optional<uint64_t> published_track_alias;
     std::vector<uint8_t> rx_buf;
   };
 
@@ -494,12 +513,18 @@ class MoqRelayBackend final : public ISessionBackend,
     std::string track_id;
     MoqtTrackNamespace remote_namespace;
     SpatialLayer preferred_layer = SpatialLayer::kHigh;
+    SpatialLayer active_subscribed_layer = SpatialLayer::kHigh;
     uint64_t low_req_stream_id = 0;
     uint64_t high_req_stream_id = 0;
     std::optional<uint64_t> low_track_alias;
     std::optional<uint64_t> high_track_alias;
     uint64_t largest_group_seen = 0;
     bool has_received_group = false;
+    uint64_t min_valid_group_id[2]{0, 0};
+    std::optional<uint64_t> last_group_id_seen_per_layer[2];
+    std::optional<int64_t> last_seen_frame_id_per_layer[2];
+    std::optional<int64_t> last_inserted_frame_id;
+    std::optional<uint32_t> last_keyframe_rtp_ts;
     std::optional<uint8_t> current_spatial_id;
     FrameBuffer3 frame_buffer;
     VCMJitterEstimator jitter_estimator;
@@ -533,6 +558,8 @@ class MoqRelayBackend final : public ISessionBackend,
   uint64_t AllocateClientRequestId();
   std::string ExtractPeerIdFromIdOrSlash(std::string_view track_or_peer_id) const;
   void SendSubscribePairForTrack(SubscribedTrackContext* ctx);
+  void SendEncodedFrameOnWorker(EncodedVideoFrame f);
+  void FlushPendingPreSetupTraffic();
   void HandleControlStreamBytes(std::vector<uint8_t>* buf);
   void HandleOutboundRequestResponseBytes(OutboundBidiRequestState* req_st,
                                           ArrayView<const uint8_t> data,
@@ -568,8 +595,15 @@ class MoqRelayBackend final : public ISessionBackend,
   SequenceChecker work_checker_;
   std::string room_id_;
   std::string local_peer_id_;
+  bool session_started_ = false;
+  bool reconnecting_ = false;
+  uint32_t reconnect_attempt_ = 0;
+  uint64_t reconnect_generation_ = 0;
   bool connected_ = false;
+  bool tick_scheduled_ = false;
+  std::atomic<bool> session_ready_{false};
   bool peer_setup_received_ = false;
+  std::optional<uint64_t> peer_control_stream_id_;
   uint64_t local_control_stream_id_ = 0;
   uint64_t next_client_request_id_ = 0;  // 客户端使用偶数 Request ID：0, 2, 4, ...
 
@@ -581,10 +615,18 @@ class MoqRelayBackend final : public ISessionBackend,
   std::map<uint64_t, OutboundBidiRequestState> outbound_requests_;
   std::map<uint64_t, InboundBidiRequestState> inbound_requests_;
   std::map<uint64_t, InboundUniStreamState> inbound_uni_streams_;
+  std::set<uint64_t> seen_server_request_ids_;
+  std::map<uint64_t, uint64_t> active_inbound_req_id_to_stream_;
+  std::map<uint64_t, uint64_t> active_track_alias_to_stream_;
+  std::set<uint64_t> inbound_published_aliases_;
+  std::deque<EncodedVideoFrame> pending_pre_setup_frames_;
+  bool had_local_video_published_ = false;
 
   bool layer_active_[2]{true, true};
   uint64_t current_group_id_[2]{0, 0};
   int64_t next_frame_id_[2]{0, 0};
+  std::optional<int64_t> last_base_frame_id_[2];
+  std::optional<int64_t> last_tl_frame_id_[2][8];
   std::optional<ActiveOutboundGroup> active_group_[2];
   uint64_t streams_reset_on_timeout_ = 0;
 

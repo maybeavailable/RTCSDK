@@ -24,6 +24,8 @@ namespace {
 constexpr uint32_t kPermissionLifetimeSec = 300;
 constexpr uint32_t kChannelLifetimeSec = 600;
 constexpr int64_t kNonceMaxAgeSec = 3600;
+constexpr size_t kMaxPermissionsPerAllocation = 256;
+constexpr size_t kMaxChannelsPerAllocation = 256;
 
 int64_t CurrentUnixSeconds() {
   return std::chrono::duration_cast<std::chrono::seconds>(
@@ -136,19 +138,22 @@ bool StunTurnRelayServer::Start() {
       control_socket_.close(ec);
       return;
     }
-    bound_port_ = control_socket_.local_endpoint(ec).port();
+    const uint16_t p = control_socket_.local_endpoint(ec).port();
     ok = !ec;
     if (ok) {
+      bound_port_.store(p, std::memory_order_release);
       stopped_.store(false, std::memory_order_release);
       DoControlReceive();
       ScheduleSweepTimer();
+    } else {
+      control_socket_.close(ec);
     }
   });
 
   if (ok) {
     RTC_LOG(kInfo) << "StunTurnRelayServer (RFC 5389 STUN + RFC 5766 TURN) "
                       "listening on udp://"
-                   << config_.bind_ip << ":" << bound_port_
+                   << config_.bind_ip << ":" << port()
                    << " (realm=" << config_.realm << ", relay_ports="
                    << config_.min_relay_port << "-" << config_.max_relay_port
                    << (parsed_external_ipv4_.has_value()
@@ -166,6 +171,7 @@ void StunTurnRelayServer::Stop() {
                                         std::memory_order_acq_rel)) {
     return;
   }
+  bound_port_.store(0, std::memory_order_release);
   if (!queue_.IsStopped()) {
     queue_.Invoke([this]() {
       RTC_DCHECK_RUN_ON(&checker_);
@@ -270,6 +276,21 @@ void StunTurnRelayServer::OnSweepExpiredAllocations() {
   }
 }
 
+std::shared_ptr<StunTurnRelayServer::TurnAllocation>
+StunTurnRelayServer::LookupActiveAllocation(
+    const boost::asio::ip::udp::endpoint& client_ep,
+    Timestamp now) {
+  const auto it = allocations_by_client_.find(client_ep);
+  if (it == allocations_by_client_.end()) {
+    return nullptr;
+  }
+  if (now >= it->second->expires_at || it->second->closed) {
+    DestroyAllocation(client_ep);
+    return nullptr;
+  }
+  return it->second;
+}
+
 void StunTurnRelayServer::HandleControlDatagram(
     ArrayView<const uint8_t> datagram,
     const boost::asio::ip::udp::endpoint& from) {
@@ -280,8 +301,9 @@ void StunTurnRelayServer::HandleControlDatagram(
 
   // 1. 快速路径：处理 RFC 5766 第 11 节 4 字节零拷贝 ChannelData 转发帧（首两比特 0b01）。
   if (TurnChannelDataCodec::IsChannelData(datagram)) {
-    const auto ait = allocations_by_client_.find(from);
-    if (ait == allocations_by_client_.end()) {
+    const Timestamp now = clock_->CurrentTime();
+    auto alloc = LookupActiveAllocation(from, now);
+    if (!alloc) {
       return;
     }
     uint16_t ch = 0;
@@ -289,13 +311,12 @@ void StunTurnRelayServer::HandleControlDatagram(
     if (!TurnChannelDataCodec::Unwrap(datagram, &ch, &inner)) {
       return;
     }
-    const Timestamp now = clock_->CurrentTime();
-    const auto cit = ait->second->channel_to_peer.find(ch);
-    if (cit == ait->second->channel_to_peer.end() ||
+    const auto cit = alloc->channel_to_peer.find(ch);
+    if (cit == alloc->channel_to_peer.end() ||
         now >= cit->second.expires_at) {
       return;
     }
-    ForwardClientPayloadToPeer(ait->second, cit->second.peer_ep, inner, now);
+    ForwardClientPayloadToPeer(alloc, cit->second.peer_ep, inner, now);
     return;
   }
 
@@ -331,8 +352,8 @@ void StunTurnRelayServer::HandleStunOrTurnPacket(
 
   // 2.2 TURN Send Indication (0x0016)：无事务响应，校验对端 IP 权限后直接转发数据。
   if (raw_type == static_cast<uint16_t>(StunMessageType::kSendIndication)) {
-    const auto ait = allocations_by_client_.find(from);
-    if (ait == allocations_by_client_.end()) {
+    auto alloc = LookupActiveAllocation(from, now);
+    if (!alloc) {
       return;
     }
     auto ind = StunMessage::Parse(datagram, "");
@@ -341,15 +362,15 @@ void StunTurnRelayServer::HandleStunOrTurnPacket(
       return;
     }
     const auto peer_ep = *ind->xor_peer_address();
-    if (!IsAllowedPeerEndpoint(peer_ep)) {
+    if (!IsAllowedPeerEndpoint(peer_ep, alloc.get())) {
       return;
     }
     const uint32_t peer_ip = peer_ep.address().to_v4().to_uint();
-    const auto pit = ait->second->ip_permissions.find(peer_ip);
-    if (pit == ait->second->ip_permissions.end() || now >= pit->second) {
+    const auto pit = alloc->ip_permissions.find(peer_ip);
+    if (pit == alloc->ip_permissions.end() || now >= pit->second) {
       return;
     }
-    ForwardClientPayloadToPeer(ait->second, peer_ep, *ind->data(), now);
+    ForwardClientPayloadToPeer(alloc, peer_ep, *ind->data(), now);
     return;
   }
 
@@ -358,28 +379,28 @@ void StunTurnRelayServer::HandleStunOrTurnPacket(
     StunMessage req;
     std::string username;
     std::string ikey;
+    std::optional<uint32_t> cred_max_ttl_sec;
     if (!AuthenticateTurnRequest(datagram, from,
                                  StunMessageType::kAllocateErrorResponse, &req,
-                                 &username, &ikey)) {
+                                 &username, &ikey, &cred_max_ttl_sec)) {
       return;
     }
 
-    const auto existing = allocations_by_client_.find(from);
-    if (existing != allocations_by_client_.end()) {
-      if (existing->second->create_tx_id == req.transaction_id()) {
+    if (auto existing = LookupActiveAllocation(from, now)) {
+      if (existing->create_tx_id == req.transaction_id()) {
         // 幂等重传上一次成功的 AllocateResponse（防客户端 UDP 丢包重试误判）。
         StunMessage dup_resp(StunMessageType::kAllocateResponse);
         dup_resp.set_transaction_id(req.transaction_id());
-        dup_resp.set_xor_relayed_address(existing->second->advertised_relay_ep);
+        dup_resp.set_xor_relayed_address(existing->advertised_relay_ep);
         dup_resp.set_xor_mapped_address(from);
-        dup_resp.set_lifetime(existing->second->lifetime_sec);
+        dup_resp.set_lifetime(existing->lifetime_sec);
         const auto wire = dup_resp.Serialize(ikey, true);
         boost::system::error_code ec;
         control_socket_.send_to(boost::asio::buffer(wire), from, 0, ec);
       } else {
         SendErrorResponse(StunMessageType::kAllocateErrorResponse,
                           req.transaction_id(), 437, "Allocation Mismatch",
-                          false, from);
+                          false, from, ikey);
       }
       return;
     }
@@ -387,14 +408,33 @@ void StunTurnRelayServer::HandleStunOrTurnPacket(
     if (req.requested_transport().value_or(17) != 17) {
       SendErrorResponse(StunMessageType::kAllocateErrorResponse,
                         req.transaction_id(), 442,
-                        "Unsupported Transport Protocol", false, from);
+                        "Unsupported Transport Protocol", false, from, ikey);
       return;
     }
 
+    // 先清理可能已过期的分配，再执行全局与单客户端 IP 配额检查。
+    if (allocations_by_client_.size() >= config_.max_allocations) {
+      OnSweepExpiredAllocations();
+    }
     if (allocations_by_client_.size() >= config_.max_allocations) {
       SendErrorResponse(StunMessageType::kAllocateErrorResponse,
                         req.transaction_id(), 508, "Insufficient Capacity",
-                        false, from);
+                        false, from, ikey);
+      return;
+    }
+
+    const size_t per_ip_quota = from.address().is_loopback() ? 256u : 64u;
+    size_t client_ip_allocs = 0;
+    for (const auto& [cli_ep, alloc_entry] : allocations_by_client_) {
+      if (!alloc_entry->closed && now < alloc_entry->expires_at &&
+          cli_ep.address() == from.address()) {
+        ++client_ip_allocs;
+      }
+    }
+    if (client_ip_allocs >= per_ip_quota) {
+      SendErrorResponse(StunMessageType::kAllocateErrorResponse,
+                        req.transaction_id(), 486, "Allocation Quota Reached",
+                        false, from, ikey);
       return;
     }
 
@@ -404,7 +444,7 @@ void StunTurnRelayServer::HandleStunOrTurnPacket(
     if (bind_ec) {
       SendErrorResponse(StunMessageType::kAllocateErrorResponse,
                         req.transaction_id(), 508, "Server Bind Config Error",
-                        false, from);
+                        false, from, ikey);
       return;
     }
 
@@ -414,7 +454,7 @@ void StunTurnRelayServer::HandleStunOrTurnPacket(
     if (bind_ec) {
       SendErrorResponse(StunMessageType::kAllocateErrorResponse,
                         req.transaction_id(), 508, "Socket Open Failed", false,
-                        from);
+                        from, ikey);
       return;
     }
     relay_sock->set_option(
@@ -426,13 +466,13 @@ void StunTurnRelayServer::HandleStunOrTurnPacket(
     const uint32_t port_span =
         static_cast<uint32_t>(config_.max_relay_port - config_.min_relay_port) +
         1u;
+    uint32_t rand_offset = 0;
+    RAND_bytes(reinterpret_cast<uint8_t*>(&rand_offset), sizeof(rand_offset));
+    rand_offset %= port_span;
     uint16_t chosen_port = 0;
     for (uint32_t attempt = 0; attempt < port_span; ++attempt) {
-      const uint16_t candidate_port = next_relay_port_cursor_;
-      next_relay_port_cursor_ =
-          (next_relay_port_cursor_ >= config_.max_relay_port)
-              ? config_.min_relay_port
-              : static_cast<uint16_t>(next_relay_port_cursor_ + 1);
+      const uint16_t candidate_port = static_cast<uint16_t>(
+          config_.min_relay_port + ((rand_offset + attempt) % port_span));
       if (allocations_by_port_.count(candidate_port) > 0) {
         continue;
       }
@@ -441,6 +481,10 @@ void StunTurnRelayServer::HandleStunOrTurnPacket(
           bind_ec);
       if (!bind_ec) {
         chosen_port = candidate_port;
+        next_relay_port_cursor_ =
+            (candidate_port >= config_.max_relay_port)
+                ? config_.min_relay_port
+                : static_cast<uint16_t>(candidate_port + 1);
         break;
       }
     }
@@ -450,13 +494,17 @@ void StunTurnRelayServer::HandleStunOrTurnPacket(
       relay_sock->close(close_ec);
       SendErrorResponse(StunMessageType::kAllocateErrorResponse,
                         req.transaction_id(), 508, "Relay Port Pool Exhausted",
-                        false, from);
+                        false, from, ikey);
       return;
     }
 
-    const uint32_t granted_lifetime = std::clamp<uint32_t>(
+    uint32_t granted_lifetime = std::clamp<uint32_t>(
         req.lifetime().value_or(config_.default_lifetime_sec), 60u,
         config_.max_lifetime_sec);
+    if (cred_max_ttl_sec.has_value()) {
+      granted_lifetime = std::min<uint32_t>(
+          granted_lifetime, std::max<uint32_t>(1u, *cred_max_ttl_sec));
+    }
     const auto adv_ip = DetermineAdvertisedAddress(from);
 
     auto alloc = std::make_shared<TurnAllocation>();
@@ -499,22 +547,23 @@ void StunTurnRelayServer::HandleStunOrTurnPacket(
     StunMessage req;
     std::string username;
     std::string ikey;
+    std::optional<uint32_t> cred_max_ttl_sec;
     if (!AuthenticateTurnRequest(datagram, from,
                                  StunMessageType::kRefreshErrorResponse, &req,
-                                 &username, &ikey)) {
+                                 &username, &ikey, &cred_max_ttl_sec)) {
       return;
     }
-    const auto ait = allocations_by_client_.find(from);
-    if (ait == allocations_by_client_.end()) {
+    auto alloc_ptr = LookupActiveAllocation(from, now);
+    if (!alloc_ptr) {
       SendErrorResponse(StunMessageType::kRefreshErrorResponse,
                         req.transaction_id(), 437, "Allocation Mismatch", false,
-                        from);
+                        from, ikey);
       return;
     }
-    if (ait->second->username != username) {
+    if (alloc_ptr->username != username) {
       SendErrorResponse(StunMessageType::kRefreshErrorResponse,
                         req.transaction_id(), 441, "Wrong Credentials", false,
-                        from);
+                        from, ikey);
       return;
     }
 
@@ -531,11 +580,15 @@ void StunTurnRelayServer::HandleStunOrTurnPacket(
       return;
     }
 
-    const uint32_t granted =
+    uint32_t granted =
         std::clamp<uint32_t>(requested, 60u, config_.max_lifetime_sec);
-    ait->second->lifetime_sec = granted;
-    ait->second->expires_at = now + TimeDelta::Seconds(granted);
-    ait->second->integrity_key = ikey;
+    if (cred_max_ttl_sec.has_value()) {
+      granted =
+          std::min<uint32_t>(granted, std::max<uint32_t>(1u, *cred_max_ttl_sec));
+    }
+    alloc_ptr->lifetime_sec = granted;
+    alloc_ptr->expires_at = now + TimeDelta::Seconds(granted);
+    alloc_ptr->integrity_key = ikey;
 
     StunMessage resp(StunMessageType::kRefreshResponse);
     resp.set_transaction_id(req.transaction_id());
@@ -556,35 +609,47 @@ void StunTurnRelayServer::HandleStunOrTurnPacket(
             &req, &username, &ikey)) {
       return;
     }
-    const auto ait = allocations_by_client_.find(from);
-    if (ait == allocations_by_client_.end()) {
+    auto alloc_ptr = LookupActiveAllocation(from, now);
+    if (!alloc_ptr) {
       SendErrorResponse(StunMessageType::kCreatePermissionErrorResponse,
                         req.transaction_id(), 437, "Allocation Mismatch", false,
-                        from);
+                        from, ikey);
       return;
     }
-    if (ait->second->username != username) {
+    if (alloc_ptr->username != username) {
       SendErrorResponse(StunMessageType::kCreatePermissionErrorResponse,
                         req.transaction_id(), 441, "Wrong Credentials", false,
-                        from);
+                        from, ikey);
       return;
     }
     if (req.xor_peer_addresses().empty()) {
       SendErrorResponse(StunMessageType::kCreatePermissionErrorResponse,
                         req.transaction_id(), 400, "Missing XOR-PEER-ADDRESS",
-                        false, from);
+                        false, from, ikey);
+      return;
+    }
+    size_t new_ips = 0;
+    for (const auto& peer_ep : req.xor_peer_addresses()) {
+      if (!IsAllowedPeerEndpoint(peer_ep, alloc_ptr.get())) {
+        SendErrorResponse(StunMessageType::kCreatePermissionErrorResponse,
+                          req.transaction_id(), 403, "Forbidden Peer Address",
+                          false, from, ikey);
+        return;
+      }
+      if (alloc_ptr->ip_permissions.find(peer_ep.address().to_v4().to_uint()) ==
+          alloc_ptr->ip_permissions.end()) {
+        ++new_ips;
+      }
+    }
+    if (alloc_ptr->ip_permissions.size() + new_ips >
+        kMaxPermissionsPerAllocation) {
+      SendErrorResponse(StunMessageType::kCreatePermissionErrorResponse,
+                        req.transaction_id(), 508, "Insufficient Capacity",
+                        false, from, ikey);
       return;
     }
     for (const auto& peer_ep : req.xor_peer_addresses()) {
-      if (!IsAllowedPeerEndpoint(peer_ep)) {
-        SendErrorResponse(StunMessageType::kCreatePermissionErrorResponse,
-                          req.transaction_id(), 403, "Forbidden Peer Address",
-                          false, from);
-        return;
-      }
-    }
-    for (const auto& peer_ep : req.xor_peer_addresses()) {
-      ait->second->ip_permissions[peer_ep.address().to_v4().to_uint()] =
+      alloc_ptr->ip_permissions[peer_ep.address().to_v4().to_uint()] =
           now + TimeDelta::Seconds(kPermissionLifetimeSec);
     }
 
@@ -605,24 +670,24 @@ void StunTurnRelayServer::HandleStunOrTurnPacket(
                                  &req, &username, &ikey)) {
       return;
     }
-    const auto ait = allocations_by_client_.find(from);
-    if (ait == allocations_by_client_.end()) {
+    auto alloc_ptr = LookupActiveAllocation(from, now);
+    if (!alloc_ptr) {
       SendErrorResponse(StunMessageType::kChannelBindErrorResponse,
                         req.transaction_id(), 437, "Allocation Mismatch", false,
-                        from);
+                        from, ikey);
       return;
     }
-    if (ait->second->username != username) {
+    if (alloc_ptr->username != username) {
       SendErrorResponse(StunMessageType::kChannelBindErrorResponse,
                         req.transaction_id(), 441, "Wrong Credentials", false,
-                        from);
+                        from, ikey);
       return;
     }
     if (!req.channel_number().has_value() ||
         !req.xor_peer_address().has_value()) {
       SendErrorResponse(StunMessageType::kChannelBindErrorResponse,
                         req.transaction_id(), 400, "Bad ChannelBind Attributes",
-                        false, from);
+                        false, from, ikey);
       return;
     }
     const uint16_t ch = *req.channel_number();
@@ -631,24 +696,39 @@ void StunTurnRelayServer::HandleStunOrTurnPacket(
     if (ch < 0x4000u || ch > 0x7FFEu) {
       SendErrorResponse(StunMessageType::kChannelBindErrorResponse,
                         req.transaction_id(), 400,
-                        "Channel Number Out Of Range", false, from);
+                        "Channel Number Out Of Range", false, from, ikey);
       return;
     }
-    if (!IsAllowedPeerEndpoint(peer_ep)) {
+    if (!IsAllowedPeerEndpoint(peer_ep, alloc_ptr.get())) {
       SendErrorResponse(StunMessageType::kChannelBindErrorResponse,
                         req.transaction_id(), 403, "Forbidden Peer Address",
-                        false, from);
+                        false, from, ikey);
       return;
     }
 
-    auto& alloc = *ait->second;
+    auto& alloc = *alloc_ptr;
     const auto existing_ch = alloc.channel_to_peer.find(ch);
+    if (existing_ch == alloc.channel_to_peer.end() &&
+        alloc.channel_to_peer.size() >= kMaxChannelsPerAllocation) {
+      SendErrorResponse(StunMessageType::kChannelBindErrorResponse,
+                        req.transaction_id(), 508, "Insufficient Capacity",
+                        false, from, ikey);
+      return;
+    }
+    const uint32_t peer_ip_u32 = peer_ep.address().to_v4().to_uint();
+    if (alloc.ip_permissions.find(peer_ip_u32) == alloc.ip_permissions.end() &&
+        alloc.ip_permissions.size() >= kMaxPermissionsPerAllocation) {
+      SendErrorResponse(StunMessageType::kChannelBindErrorResponse,
+                        req.transaction_id(), 508, "Insufficient Capacity",
+                        false, from, ikey);
+      return;
+    }
     if (existing_ch != alloc.channel_to_peer.end() &&
         now < existing_ch->second.expires_at &&
         existing_ch->second.peer_ep != peer_ep) {
       SendErrorResponse(StunMessageType::kChannelBindErrorResponse,
                         req.transaction_id(), 400, "Channel Already Bound",
-                        false, from);
+                        false, from, ikey);
       return;
     }
     const auto existing_peer = alloc.peer_to_channel.find(peer_ep);
@@ -659,7 +739,7 @@ void StunTurnRelayServer::HandleStunOrTurnPacket(
           now < old_cit->second.expires_at) {
         SendErrorResponse(StunMessageType::kChannelBindErrorResponse,
                           req.transaction_id(), 400, "Peer Already Bound",
-                          false, from);
+                          false, from, ikey);
         return;
       }
       alloc.peer_to_channel.erase(existing_peer);
@@ -686,12 +766,17 @@ bool StunTurnRelayServer::AuthenticateTurnRequest(
     StunMessageType error_resp_type,
     StunMessage* out_verified_msg,
     std::string* out_username,
-    std::string* out_integrity_key) {
+    std::string* out_integrity_key,
+    std::optional<uint32_t>* out_cred_max_ttl_sec) {
+  if (out_cred_max_ttl_sec != nullptr) {
+    out_cred_max_ttl_sec->reset();
+  }
   auto unverified = StunMessage::Parse(raw_datagram, "");
   if (!unverified.has_value()) {
     return false;
   }
 
+  // RFC 5389 §10.2.2：401 与 438 质询错误响应不携带 MESSAGE-INTEGRITY。
   if (!unverified->has_message_integrity() ||
       !unverified->username().has_value() || !unverified->realm().has_value() ||
       !unverified->nonce().has_value()) {
@@ -708,13 +793,14 @@ bool StunTurnRelayServer::AuthenticateTurnRequest(
     return false;
   }
 
-  if (!VerifyNonce(*unverified->nonce(), unix_now)) {
+  if (!VerifyNonce(*unverified->nonce(), unix_now, from.address())) {
     SendErrorResponse(error_resp_type, unverified->transaction_id(), 438,
                       "Stale Nonce", true, from);
     return false;
   }
 
-  const auto password = LookupUserPassword(*unverified->username(), unix_now);
+  const auto password = LookupUserPassword(*unverified->username(), unix_now,
+                                           out_cred_max_ttl_sec);
   if (!password.has_value()) {
     ++stat_auth_failures_;
     SendErrorResponse(error_resp_type, unverified->transaction_id(), 401,
@@ -740,13 +826,17 @@ bool StunTurnRelayServer::AuthenticateTurnRequest(
 
 std::optional<std::string> StunTurnRelayServer::LookupUserPassword(
     std::string_view username,
-    int64_t unix_now_sec) const {
+    int64_t unix_now_sec,
+    std::optional<uint32_t>* out_cred_max_ttl_sec) const {
+  if (out_cred_max_ttl_sec != nullptr) {
+    out_cred_max_ttl_sec->reset();
+  }
   const auto it = config_.static_users.find(std::string(username));
   if (it != config_.static_users.end()) {
     return it->second;
   }
 
-  // 兼容 coturn TURN REST API（格式：`<unix_expiry_ts>:<client_id>`）。
+  // 兼容 coturn TURN REST API（格式：`<unix_expiry_ts>:<client_id>`），并将分配有效期上限严格收敛至剩余令牌 TTL。
   if (!config_.rest_api_secret.empty()) {
     const size_t colon = username.find(':');
     const std::string_view ts_part =
@@ -755,24 +845,32 @@ std::optional<std::string> StunTurnRelayServer::LookupUserPassword(
     const auto [ptr, ec] = std::from_chars(
         ts_part.data(), ts_part.data() + ts_part.size(), exp_ts);
     if (ec == std::errc() && ptr == ts_part.data() + ts_part.size() &&
-        exp_ts >= unix_now_sec) {
+        exp_ts > unix_now_sec) {
+      if (out_cred_max_ttl_sec != nullptr) {
+        const int64_t rem = exp_ts - unix_now_sec;
+        *out_cred_max_ttl_sec = static_cast<uint32_t>(std::clamp<int64_t>(
+            rem, 1, static_cast<int64_t>(config_.max_lifetime_sec)));
+      }
       return ComputeRestApiPassword(config_.rest_api_secret, username);
     }
   }
   return std::nullopt;
 }
 
-std::string StunTurnRelayServer::GenerateNonce(int64_t unix_now_sec) const {
+std::string StunTurnRelayServer::GenerateNonce(
+    int64_t unix_now_sec,
+    const boost::asio::ip::address& client_ip) const {
   std::ostringstream ts_oss;
   ts_oss << std::hex << std::setw(16) << std::setfill('0')
          << static_cast<uint64_t>(unix_now_sec);
   const std::string ts_hex = ts_oss.str();
+  const std::string mac_input = ts_hex + ":" + client_ip.to_string();
 
   unsigned char mac[20]{};
   unsigned int mac_len = 0;
   HMAC(EVP_sha1(), nonce_secret_.data(), static_cast<int>(nonce_secret_.size()),
-       reinterpret_cast<const unsigned char*>(ts_hex.data()), ts_hex.size(),
-       mac, &mac_len);
+       reinterpret_cast<const unsigned char*>(mac_input.data()),
+       mac_input.size(), mac, &mac_len);
 
   std::ostringstream full;
   full << ts_hex << '.';
@@ -783,8 +881,10 @@ std::string StunTurnRelayServer::GenerateNonce(int64_t unix_now_sec) const {
   return full.str();
 }
 
-bool StunTurnRelayServer::VerifyNonce(std::string_view nonce,
-                                      int64_t unix_now_sec) const {
+bool StunTurnRelayServer::VerifyNonce(
+    std::string_view nonce,
+    int64_t unix_now_sec,
+    const boost::asio::ip::address& client_ip) const {
   if (nonce.size() != 33 || nonce[16] != '.') {
     return false;
   }
@@ -801,7 +901,7 @@ bool StunTurnRelayServer::VerifyNonce(std::string_view nonce,
     return false;
   }
   const std::string expected =
-      GenerateNonce(static_cast<int64_t>(issued_ts));
+      GenerateNonce(static_cast<int64_t>(issued_ts), client_ip);
   return expected.size() == nonce.size() &&
          CRYPTO_memcmp(expected.data(), nonce.data(), nonce.size()) == 0;
 }
@@ -812,30 +912,71 @@ void StunTurnRelayServer::SendErrorResponse(
     int code,
     std::string_view reason,
     bool include_challenge,
-    const boost::asio::ip::udp::endpoint& to) {
+    const boost::asio::ip::udp::endpoint& to,
+    std::string_view integrity_key) {
   StunMessage resp(error_type);
   resp.set_transaction_id(tx_id);
   resp.set_error_code(code, std::string(reason));
   if (include_challenge) {
     resp.set_realm(config_.realm);
-    resp.set_nonce(GenerateNonce(CurrentUnixSeconds()));
+    resp.set_nonce(GenerateNonce(CurrentUnixSeconds(), to.address()));
   }
-  const auto wire = resp.Serialize("", true);
+  const auto wire = resp.Serialize(std::string(integrity_key), true);
   boost::system::error_code ec;
   control_socket_.send_to(boost::asio::buffer(wire), to, 0, ec);
 }
 
 bool StunTurnRelayServer::IsAllowedPeerEndpoint(
-    const boost::asio::ip::udp::endpoint& peer_ep) const {
+    const boost::asio::ip::udp::endpoint& peer_ep,
+    const TurnAllocation* sender_alloc) const {
   if (!peer_ep.address().is_v4() || peer_ep.port() == 0) {
     return false;
   }
   const auto ipv4 = peer_ep.address().to_v4();
-  if (ipv4.is_unspecified() || ipv4.is_multicast() ||
-      ipv4.to_uint() == 0xFFFFFFFFu) {
+  const uint32_t ip_u32 = ipv4.to_uint();
+  // 阻断 0.0.0.0/8 ("This network")、链路本地/云元数据 169.254.0.0/16、多播与保留段 224.0.0.0/3。
+  if ((ip_u32 >> 24) == 0u || ((ip_u32 >> 16) == 0xA9FEu) ||
+      ipv4.is_multicast() || (ip_u32 & 0xF0000000u) == 0xF0000000u) {
     return false;
   }
-  if (!config_.allow_loopback_peers && ipv4.is_loopback()) {
+
+  boost::system::error_code ec;
+  const auto ctrl_bind_addr =
+      boost::asio::ip::make_address_v4(config_.bind_ip, ec);
+  const bool has_ctrl_bind_ip = (!ec && !ctrl_bind_addr.is_unspecified());
+  const auto rly_bind_addr =
+      boost::asio::ip::make_address_v4(config_.relay_bind_ip, ec);
+  const bool has_rly_bind_ip = (!ec && !rly_bind_addr.is_unspecified());
+  const bool matches_server_ip =
+      ipv4.is_loopback() || (has_ctrl_bind_ip && ipv4 == ctrl_bind_addr) ||
+      (has_rly_bind_ip && ipv4 == rly_bind_addr) ||
+      (parsed_external_ipv4_.has_value() && ipv4 == *parsed_external_ipv4_);
+
+  const uint16_t ctrl_port = port();
+  if (ctrl_port != 0 && peer_ep.port() == ctrl_port && matches_server_ip) {
+    return false;
+  }
+  if (sender_alloc != nullptr && peer_ep.port() == sender_alloc->relay_port &&
+      (matches_server_ip ||
+       ipv4 == sender_alloc->advertised_relay_ep.address().to_v4() ||
+       (!sender_alloc->local_bound_ipv4.is_unspecified() &&
+        ipv4 == sender_alloc->local_bound_ipv4))) {
+    return false;
+  }
+
+  if (ipv4.is_loopback() && !config_.allow_loopback_peers) {
+    return false;
+  }
+
+  const bool is_private_lan =
+      ((ip_u32 >> 24) == 10u) ||
+      ((ip_u32 & 0xFFF00000u) == 0xAC100000u) ||
+      ((ip_u32 & 0xFFFF0000u) == 0xC0A80000u) ||
+      ((ip_u32 & 0xFFC00000u) == 0x64400000u);
+  const bool lan_allowed =
+      config_.allow_private_lan_peers ||
+      (config_.allow_loopback_peers && config_.bind_ip == "127.0.0.1");
+  if (is_private_lan && !lan_allowed) {
     return false;
   }
   return true;
@@ -888,7 +1029,9 @@ StunTurnRelayServer::FindHairpinTarget(
   if (target_ip == it->second->advertised_relay_ep.address().to_v4() ||
       (!it->second->local_bound_ipv4.is_unspecified() &&
        target_ip == it->second->local_bound_ipv4) ||
-      (config_.allow_loopback_peers && target_ip.is_loopback())) {
+      (config_.allow_loopback_peers && target_ip.is_loopback() &&
+       (it->second->local_bound_ipv4.is_unspecified() ||
+        it->second->local_bound_ipv4.is_loopback()))) {
     return it->second;
   }
   return nullptr;
@@ -899,22 +1042,26 @@ void StunTurnRelayServer::ForwardClientPayloadToPeer(
     const boost::asio::ip::udp::endpoint& peer_ep,
     ArrayView<const uint8_t> payload,
     Timestamp now) {
-  if (!sender_alloc || sender_alloc->closed || !sender_alloc->relay_socket) {
+  if (!sender_alloc || sender_alloc->closed || !sender_alloc->relay_socket ||
+      !IsAllowedPeerEndpoint(peer_ep, sender_alloc.get())) {
     return;
   }
-  ++stat_relayed_pkts_;
-  stat_relayed_bytes_ += payload.size();
 
   // 若目标端点属于本机另一个活跃 TURN 分配（例如两个对称型 NAT 客户端均通过同一台公网 TURN 中继），
-  // 直接执行内存级发卡弯（Hairpinning）投递，彻底规避云厂商 VPC 阻断弹性公网 IP 自环 UDP 的问题。
+  // 直接执行内存级发卡弯（Hairpinning）投递；若目标指向自身分配则直接丢弃，严禁自环放大！
   if (auto hairpin_dst = FindHairpinTarget(peer_ep)) {
-    if (hairpin_dst.get() != sender_alloc.get()) {
-      DeliverPeerPayloadToClient(hairpin_dst, sender_alloc->advertised_relay_ep,
-                                 payload, now);
+    if (hairpin_dst.get() == sender_alloc.get()) {
       return;
     }
+    ++stat_relayed_pkts_;
+    stat_relayed_bytes_ += payload.size();
+    DeliverPeerPayloadToClient(hairpin_dst, sender_alloc->advertised_relay_ep,
+                               payload, now);
+    return;
   }
 
+  ++stat_relayed_pkts_;
+  stat_relayed_bytes_ += payload.size();
   boost::system::error_code ec;
   sender_alloc->relay_socket->send_to(
       boost::asio::buffer(payload.data(), payload.size()), peer_ep, 0, ec);

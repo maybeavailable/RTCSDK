@@ -2,8 +2,13 @@
 
 #include <algorithm>
 #include <array>
+#include <climits>
+#include <cstdlib>
 #include <cstring>
 
+#include <openssl/crypto.h>
+#include <openssl/evp.h>
+#include <openssl/hmac.h>
 #include <openssl/rand.h>
 
 #include "modules/rtp_rtcp/byte_io.h"
@@ -36,9 +41,14 @@ constexpr uint8_t kDataFlagImmediateSack = 0x08;
 
 // SCTP 可选参数类型（RFC 4960 / RFC 3758 / RFC 6525）。
 constexpr uint16_t kParamStateCookie = 0x0007;
+constexpr uint16_t kParamSupportedExtensions = 0x8008;
 constexpr uint16_t kParamForwardTsnSupported = 0xC000;
 constexpr uint16_t kParamOutgoingSsnResetReq = 0x000D;
 constexpr uint16_t kParamReconfigResponse = 0x0010;
+
+// RFC 6525 Re-configuration Response Result 编码。
+constexpr uint32_t kReconfigResultSuccessPerformed = 1;
+constexpr uint32_t kReconfigResultInProgress = 6;
 
 // WebRTC DataChannel 负载协议标识符 PPID（RFC 8831 第 6.6 节 / RFC 8832）。
 constexpr uint32_t kPpidDcep = 50;
@@ -53,11 +63,25 @@ constexpr uint32_t kPpidWebRtcBinaryEmpty = 57;
 constexpr uint8_t kDcepMsgAck = 0x02;
 constexpr uint8_t kDcepMsgOpen = 0x03;
 
-// 分片与封包尺寸限制（预留 DTLS 1.2 记录头及 UDP/IP 头部余量，防止 IP 层分片）。
+// 分片、流数量与接收窗口边界常量。
 constexpr size_t kMaxSctpFragmentPayload = 1000;
 constexpr size_t kMaxSctpPacketBytes = 1160;
+constexpr uint16_t kDefaultMaxStreams = 1024;
 constexpr uint32_t kDefaultAdvertisedRwnd = 1024 * 1024;
+constexpr size_t kRxEntryOverheadBytes = 64;
+constexpr size_t kMaxSeenTsns = 4096;
+constexpr size_t kMaxRxFragments = 2048;
+constexpr size_t kMaxStreamOrderedBufferedMsgs = 1024;
+constexpr size_t kMaxTotalOrderedBufferedMsgs = 2048;
+constexpr size_t kMaxEarlyRxStreams = 64;
+constexpr size_t kMaxEarlyRxMsgsPerStream = 32;
+
+// 状态 Cookie 结构常量：44B 载荷 + 32B HMAC-SHA256 = 76B（TLV 长度 80B）。
 constexpr uint32_t kStateCookieMagic = 0x5254434Bu;
+constexpr size_t kCookieDataBytes = 44;
+constexpr size_t kCookieHmacBytes = 32;
+constexpr size_t kCookieTotalBytes = kCookieDataBytes + kCookieHmacBytes;
+constexpr TimeDelta kMaxCookieLifetime = TimeDelta::Seconds(60);
 
 const std::array<uint32_t, 256>& GetCrc32cTable() {
   static const std::array<uint32_t, 256> kTable = []() {
@@ -129,11 +153,95 @@ SctpDataChannelManager::SctpDataChannelManager(
     Clock* clock,
     SctpDataChannelObserver* observer)
     : clock_(clock), observer_(observer) {
+  InitializeLocalAssociationParams();
+}
+
+void SctpDataChannelManager::InitializeLocalAssociationParams() {
+  RAND_bytes(cookie_hmac_key_.data(), cookie_hmac_key_.size());
   local_vtag_ = GenerateNonZeroRandom32();
   local_initial_tsn_ = GenerateNonZeroRandom32();
-  next_tx_tsn_ = local_initial_tsn_;
-  last_acked_tx_tsn_ = local_initial_tsn_ - 1;
-  advanced_peer_ack_point_ = last_acked_tx_tsn_;
+  next_tx_tsn_unwrapped_ = static_cast<int64_t>(local_initial_tsn_);
+  last_acked_tx_tsn_unwrapped_ = next_tx_tsn_unwrapped_ - 1;
+  advanced_peer_ack_point_unwrapped_ = last_acked_tx_tsn_unwrapped_;
+  next_reconfig_seq_ = local_initial_tsn_;
+}
+
+void SctpDataChannelManager::ResetAssociationTransportState() {
+  peer_vtag_ = 0;
+  peer_initial_tsn_ = 0;
+  negotiated_mis_ = kDefaultMaxStreams;
+  peer_mis_ = kDefaultMaxStreams;
+  peer_rwnd_ = kDefaultAdvertisedRwnd;
+  peer_supports_prsctp_ = true;
+
+  has_peer_initial_tsn_ = false;
+  peer_cum_tsn_ack_unwrapped_ = 0;
+  last_peer_reconfig_seq_.reset();
+  rx_seen_tsns_.clear();
+  rx_fragments_.clear();
+  next_expected_ssn_.clear();
+  ordered_ready_.clear();
+  partial_rx_messages_.clear();
+  early_rx_messages_.clear();
+  rx_frag_bytes_ = 0;
+  ordered_ready_bytes_ = 0;
+  ordered_ready_count_ = 0;
+  partial_rx_bytes_ = 0;
+  early_rx_bytes_ = 0;
+  early_rx_count_ = 0;
+  sack_needed_ = false;
+  packets_since_sack_ = 0;
+  sack_deadline_ = Timestamp::PlusInfinity();
+
+  pending_cookie_.clear();
+  handshake_started_at_ = Timestamp::MinusInfinity();
+  last_handshake_tx_ = Timestamp::MinusInfinity();
+  handshake_rtx_count_ = 0;
+
+  cwnd_bytes_ = 4 * 1200;
+  ssthresh_bytes_ = 128 * 1024;
+  partial_bytes_acked_ = 0;
+  flight_bytes_ = 0;
+  in_fast_recovery_ = false;
+  fast_recovery_exit_point_ = -1;
+  srtt_us_ = 100'000;
+  rttvar_us_ = 50'000;
+  rto_us_ = 200'000;
+  has_rtt_sample_ = false;
+  t3_rtx_deadline_ = Timestamp::PlusInfinity();
+
+  outbound_buffered_bytes_ = 0;
+  outbound_chunks_.clear();
+  abandoned_ordered_streams_.clear();
+  dup_sack_below_adv_count_ = 0;
+  last_forward_tsn_tx_ = Timestamp::MinusInfinity();
+  in_flush_transmit_ = false;
+  pending_reentrant_flush_ = false;
+  pending_reentrant_fast_rtx_ = false;
+
+  queued_outbound_reset_sids_.clear();
+  inflight_outbound_reset_.reset();
+  outbound_reset_pending_sids_.clear();
+  pending_inbound_reset_.reset();
+
+  sid_to_channel_id_.clear();
+  next_even_sid_ = 0;
+  next_odd_sid_ = 1;
+}
+
+void SctpDataChannelManager::set_remote_max_message_size(uint32_t max_bytes) {
+  remote_max_message_size_ = max_bytes;
+}
+
+size_t SctpDataChannelManager::EffectiveMaxMessageSize() const {
+  if (remote_max_message_size_ == 0) {
+    return kMaxSctpMessageSize;
+  }
+  return std::min<size_t>(remote_max_message_size_, kMaxSctpMessageSize);
+}
+
+uint32_t SctpDataChannelManager::CurrentPeerReconfigRespSeq() const {
+  return last_peer_reconfig_seq_.value_or(peer_initial_tsn_ - 1u);
 }
 
 void SctpDataChannelManager::ConfigureAndStart(DtlsRole dtls_role,
@@ -144,6 +252,9 @@ void SctpDataChannelManager::ConfigureAndStart(DtlsRole dtls_role,
   remote_port_ = (remote_port > 0) ? remote_port : 5000;
   if (started_) {
     return;
+  }
+  if (local_vtag_ == 0) {
+    InitializeLocalAssociationParams();
   }
   started_ = true;
   const Timestamp now = clock_->CurrentTime();
@@ -157,38 +268,124 @@ void SctpDataChannelManager::ConfigureAndStart(DtlsRole dtls_role,
 void SctpDataChannelManager::Shutdown() {
   started_ = false;
   assoc_state_ = AssocState::kClosed;
-  outbound_chunks_.clear();
-  rx_seen_tsns_.clear();
-  rx_fragments_.clear();
-  ordered_ready_.clear();
-  early_rx_messages_.clear();
-  flight_bytes_ = 0;
-  for (auto& [cid, ch] : channels_) {
-    (void)cid;
-    ch.pending_messages.clear();
-    ch.state = RTC_DATA_CHANNEL_CLOSED;
+  remote_max_message_size_ = 0;
+  local_vtag_ = 0;
+  local_initial_tsn_ = 0;
+  next_tx_tsn_unwrapped_ = 0;
+  last_acked_tx_tsn_unwrapped_ = -1;
+  advanced_peer_ack_point_unwrapped_ = -1;
+  next_reconfig_seq_ = 1;
+
+  ResetAssociationTransportState();
+  channels_.clear();
+}
+
+void SctpDataChannelManager::ClearStreamRxState(uint16_t sid,
+                                                bool clear_early_rx) {
+  const auto ord_it = ordered_ready_.find(sid);
+  if (ord_it != ordered_ready_.end()) {
+    for (const auto& [ssn_k, m] : ord_it->second) {
+      (void)ssn_k;
+      ordered_ready_bytes_ = (ordered_ready_bytes_ >= m.payload.size())
+                                 ? (ordered_ready_bytes_ - m.payload.size())
+                                 : 0;
+    }
+    ordered_ready_count_ = (ordered_ready_count_ >= ord_it->second.size())
+                               ? (ordered_ready_count_ - ord_it->second.size())
+                               : 0;
+    ordered_ready_.erase(ord_it);
+  }
+  const auto part_it = partial_rx_messages_.find(sid);
+  if (part_it != partial_rx_messages_.end()) {
+    partial_rx_bytes_ = (partial_rx_bytes_ >= part_it->second.data.size())
+                            ? (partial_rx_bytes_ - part_it->second.data.size())
+                            : 0;
+    partial_rx_messages_.erase(part_it);
+  }
+  next_expected_ssn_.erase(sid);
+  if (clear_early_rx) {
+    const auto early_it = early_rx_messages_.find(sid);
+    if (early_it != early_rx_messages_.end()) {
+      for (const auto& [is_bin, msg_data] : early_it->second) {
+        (void)is_bin;
+        early_rx_bytes_ = (early_rx_bytes_ >= msg_data.size())
+                              ? (early_rx_bytes_ - msg_data.size())
+                              : 0;
+      }
+      early_rx_count_ = (early_rx_count_ >= early_it->second.size())
+                            ? (early_rx_count_ - early_it->second.size())
+                            : 0;
+      early_rx_messages_.erase(early_it);
+    }
   }
 }
 
-uint16_t SctpDataChannelManager::AllocateNextLocalStreamId() {
-  uint16_t* cursor =
-      (dtls_role_ == DtlsRole::kClient) ? &next_even_sid_ : &next_odd_sid_;
-  while (sid_to_channel_id_.find(*cursor) != sid_to_channel_id_.end()) {
-    *cursor = static_cast<uint16_t>(*cursor + 2);
+size_t SctpDataChannelManager::ComputeBufferedRxBytes() const {
+  const size_t payload_bytes = rx_frag_bytes_ + ordered_ready_bytes_ +
+                               partial_rx_bytes_ + early_rx_bytes_;
+  const size_t entry_count = rx_fragments_.size() + ordered_ready_count_ +
+                             partial_rx_messages_.size() + early_rx_count_;
+  return payload_bytes + entry_count * kRxEntryOverheadBytes;
+}
+
+uint32_t SctpDataChannelManager::CurrentAdvertisedRwnd() const {
+  const size_t used = ComputeBufferedRxBytes();
+  return (used < kDefaultAdvertisedRwnd)
+             ? static_cast<uint32_t>(kDefaultAdvertisedRwnd - used)
+             : 0u;
+}
+
+std::optional<uint16_t> SctpDataChannelManager::AllocateNextLocalStreamId() {
+  const uint16_t base = (dtls_role_ == DtlsRole::kClient) ? 0u : 1u;
+  if (peer_mis_ <= base) {
+    return std::nullopt;
   }
-  const uint16_t chosen = *cursor;
-  *cursor = static_cast<uint16_t>(*cursor + 2);
-  return chosen;
+  uint16_t& cursor =
+      (dtls_role_ == DtlsRole::kClient) ? next_even_sid_ : next_odd_sid_;
+  if (cursor >= peer_mis_ || (cursor & 1u) != base) {
+    cursor = base;
+  }
+  const size_t max_candidates =
+      static_cast<size_t>((peer_mis_ - 1u - base) / 2u) + 1u;
+  for (size_t step = 0; step < max_candidates; ++step) {
+    const uint16_t cand = cursor;
+    cursor = static_cast<uint16_t>(cursor + 2u);
+    if (cursor >= peer_mis_) {
+      cursor = base;
+    }
+    if (cand < peer_mis_ && cand != 0xFFFFu &&
+        sid_to_channel_id_.find(cand) == sid_to_channel_id_.end() &&
+        outbound_reset_pending_sids_.find(cand) ==
+            outbound_reset_pending_sids_.end()) {
+      return cand;
+    }
+  }
+  return std::nullopt;
 }
 
 int SctpDataChannelManager::CreateDataChannel(const DataChannelConfig& config) {
+  if (config.label.size() > 65535 || config.protocol.size() > 65535 ||
+      (config.max_retransmits >= 0 && config.max_packet_lifetime_ms >= 0) ||
+      channels_.size() >= 2048) {
+    return RTC_ERR_INVALID_ARG;
+  }
+  std::optional<uint16_t> preallocated_sid;
   if (config.negotiated) {
-    if (config.id < 0 || config.id > 65534) {
+    if (config.id < 0 || config.id > 65534 ||
+        static_cast<uint16_t>(config.id) >= peer_mis_) {
       return RTC_ERR_INVALID_ARG;
     }
     const uint16_t sid = static_cast<uint16_t>(config.id);
-    if (sid_to_channel_id_.find(sid) != sid_to_channel_id_.end()) {
+    if (sid_to_channel_id_.find(sid) != sid_to_channel_id_.end() ||
+        outbound_reset_pending_sids_.find(sid) !=
+            outbound_reset_pending_sids_.end()) {
       return RTC_ERR_INVALID_ARG;
+    }
+    preallocated_sid = sid;
+  } else if (assoc_state_ == AssocState::kEstablished) {
+    preallocated_sid = AllocateNextLocalStreamId();
+    if (!preallocated_sid.has_value()) {
+      return RTC_ERR_NO_MEMORY;
     }
   }
 
@@ -199,10 +396,9 @@ int SctpDataChannelManager::CreateDataChannel(const DataChannelConfig& config) {
   if (entry.config.label.empty()) {
     entry.config.label = "data_" + std::to_string(channel_id);
   }
-  if (config.negotiated) {
-    const uint16_t sid = static_cast<uint16_t>(config.id);
-    entry.sctp_sid = sid;
-    sid_to_channel_id_[sid] = channel_id;
+  if (preallocated_sid.has_value()) {
+    entry.sctp_sid = *preallocated_sid;
+    sid_to_channel_id_[*preallocated_sid] = channel_id;
   }
 
   auto [it, inserted] = channels_.emplace(channel_id, std::move(entry));
@@ -216,6 +412,10 @@ int SctpDataChannelManager::CreateDataChannel(const DataChannelConfig& config) {
 int SctpDataChannelManager::SendData(int channel_id,
                                      ArrayView<const uint8_t> payload,
                                      bool is_binary) {
+  constexpr size_t kMaxOutboundBufferedBytes = kMaxSctpMessageSize;
+  if (payload.size() > EffectiveMaxMessageSize()) {
+    return RTC_ERR_INVALID_ARG;
+  }
   const auto it = channels_.find(channel_id);
   if (it == channels_.end()) {
     return RTC_ERR_INVALID_ARG;
@@ -228,15 +428,21 @@ int SctpDataChannelManager::SendData(int channel_id,
 
   const Timestamp now = clock_->CurrentTime();
   if (assoc_state_ != AssocState::kEstablished || !ch.sctp_sid.has_value()) {
-    if (ch.pending_messages.size() >= 512) {
+    if (ch.pending_messages.size() >= 512 ||
+        ch.pending_bytes > kMaxOutboundBufferedBytes - payload.size()) {
       return RTC_ERR_NO_MEMORY;
     }
+    ch.pending_bytes += payload.size();
     PendingUserMessage pending;
     pending.payload.assign(payload.begin(), payload.end());
     pending.is_binary = is_binary;
     pending.queued_at = now;
     ch.pending_messages.push_back(std::move(pending));
     return RTC_OK;
+  }
+
+  if (outbound_buffered_bytes_ > kMaxOutboundBufferedBytes - payload.size()) {
+    return RTC_ERR_NO_MEMORY;
   }
 
   uint32_t ppid = is_binary ? kPpidWebRtcBinary : kPpidWebRtcString;
@@ -265,43 +471,168 @@ int SctpDataChannelManager::CloseDataChannel(int channel_id) {
   if (ch.state == RTC_DATA_CHANNEL_CLOSED) {
     return RTC_OK;
   }
-  const std::string label = ch.config.label;
-  if (ch.sctp_sid.has_value()) {
-    const uint16_t sid = *ch.sctp_sid;
-    if (assoc_state_ == AssocState::kEstablished) {
-      // 发送 RFC 6525 Outgoing SSN Reset Request (0x000D) 通知远端关闭该流。
-      std::vector<uint8_t> chunk;
-      AppendChunkHeader(kChunkReconfig, 0, 4 + 18, &chunk);
-      uint8_t hdr[18]{};
-      WriteBigEndian16(hdr, kParamOutgoingSsnResetReq);
-      WriteBigEndian16(hdr + 2, 18);
-      WriteBigEndian32(hdr + 4, next_reconfig_seq_++);
-      WriteBigEndian32(hdr + 8, 0);
-      WriteBigEndian32(hdr + 12, next_tx_tsn_ - 1);
-      WriteBigEndian16(hdr + 16, sid);
-      chunk.insert(chunk.end(), hdr, hdr + sizeof(hdr));
-      PadTo4Bytes(&chunk);
-      SendChunksPacket(peer_vtag_, chunk);
+
+  ch.pending_messages.clear();
+  ch.pending_bytes = 0;
+
+  if (assoc_state_ != AssocState::kEstablished || !ch.sctp_sid.has_value()) {
+    const std::string label = ch.config.label;
+    if (ch.sctp_sid.has_value()) {
+      const uint16_t sid = *ch.sctp_sid;
+      sid_to_channel_id_.erase(sid);
+      ClearStreamRxState(sid, /*clear_early_rx=*/true);
     }
-    sid_to_channel_id_.erase(sid);
-    ordered_ready_.erase(sid);
-    next_expected_ssn_.erase(sid);
-    early_rx_messages_.erase(sid);
+    channels_.erase(it);
+    if (observer_ != nullptr) {
+      observer_->OnSctpDataChannelState(channel_id, label,
+                                        RTC_DATA_CHANNEL_CLOSED);
+    }
+    return RTC_OK;
   }
-  channels_.erase(it);
-  if (observer_ != nullptr) {
+
+  const uint16_t sid = *ch.sctp_sid;
+  const std::string label = ch.config.label;
+  const bool notify_closing = (ch.state != RTC_DATA_CHANNEL_CLOSING);
+  ch.state = RTC_DATA_CHANNEL_CLOSING;
+  if (notify_closing && observer_ != nullptr) {
     observer_->OnSctpDataChannelState(channel_id, label,
-                                      RTC_DATA_CHANNEL_CLOSED);
+                                      RTC_DATA_CHANNEL_CLOSING);
+  }
+
+  const auto refreshed_it = channels_.find(channel_id);
+  if (refreshed_it != channels_.end()) {
+    ChannelEntry& cur_ch = refreshed_it->second;
+    if (!cur_ch.outbound_reset_queued && !cur_ch.outbound_reset_done) {
+      cur_ch.outbound_reset_queued = true;
+      EnqueueOutgoingStreamReset(sid, clock_->CurrentTime());
+    }
+    FinalizeChannelCloseIfReady(channel_id);
   }
   return RTC_OK;
 }
 
-std::vector<uint8_t> SctpDataChannelManager::BuildSctpPacket(
+void SctpDataChannelManager::EnqueueOutgoingStreamReset(uint16_t sid,
+                                                        Timestamp now) {
+  outbound_reset_pending_sids_.insert(sid);
+  if (inflight_outbound_reset_.has_value()) {
+    const auto& cur_sids = inflight_outbound_reset_->sids;
+    if (std::find(cur_sids.begin(), cur_sids.end(), sid) != cur_sids.end()) {
+      return;
+    }
+  }
+  if (std::find(queued_outbound_reset_sids_.begin(),
+                queued_outbound_reset_sids_.end(),
+                sid) == queued_outbound_reset_sids_.end()) {
+    queued_outbound_reset_sids_.push_back(sid);
+  }
+  PumpOutboundStreamResetQueue(now);
+}
+
+void SctpDataChannelManager::PumpOutboundStreamResetQueue(Timestamp now) {
+  if (assoc_state_ != AssocState::kEstablished || peer_vtag_ == 0 ||
+      inflight_outbound_reset_.has_value() ||
+      queued_outbound_reset_sids_.empty()) {
+    return;
+  }
+
+  OutgoingResetReq req;
+  req.req_seq = next_reconfig_seq_++;
+  req.last_assigned_tsn =
+      static_cast<uint32_t>((next_tx_tsn_unwrapped_ - 1) & 0xFFFFFFFFULL);
+  constexpr size_t kMaxSidsPerResetReq = 128;
+  while (!queued_outbound_reset_sids_.empty() &&
+         req.sids.size() < kMaxSidsPerResetReq) {
+    req.sids.push_back(queued_outbound_reset_sids_.front());
+    queued_outbound_reset_sids_.pop_front();
+  }
+  inflight_outbound_reset_ = std::move(req);
+  SendInflightOutboundReset(now);
+}
+
+void SctpDataChannelManager::SendInflightOutboundReset(Timestamp now) {
+  if (!inflight_outbound_reset_.has_value() || peer_vtag_ == 0) {
+    return;
+  }
+  auto& req = *inflight_outbound_reset_;
+  const uint16_t param_len =
+      static_cast<uint16_t>(16 + req.sids.size() * sizeof(uint16_t));
+  const uint16_t chunk_len = static_cast<uint16_t>(4 + param_len);
+
+  std::vector<uint8_t> chunk;
+  chunk.reserve((static_cast<size_t>(chunk_len) + 3u) & ~size_t{3});
+  AppendChunkHeader(kChunkReconfig, 0, chunk_len, &chunk);
+
+  uint8_t hdr[16]{};
+  WriteBigEndian16(hdr, kParamOutgoingSsnResetReq);
+  WriteBigEndian16(hdr + 2, param_len);
+  WriteBigEndian32(hdr + 4, req.req_seq);
+  WriteBigEndian32(hdr + 8, CurrentPeerReconfigRespSeq());
+  WriteBigEndian32(hdr + 12, req.last_assigned_tsn);
+  chunk.insert(chunk.end(), hdr, hdr + sizeof(hdr));
+
+  for (uint16_t sid : req.sids) {
+    uint8_t sid_bytes[2];
+    WriteBigEndian16(sid_bytes, sid);
+    chunk.push_back(sid_bytes[0]);
+    chunk.push_back(sid_bytes[1]);
+  }
+  PadTo4Bytes(&chunk);
+  SendChunksPacket(peer_vtag_, chunk);
+  req.last_sent_at = now;
+  ++req.rtx_count;
+}
+
+void SctpDataChannelManager::SendReconfigResponse(uint32_t resp_seq,
+                                                  uint32_t result) {
+  if (peer_vtag_ == 0) {
+    return;
+  }
+  std::vector<uint8_t> resp;
+  AppendChunkHeader(kChunkReconfig, 0, 16, &resp);
+  uint8_t body[12]{};
+  WriteBigEndian16(body, kParamReconfigResponse);
+  WriteBigEndian16(body + 2, 12);
+  WriteBigEndian32(body + 4, resp_seq);
+  WriteBigEndian32(body + 8, result);
+  resp.insert(resp.end(), body, body + sizeof(body));
+  SendChunksPacket(peer_vtag_, resp);
+}
+
+void SctpDataChannelManager::FinalizeChannelCloseIfReady(int channel_id) {
+  const auto ch_it = channels_.find(channel_id);
+  if (ch_it == channels_.end()) {
+    return;
+  }
+  ChannelEntry& ch = ch_it->second;
+  if (!ch.outbound_reset_done || !ch.inbound_reset_done) {
+    return;
+  }
+
+  const std::string label = ch.config.label;
+  if (ch.sctp_sid.has_value()) {
+    const uint16_t sid = *ch.sctp_sid;
+    outbound_reset_pending_sids_.erase(sid);
+    abandoned_ordered_streams_.erase(sid);
+    const auto sid_it = sid_to_channel_id_.find(sid);
+    if (sid_it != sid_to_channel_id_.end() && sid_it->second == channel_id) {
+      sid_to_channel_id_.erase(sid_it);
+      ClearStreamRxState(sid, /*clear_early_rx=*/true);
+    }
+  }
+  channels_.erase(ch_it);
+  if (observer_ != nullptr) {
+    observer_->OnSctpDataChannelState(channel_id, label,
+                                      RTC_DATA_CHANNEL_CLOSED);
+  }
+}
+
+std::vector<uint8_t> SctpDataChannelManager::BuildSctpPacketToPort(
+    uint16_t dst_port,
     uint32_t vtag,
     ArrayView<const uint8_t> chunks_bytes) const {
   std::vector<uint8_t> pkt(12 + chunks_bytes.size(), 0);
   WriteBigEndian16(pkt.data(), local_port_);
-  WriteBigEndian16(pkt.data() + 2, remote_port_);
+  WriteBigEndian16(pkt.data() + 2, dst_port);
   WriteBigEndian32(pkt.data() + 4, vtag);
   if (!chunks_bytes.empty()) {
     std::memcpy(pkt.data() + 12, chunks_bytes.data(), chunks_bytes.size());
@@ -315,41 +646,66 @@ std::vector<uint8_t> SctpDataChannelManager::BuildSctpPacket(
   return pkt;
 }
 
-bool SctpDataChannelManager::SendChunksPacket(
+std::vector<uint8_t> SctpDataChannelManager::BuildSctpPacket(
+    uint32_t vtag,
+    ArrayView<const uint8_t> chunks_bytes) const {
+  return BuildSctpPacketToPort(remote_port_, vtag, chunks_bytes);
+}
+
+bool SctpDataChannelManager::SendChunksPacketToPort(
+    uint16_t dst_port,
     uint32_t vtag,
     ArrayView<const uint8_t> chunks_bytes) {
   if (observer_ == nullptr || chunks_bytes.empty()) {
     return false;
   }
-  const auto wire = BuildSctpPacket(vtag, chunks_bytes);
+  const auto wire = BuildSctpPacketToPort(dst_port, vtag, chunks_bytes);
   return observer_->SendSctpPacketOverDtls(wire);
 }
 
+bool SctpDataChannelManager::SendChunksPacket(
+    uint32_t vtag,
+    ArrayView<const uint8_t> chunks_bytes) {
+  return SendChunksPacketToPort(remote_port_, vtag, chunks_bytes);
+}
+
 void SctpDataChannelManager::SendInitChunk(Timestamp now) {
+  if (local_vtag_ == 0) {
+    InitializeLocalAssociationParams();
+  }
   std::vector<uint8_t> chunk;
-  // INIT 固定体 16 字节 + Forward-TSN-Supported (4 字节) + Chunk 头 (4 字节) = 24 字节。
-  AppendChunkHeader(kChunkInit, 0, 24, &chunk);
-  uint8_t body[20]{};
+  // INIT 固定体 16B + Forward-TSN-Supported (4B) + Supported-Extensions (8B, 含对齐) + Chunk 头 (4B) = 32B。
+  AppendChunkHeader(kChunkInit, 0, 32, &chunk);
+  uint8_t body[28]{};
   WriteBigEndian32(body, local_vtag_);
-  WriteBigEndian32(body + 4, kDefaultAdvertisedRwnd);
-  WriteBigEndian16(body + 8, 1024);
-  WriteBigEndian16(body + 10, 1024);
+  WriteBigEndian32(body + 4, CurrentAdvertisedRwnd());
+  WriteBigEndian16(body + 8, kDefaultMaxStreams);
+  WriteBigEndian16(body + 10, kDefaultMaxStreams);
   WriteBigEndian32(body + 12, local_initial_tsn_);
   WriteBigEndian16(body + 16, kParamForwardTsnSupported);
   WriteBigEndian16(body + 18, 4);
+  WriteBigEndian16(body + 20, kParamSupportedExtensions);
+  WriteBigEndian16(body + 22, 6);
+  body[24] = kChunkReconfig;
+  body[25] = kChunkForwardTsn;
   chunk.insert(chunk.end(), body, body + sizeof(body));
   SendChunksPacket(0, chunk);
   last_handshake_tx_ = now;
 }
 
-void SctpDataChannelManager::HandleInitChunk(ArrayView<const uint8_t> chunk_body,
-                                             Timestamp now) {
+void SctpDataChannelManager::HandleInitChunk(
+    uint16_t src_port,
+    ArrayView<const uint8_t> chunk_body,
+    Timestamp now) {
   if (chunk_body.size() < 16) {
     return;
   }
   const uint32_t init_tag = ReadBigEndian32(chunk_body.data());
+  const uint32_t peer_arwnd = ReadBigEndian32(chunk_body.data() + 4);
+  const uint16_t peer_os = ReadBigEndian16(chunk_body.data() + 8);
+  const uint16_t peer_mis = ReadBigEndian16(chunk_body.data() + 10);
   const uint32_t peer_init_tsn = ReadBigEndian32(chunk_body.data() + 12);
-  if (init_tag == 0) {
+  if (init_tag == 0 || peer_os == 0 || peer_mis == 0) {
     return;
   }
 
@@ -363,38 +719,83 @@ void SctpDataChannelManager::HandleInitChunk(ArrayView<const uint8_t> chunk_body
     }
     if (ptype == kParamForwardTsnSupported) {
       prsctp = true;
+    } else if (ptype == kParamSupportedExtensions && plen > 4) {
+      for (size_t k = 4; k < plen; ++k) {
+        if (chunk_body[off + k] == kChunkForwardTsn) {
+          prsctp = true;
+        }
+      }
     }
     off += (static_cast<size_t>(plen) + 3u) & ~size_t{3};
   }
 
-  // 构造带状态 Cookie (0x0007) 与 Forward-TSN-Supported (0xC000) 的 INIT-ACK。
+  if (local_vtag_ == 0) {
+    InitializeLocalAssociationParams();
+  }
+
+  // RFC 4960 第 5.2.2 节：若关联已建立，不修改当前 TCB，生成新的临时 VTag/TSN 封入签名 Cookie。
+  uint32_t resp_local_vtag = local_vtag_;
+  uint32_t resp_local_tsn = local_initial_tsn_;
+  if (assoc_state_ == AssocState::kEstablished &&
+      (init_tag != peer_vtag_ || peer_init_tsn != peer_initial_tsn_)) {
+    do {
+      resp_local_vtag = GenerateNonZeroRandom32();
+    } while (resp_local_vtag == local_vtag_);
+    resp_local_tsn = GenerateNonZeroRandom32();
+  }
+
+  const uint16_t ack_os = std::min<uint16_t>(kDefaultMaxStreams, peer_mis);
+  const uint16_t ack_mis = kDefaultMaxStreams;
+
+  // 构造带 HMAC-SHA256 签名与时间戳的状态 Cookie (0x0007, TLV 长度 80B)。
+  constexpr uint16_t kCookieParamLen = static_cast<uint16_t>(4 + kCookieTotalBytes);
+  constexpr uint16_t kInitAckLen = 4 + 16 + kCookieParamLen + 4 + 6;
   std::vector<uint8_t> chunk;
-  constexpr uint16_t kInitAckLen = 4 + 16 + 20 + 4;
+  chunk.reserve(112);
   AppendChunkHeader(kChunkInitAck, 0, kInitAckLen, &chunk);
+
   uint8_t fixed[16]{};
-  WriteBigEndian32(fixed, local_vtag_);
-  WriteBigEndian32(fixed + 4, kDefaultAdvertisedRwnd);
-  WriteBigEndian16(fixed + 8, 1024);
-  WriteBigEndian16(fixed + 10, 1024);
-  WriteBigEndian32(fixed + 12, local_initial_tsn_);
+  WriteBigEndian32(fixed, resp_local_vtag);
+  WriteBigEndian32(fixed + 4, CurrentAdvertisedRwnd());
+  WriteBigEndian16(fixed + 8, ack_os);
+  WriteBigEndian16(fixed + 10, ack_mis);
+  WriteBigEndian32(fixed + 12, resp_local_tsn);
   chunk.insert(chunk.end(), fixed, fixed + sizeof(fixed));
 
-  uint8_t cookie_param[20]{};
+  uint8_t cookie_param[4 + kCookieTotalBytes]{};
   WriteBigEndian16(cookie_param, kParamStateCookie);
-  WriteBigEndian16(cookie_param + 2, 20);
-  WriteBigEndian32(cookie_param + 4, kStateCookieMagic);
-  WriteBigEndian32(cookie_param + 8, init_tag);
-  WriteBigEndian32(cookie_param + 12, peer_init_tsn);
-  WriteBigEndian32(cookie_param + 16, prsctp ? 1u : 0u);
+  WriteBigEndian16(cookie_param + 2, kCookieParamLen);
+  uint8_t* cdata = cookie_param + 4;
+  const int64_t cookie_ts_us = now.IsFinite() ? now.us() : 0;
+  WriteBigEndian32(cdata + 0, kStateCookieMagic);
+  WriteBigEndian64(cdata + 4, static_cast<uint64_t>(cookie_ts_us));
+  WriteBigEndian32(cdata + 12, resp_local_vtag);
+  WriteBigEndian32(cdata + 16, resp_local_tsn);
+  WriteBigEndian32(cdata + 20, init_tag);
+  WriteBigEndian32(cdata + 24, peer_init_tsn);
+  WriteBigEndian32(cdata + 28, peer_arwnd);
+  WriteBigEndian16(cdata + 32, peer_os);
+  WriteBigEndian16(cdata + 34, peer_mis);
+  WriteBigEndian16(cdata + 36, local_port_);
+  WriteBigEndian16(cdata + 38, src_port);
+  WriteBigEndian32(cdata + 40, prsctp ? 1u : 0u);
+
+  unsigned int mac_len = 0;
+  HMAC(EVP_sha256(), cookie_hmac_key_.data(),
+       static_cast<int>(cookie_hmac_key_.size()), cdata, kCookieDataBytes,
+       cdata + kCookieDataBytes, &mac_len);
   chunk.insert(chunk.end(), cookie_param, cookie_param + sizeof(cookie_param));
 
-  uint8_t ftsn_param[4]{};
-  WriteBigEndian16(ftsn_param, kParamForwardTsnSupported);
-  WriteBigEndian16(ftsn_param + 2, 4);
-  chunk.insert(chunk.end(), ftsn_param, ftsn_param + sizeof(ftsn_param));
+  uint8_t ext_params[12]{};
+  WriteBigEndian16(ext_params, kParamForwardTsnSupported);
+  WriteBigEndian16(ext_params + 2, 4);
+  WriteBigEndian16(ext_params + 4, kParamSupportedExtensions);
+  WriteBigEndian16(ext_params + 6, 6);
+  ext_params[8] = kChunkReconfig;
+  ext_params[9] = kChunkForwardTsn;
+  chunk.insert(chunk.end(), ext_params, ext_params + sizeof(ext_params));
 
-  SendChunksPacket(init_tag, chunk);
-  (void)now;
+  SendChunksPacketToPort(src_port, init_tag, chunk);
 }
 
 void SctpDataChannelManager::HandleInitAckChunk(
@@ -404,8 +805,11 @@ void SctpDataChannelManager::HandleInitAckChunk(
     return;
   }
   const uint32_t init_tag = ReadBigEndian32(chunk_body.data());
+  const uint32_t peer_arwnd = ReadBigEndian32(chunk_body.data() + 4);
+  const uint16_t peer_os = ReadBigEndian16(chunk_body.data() + 8);
+  const uint16_t peer_mis = ReadBigEndian16(chunk_body.data() + 10);
   const uint32_t peer_init_tsn = ReadBigEndian32(chunk_body.data() + 12);
-  if (init_tag == 0) {
+  if (init_tag == 0 || peer_os == 0 || peer_mis == 0) {
     return;
   }
 
@@ -418,11 +822,17 @@ void SctpDataChannelManager::HandleInitAckChunk(
     if (plen < 4 || off + plen > chunk_body.size()) {
       break;
     }
-    if (ptype == kParamStateCookie && plen > 4) {
+    if (ptype == kParamStateCookie && plen > 4 && plen <= 1024) {
       cookie.assign(chunk_body.data() + off + 4,
                     chunk_body.data() + off + plen);
     } else if (ptype == kParamForwardTsnSupported) {
       prsctp = true;
+    } else if (ptype == kParamSupportedExtensions && plen > 4) {
+      for (size_t k = 4; k < plen; ++k) {
+        if (chunk_body[off + k] == kChunkForwardTsn) {
+          prsctp = true;
+        }
+      }
     }
     off += (static_cast<size_t>(plen) + 3u) & ~size_t{3};
   }
@@ -431,11 +841,14 @@ void SctpDataChannelManager::HandleInitAckChunk(
   }
 
   peer_vtag_ = init_tag;
+  peer_rwnd_ = peer_arwnd;
+  negotiated_mis_ = std::min<uint16_t>(kDefaultMaxStreams, peer_os);
+  peer_mis_ = std::min<uint16_t>(kDefaultMaxStreams, peer_mis);
   peer_supports_prsctp_ = prsctp;
-  if (!has_peer_initial_tsn_) {
-    peer_cum_tsn_ack_ = peer_init_tsn - 1;
-    has_peer_initial_tsn_ = true;
-  }
+  peer_initial_tsn_ = peer_init_tsn;
+  peer_cum_tsn_ack_unwrapped_ = static_cast<int64_t>(peer_init_tsn) - 1;
+  has_peer_initial_tsn_ = true;
+
   pending_cookie_ = std::move(cookie);
   assoc_state_ = AssocState::kCookieEchoed;
   handshake_rtx_count_ = 0;
@@ -452,30 +865,123 @@ void SctpDataChannelManager::HandleInitAckChunk(
 }
 
 void SctpDataChannelManager::HandleCookieEchoChunk(
+    uint32_t rx_vtag,
+    uint16_t src_port,
     ArrayView<const uint8_t> chunk_body,
     Timestamp now) {
-  if (chunk_body.size() >= 16 &&
-      ReadBigEndian32(chunk_body.data()) == kStateCookieMagic) {
-    const uint32_t c_peer_vtag = ReadBigEndian32(chunk_body.data() + 4);
-    const uint32_t c_peer_tsn = ReadBigEndian32(chunk_body.data() + 8);
-    const bool c_prsctp = ReadBigEndian32(chunk_body.data() + 12) != 0u;
-    if (c_peer_vtag != 0) {
-      peer_vtag_ = c_peer_vtag;
-      peer_supports_prsctp_ = c_prsctp;
-      if (!has_peer_initial_tsn_) {
-        peer_cum_tsn_ack_ = c_peer_tsn - 1;
-        has_peer_initial_tsn_ = true;
-      }
+  if (chunk_body.size() != kCookieTotalBytes) {
+    return;
+  }
+
+  unsigned char expected_mac[kCookieHmacBytes]{};
+  unsigned int mac_len = 0;
+  HMAC(EVP_sha256(), cookie_hmac_key_.data(),
+       static_cast<int>(cookie_hmac_key_.size()), chunk_body.data(),
+       kCookieDataBytes, expected_mac, &mac_len);
+  if (mac_len != kCookieHmacBytes ||
+      CRYPTO_memcmp(expected_mac, chunk_body.data() + kCookieDataBytes,
+                    kCookieHmacBytes) != 0) {
+    RTC_LOG(kWarning) << "Dropped SCTP COOKIE-ECHO with invalid HMAC";
+    return;
+  }
+
+  const uint8_t* cdata = chunk_body.data();
+  const uint32_t c_magic = ReadBigEndian32(cdata + 0);
+  const int64_t c_ts_us = static_cast<int64_t>(ReadBigEndian64(cdata + 4));
+  const uint32_t c_local_vtag = ReadBigEndian32(cdata + 12);
+  const uint32_t c_local_tsn = ReadBigEndian32(cdata + 16);
+  const uint32_t c_peer_vtag = ReadBigEndian32(cdata + 20);
+  const uint32_t c_peer_tsn = ReadBigEndian32(cdata + 24);
+  const uint32_t c_peer_rwnd = ReadBigEndian32(cdata + 28);
+  const uint16_t c_peer_os = ReadBigEndian16(cdata + 32);
+  const uint16_t c_peer_mis = ReadBigEndian16(cdata + 34);
+  const uint16_t c_local_port = ReadBigEndian16(cdata + 36);
+  const uint16_t c_remote_port = ReadBigEndian16(cdata + 38);
+  const bool c_prsctp = ReadBigEndian32(cdata + 40) != 0u;
+
+  if (c_magic != kStateCookieMagic || c_local_vtag == 0 || c_peer_vtag == 0 ||
+      c_peer_os == 0 || c_peer_mis == 0 || c_local_vtag != rx_vtag ||
+      c_local_port != local_port_ || c_remote_port != src_port) {
+    return;
+  }
+
+  if (now.IsFinite()) {
+    const TimeDelta age = now - Timestamp::Micros(c_ts_us);
+    if (age < TimeDelta::Zero() || age > kMaxCookieLifetime) {
+      RTC_LOG(kWarning) << "Dropped expired SCTP State Cookie";
+      return;
     }
   }
+
+  remote_port_ = src_port;
+
+  // RFC 4960 第 5.2.4 节：区分重复 COOKIE-ECHO 与对端关联重启（Association Restart）。
+  if (assoc_state_ == AssocState::kEstablished) {
+    if (c_local_vtag == local_vtag_ && c_peer_vtag == peer_vtag_ &&
+        c_peer_tsn == peer_initial_tsn_) {
+      std::vector<uint8_t> ack_chunk;
+      AppendChunkHeader(kChunkCookieAck, 0, 4, &ack_chunk);
+      SendChunksPacket(peer_vtag_, ack_chunk);
+      return;
+    }
+
+    std::vector<std::pair<int, std::string>> restarted_channels;
+    for (auto ch_it = channels_.begin(); ch_it != channels_.end();) {
+      if (ch_it->second.open_notified ||
+          ch_it->second.state != RTC_DATA_CHANNEL_CONNECTING) {
+        if (ch_it->second.state != RTC_DATA_CHANNEL_CLOSED) {
+          restarted_channels.emplace_back(ch_it->first,
+                                          ch_it->second.config.label);
+        }
+        ch_it = channels_.erase(ch_it);
+      } else {
+        ch_it->second.sctp_sid.reset();
+        ch_it->second.open_sent = false;
+        ch_it->second.next_tx_ssn = 0;
+        ++ch_it;
+      }
+    }
+
+    ResetAssociationTransportState();
+    local_vtag_ = c_local_vtag;
+    local_initial_tsn_ = c_local_tsn;
+    next_tx_tsn_unwrapped_ = static_cast<int64_t>(local_initial_tsn_);
+    last_acked_tx_tsn_unwrapped_ = next_tx_tsn_unwrapped_ - 1;
+    advanced_peer_ack_point_unwrapped_ = last_acked_tx_tsn_unwrapped_;
+    next_reconfig_seq_ = local_initial_tsn_;
+
+    for (auto& [cid, ch] : channels_) {
+      if (ch.config.negotiated && ch.config.id >= 0) {
+        const uint16_t sid = static_cast<uint16_t>(ch.config.id);
+        ch.sctp_sid = sid;
+        sid_to_channel_id_[sid] = cid;
+      }
+    }
+
+    if (observer_ != nullptr) {
+      for (const auto& [cid, label] : restarted_channels) {
+        observer_->OnSctpDataChannelState(cid, label, RTC_DATA_CHANNEL_CLOSED);
+      }
+    }
+  } else if (c_local_vtag != local_vtag_) {
+    return;
+  }
+
+  peer_vtag_ = c_peer_vtag;
+  peer_rwnd_ = c_peer_rwnd;
+  negotiated_mis_ = std::min<uint16_t>(kDefaultMaxStreams, c_peer_os);
+  peer_mis_ = std::min<uint16_t>(kDefaultMaxStreams, c_peer_mis);
+  peer_supports_prsctp_ = c_prsctp;
+  peer_initial_tsn_ = c_peer_tsn;
+  peer_cum_tsn_ack_unwrapped_ = static_cast<int64_t>(c_peer_tsn) - 1;
+  has_peer_initial_tsn_ = true;
+  pending_cookie_.clear();
 
   std::vector<uint8_t> ack_chunk;
   AppendChunkHeader(kChunkCookieAck, 0, 4, &ack_chunk);
   SendChunksPacket(peer_vtag_, ack_chunk);
 
-  if (assoc_state_ != AssocState::kEstablished) {
-    OnAssociationEstablished(now);
-  }
+  OnAssociationEstablished(now);
 }
 
 void SctpDataChannelManager::HandleCookieAckChunk(Timestamp now) {
@@ -489,42 +995,86 @@ void SctpDataChannelManager::OnAssociationEstablished(Timestamp now) {
   assoc_state_ = AssocState::kEstablished;
   RTC_LOG(kInfo) << "SCTP association established (local_port=" << local_port_
                  << ", remote_port=" << remote_port_
-                 << ", role=" << (dtls_role_ == DtlsRole::kClient ? "client" : "server")
-                 << ", pr_sctp=" << (peer_supports_prsctp_ ? "on" : "off") << ")";
+                 << ", role="
+                 << (dtls_role_ == DtlsRole::kClient ? "client" : "server")
+                 << ", pr_sctp=" << (peer_supports_prsctp_ ? "on" : "off")
+                 << ")";
 
-  for (auto& [cid, ch] : channels_) {
-    (void)cid;
-    ActivateChannelIfReady(&ch, now);
+  std::vector<int> existing_cids;
+  existing_cids.reserve(channels_.size());
+  for (const auto& [cid, ch] : channels_) {
+    (void)ch;
+    existing_cids.push_back(cid);
+  }
+  for (int cid : existing_cids) {
+    const auto it = channels_.find(cid);
+    if (it != channels_.end()) {
+      ActivateChannelIfReady(&it->second, now);
+    }
   }
   FlushTransmitQueue(now);
 }
 
 void SctpDataChannelManager::ActivateChannelIfReady(ChannelEntry* ch,
                                                     Timestamp now) {
-  if (ch == nullptr || ch->state == RTC_DATA_CHANNEL_CLOSED ||
+  if (ch == nullptr || ch->state == RTC_DATA_CHANNEL_CLOSING ||
+      ch->state == RTC_DATA_CHANNEL_CLOSED ||
       assoc_state_ != AssocState::kEstablished) {
     return;
   }
+  if (ch->sctp_sid.has_value() && *ch->sctp_sid >= peer_mis_) {
+    const int cid = ch->channel_id;
+    const std::string label = ch->config.label;
+    sid_to_channel_id_.erase(*ch->sctp_sid);
+    channels_.erase(cid);
+    if (observer_ != nullptr) {
+      observer_->OnSctpDataChannelState(cid, label, RTC_DATA_CHANNEL_CLOSED);
+    }
+    return;
+  }
   if (!ch->sctp_sid.has_value()) {
-    const uint16_t sid = AllocateNextLocalStreamId();
-    ch->sctp_sid = sid;
-    sid_to_channel_id_[sid] = ch->channel_id;
+    const auto sid_opt = AllocateNextLocalStreamId();
+    if (!sid_opt.has_value()) {
+      return;
+    }
+    ch->sctp_sid = *sid_opt;
+    sid_to_channel_id_[*sid_opt] = ch->channel_id;
   }
   if (!ch->config.negotiated && !ch->open_sent) {
     SendDcepOpen(*ch, now);
     ch->open_sent = true;
   }
+  const int cid = ch->channel_id;
   ch->state = RTC_DATA_CHANNEL_OPEN;
   if (!ch->open_notified && observer_ != nullptr) {
     ch->open_notified = true;
-    observer_->OnSctpDataChannelState(ch->channel_id, ch->config.label,
-                                      RTC_DATA_CHANNEL_OPEN);
+    const std::string label = ch->config.label;
+    observer_->OnSctpDataChannelState(cid, label, RTC_DATA_CHANNEL_OPEN);
   }
 
-  // 按入队顺序冲刷在握手完成前预先缓存的应用消息。
-  while (!ch->pending_messages.empty()) {
-    PendingUserMessage msg = std::move(ch->pending_messages.front());
-    ch->pending_messages.pop_front();
+  const auto ch_it = channels_.find(cid);
+  if (ch_it == channels_.end() ||
+      ch_it->second.state != RTC_DATA_CHANNEL_OPEN ||
+      !ch_it->second.sctp_sid.has_value()) {
+    return;
+  }
+  ChannelEntry& active_ch = ch_it->second;
+
+  // 按入队顺序冲刷在握手完成前预先缓存的应用消息，保留原始入队时间戳供 PR-SCTP 生存期判定。
+  const size_t max_msg_sz = EffectiveMaxMessageSize();
+  while (!active_ch.pending_messages.empty()) {
+    PendingUserMessage msg = std::move(active_ch.pending_messages.front());
+    active_ch.pending_messages.pop_front();
+    active_ch.pending_bytes =
+        (active_ch.pending_bytes >= msg.payload.size())
+            ? (active_ch.pending_bytes - msg.payload.size())
+            : 0;
+    if (msg.payload.size() > max_msg_sz) {
+      RTC_LOG(kWarning) << "Dropped pre-queued SCTP message exceeding remote "
+                           "max-message-size ("
+                        << msg.payload.size() << " > " << max_msg_sz << ")";
+      continue;
+    }
 
     uint32_t ppid = msg.is_binary ? kPpidWebRtcBinary : kPpidWebRtcString;
     std::vector<uint8_t> empty_placeholder(1, 0);
@@ -533,10 +1083,11 @@ void SctpDataChannelManager::ActivateChannelIfReady(ChannelEntry* ch,
       ppid = msg.is_binary ? kPpidWebRtcBinaryEmpty : kPpidWebRtcStringEmpty;
       wire_payload = empty_placeholder;
     }
-    const uint16_t ssn = ch->config.ordered ? ch->next_tx_ssn++ : 0;
-    EnqueueSctpMessage(*ch->sctp_sid, ch->config.ordered, ssn, ppid,
-                       wire_payload, ch->config.max_retransmits,
-                       ch->config.max_packet_lifetime_ms, now);
+    const uint16_t ssn = active_ch.config.ordered ? active_ch.next_tx_ssn++ : 0;
+    const Timestamp created_at = msg.queued_at.IsFinite() ? msg.queued_at : now;
+    EnqueueSctpMessage(*active_ch.sctp_sid, active_ch.config.ordered, ssn, ppid,
+                       wire_payload, active_ch.config.max_retransmits,
+                       active_ch.config.max_packet_lifetime_ms, created_at);
   }
   FlushTransmitQueue(now);
 }
@@ -601,7 +1152,7 @@ void SctpDataChannelManager::EnqueueSctpMessage(
     ArrayView<const uint8_t> payload,
     int32_t max_retransmits,
     int32_t max_lifetime_ms,
-    Timestamp now) {
+    Timestamp created_at) {
   const uint64_t msg_seq = next_msg_seq_id_++;
   const size_t total = payload.size();
   const size_t frag_count =
@@ -611,9 +1162,10 @@ void SctpDataChannelManager::EnqueueSctpMessage(
   size_t offset = 0;
   for (size_t i = 0; i < frag_count; ++i) {
     const size_t len = std::min(kMaxSctpFragmentPayload, total - offset);
+    const int64_t uw_tsn = next_tx_tsn_unwrapped_++;
     OutboundDataChunk chunk;
     chunk.msg_seq_id = msg_seq;
-    chunk.tsn = next_tx_tsn_++;
+    chunk.tsn = static_cast<uint32_t>(uw_tsn & 0xFFFFFFFFULL);
     chunk.sid = sid;
     chunk.ssn = ordered ? ssn : 0;
     chunk.ppid = ppid;
@@ -631,76 +1183,172 @@ void SctpDataChannelManager::EnqueueSctpMessage(
     chunk.ordered = ordered;
     chunk.max_retransmits = max_retransmits;
     chunk.max_lifetime_ms = max_lifetime_ms;
-    chunk.created_at = now;
-    outbound_chunks_.emplace(chunk.tsn, std::move(chunk));
+    chunk.created_at = created_at;
+    outbound_buffered_bytes_ += len;
+    outbound_chunks_.emplace(uw_tsn, std::move(chunk));
     offset += len;
   }
 }
 
-void SctpDataChannelManager::FlushTransmitQueue(Timestamp now) {
+void SctpDataChannelManager::FlushTransmitQueue(
+    Timestamp now,
+    bool allow_one_fast_rtx_packet) {
   if (assoc_state_ != AssocState::kEstablished || peer_vtag_ == 0) {
     return;
   }
+  if (in_flush_transmit_) {
+    pending_reentrant_flush_ = true;
+    pending_reentrant_fast_rtx_ =
+        pending_reentrant_fast_rtx_ || allow_one_fast_rtx_packet;
+    return;
+  }
+  in_flush_transmit_ = true;
+  bool fast_rtx_flag = allow_one_fast_rtx_packet;
 
-  CheckAbandonedAndSendForwardTsn(now);
-
-  std::vector<uint8_t> bundle;
-  bundle.reserve(kMaxSctpPacketBytes);
-
-  auto flush_bundle = [&]() {
-    if (!bundle.empty()) {
-      SendChunksPacket(peer_vtag_, bundle);
-      bundle.clear();
-    }
-  };
-
-  for (auto& [tsn, ch] : outbound_chunks_) {
-    (void)tsn;
-    if (ch.acked || ch.abandoned) {
-      continue;
-    }
-    if (ch.tx_count > 0 && !ch.needs_retransmit) {
-      continue;
-    }
-
-    const size_t chunk_wire_len = 16 + ch.payload.size();
-    const size_t padded_len = (chunk_wire_len + 3u) & ~size_t{3};
-    if (!ch.needs_retransmit && flight_bytes_ > 0 &&
-        flight_bytes_ + chunk_wire_len > cwnd_bytes_) {
+  do {
+    pending_reentrant_flush_ = false;
+    CheckAbandonedAndSendForwardTsn(now);
+    if (assoc_state_ != AssocState::kEstablished || peer_vtag_ == 0) {
       break;
     }
-    if (!bundle.empty() && 12 + bundle.size() + padded_len > kMaxSctpPacketBytes) {
-      flush_bundle();
+
+    std::vector<std::vector<uint8_t>> packets_to_send;
+    std::vector<uint8_t> bundle;
+    bundle.reserve(kMaxSctpPacketBytes);
+    bool fast_rtx_packet_open = fast_rtx_flag;
+    fast_rtx_flag = false;
+
+    auto seal_bundle = [&]() {
+      if (!bundle.empty()) {
+        packets_to_send.push_back(std::move(bundle));
+        bundle.clear();
+        bundle.reserve(kMaxSctpPacketBytes);
+        fast_rtx_packet_open = false;
+      }
+    };
+
+    for (auto& [tsn, ch] : outbound_chunks_) {
+      (void)tsn;
+      if (ch.acked || ch.abandoned) {
+        continue;
+      }
+      if (ch.tx_count > 0 && !ch.needs_retransmit) {
+        continue;
+      }
+
+      const size_t chunk_wire_len = 16 + ch.payload.size();
+      const size_t padded_len = (chunk_wire_len + 3u) & ~size_t{3};
+      const bool bypass_cwnd_for_fast_rtx =
+          fast_rtx_packet_open && ch.needs_retransmit &&
+          (bundle.empty() ||
+           12 + bundle.size() + padded_len <= kMaxSctpPacketBytes);
+
+      // RFC 4960 第 6.1 / 7.2 节：同时遵守 cwnd 与对端 a_rwnd（flight_bytes_ == 0 时允许 1 个零窗口探测块）。
+      if (flight_bytes_ > 0) {
+        if (flight_bytes_ + chunk_wire_len > peer_rwnd_) {
+          break;
+        }
+        if (!bypass_cwnd_for_fast_rtx &&
+            flight_bytes_ + chunk_wire_len > cwnd_bytes_) {
+          break;
+        }
+      }
+
+      if (!bundle.empty() &&
+          12 + bundle.size() + padded_len > kMaxSctpPacketBytes) {
+        seal_bundle();
+        if (flight_bytes_ > 0 && flight_bytes_ + chunk_wire_len > cwnd_bytes_) {
+          break;
+        }
+      }
+
+      uint8_t flags = ch.flags;
+      if ((flags & kDataFlagEnd) != 0u) {
+        flags |= kDataFlagImmediateSack;
+      }
+      AppendChunkHeader(kChunkData, flags,
+                        static_cast<uint16_t>(chunk_wire_len), &bundle);
+      uint8_t meta[12]{};
+      WriteBigEndian32(meta, ch.tsn);
+      WriteBigEndian16(meta + 4, ch.sid);
+      WriteBigEndian16(meta + 6, ch.ssn);
+      WriteBigEndian32(meta + 8, ch.ppid);
+      bundle.insert(bundle.end(), meta, meta + sizeof(meta));
+      bundle.insert(bundle.end(), ch.payload.begin(), ch.payload.end());
+      PadTo4Bytes(&bundle);
+
+      if (!ch.in_flight) {
+        ch.in_flight = true;
+        flight_bytes_ += chunk_wire_len;
+      }
+      ch.needs_retransmit = false;
+      ch.last_sent_at = now;
+      ++ch.tx_count;
+      if (!t3_rtx_deadline_.IsFinite()) {
+        t3_rtx_deadline_ = now + TimeDelta::Micros(rto_us_);
+      }
     }
 
-    uint8_t flags = ch.flags;
-    if ((flags & kDataFlagEnd) != 0u) {
-      flags |= kDataFlagImmediateSack;
-    }
-    AppendChunkHeader(kChunkData, flags,
-                      static_cast<uint16_t>(chunk_wire_len), &bundle);
-    uint8_t meta[12]{};
-    WriteBigEndian32(meta, ch.tsn);
-    WriteBigEndian16(meta + 4, ch.sid);
-    WriteBigEndian16(meta + 6, ch.ssn);
-    WriteBigEndian32(meta + 8, ch.ppid);
-    bundle.insert(bundle.end(), meta, meta + sizeof(meta));
-    bundle.insert(bundle.end(), ch.payload.begin(), ch.payload.end());
-    PadTo4Bytes(&bundle);
+    seal_bundle();
 
-    if (!ch.in_flight) {
-      ch.in_flight = true;
-      flight_bytes_ += chunk_wire_len;
+    const uint32_t vtag = peer_vtag_;
+    for (const auto& pkt_chunks : packets_to_send) {
+      if (assoc_state_ != AssocState::kEstablished || peer_vtag_ == 0 ||
+          peer_vtag_ != vtag) {
+        break;
+      }
+      SendChunksPacket(vtag, pkt_chunks);
     }
-    ch.needs_retransmit = false;
-    ch.last_sent_at = now;
-    ++ch.tx_count;
-    if (!t3_rtx_deadline_.IsFinite()) {
-      t3_rtx_deadline_ = now + TimeDelta::Micros(rto_us_);
+
+    if (pending_reentrant_fast_rtx_) {
+      fast_rtx_flag = true;
+      pending_reentrant_fast_rtx_ = false;
+    }
+  } while (pending_reentrant_flush_ &&
+           assoc_state_ == AssocState::kEstablished && peer_vtag_ != 0);
+
+  in_flush_transmit_ = false;
+}
+
+void SctpDataChannelManager::SendForwardTsnChunk(Timestamp now) {
+  if (!peer_supports_prsctp_ || peer_vtag_ == 0 ||
+      advanced_peer_ack_point_unwrapped_ <= last_acked_tx_tsn_unwrapped_) {
+    return;
+  }
+
+  std::vector<std::pair<uint16_t, uint16_t>> stream_entries;
+  stream_entries.reserve(abandoned_ordered_streams_.size());
+  for (const auto& [sid, rec] : abandoned_ordered_streams_) {
+    if (rec.adv_tsn_unwrapped > last_acked_tx_tsn_unwrapped_) {
+      stream_entries.emplace_back(sid, rec.ssn);
+      if (stream_entries.size() >= 256) {
+        break;
+      }
     }
   }
 
-  flush_bundle();
+  std::vector<uint8_t> ftsn;
+  const uint16_t chunk_len =
+      static_cast<uint16_t>(8 + stream_entries.size() * 4);
+  AppendChunkHeader(kChunkForwardTsn, 0, chunk_len, &ftsn);
+  uint8_t cum_bytes[4];
+  WriteBigEndian32(cum_bytes,
+                   static_cast<uint32_t>(advanced_peer_ack_point_unwrapped_ &
+                                         0xFFFFFFFFULL));
+  ftsn.insert(ftsn.end(), cum_bytes, cum_bytes + 4);
+  for (const auto& [sid, ssn] : stream_entries) {
+    uint8_t entry[4];
+    WriteBigEndian16(entry, sid);
+    WriteBigEndian16(entry + 2, ssn);
+    ftsn.insert(ftsn.end(), entry, entry + 4);
+  }
+  SendChunksPacket(peer_vtag_, ftsn);
+  last_forward_tsn_tx_ = now;
+  dup_sack_below_adv_count_ = 0;
+
+  if (!t3_rtx_deadline_.IsFinite()) {
+    t3_rtx_deadline_ = now + TimeDelta::Micros(rto_us_);
+  }
 }
 
 void SctpDataChannelManager::CheckAbandonedAndSendForwardTsn(Timestamp now) {
@@ -714,13 +1362,14 @@ void SctpDataChannelManager::CheckAbandonedAndSendForwardTsn(Timestamp now) {
     if (ch.acked || ch.abandoned) {
       continue;
     }
+    // RFC 3758：仅当分片真正需要重传且已耗尽允许重传次数时才视为超过重传预算。
     const bool rtx_exceeded =
-        (ch.max_retransmits >= 0) &&
+        (ch.max_retransmits >= 0) && ch.needs_retransmit &&
         (ch.tx_count > static_cast<uint32_t>(ch.max_retransmits));
     const bool ttl_expired =
         (ch.max_lifetime_ms >= 0) && ch.created_at.IsFinite() &&
-        ((now - ch.created_at).ms() >= ch.max_lifetime_ms);
-    if ((ch.tx_count > 0 && rtx_exceeded) || ttl_expired) {
+        now.IsFinite() && ((now - ch.created_at).ms() >= ch.max_lifetime_ms);
+    if (rtx_exceeded || ttl_expired) {
       newly_abandoned_msgs.insert(ch.msg_seq_id);
     }
   }
@@ -742,51 +1391,54 @@ void SctpDataChannelManager::CheckAbandonedAndSendForwardTsn(Timestamp now) {
     }
   }
 
-  // 推进 advanced_peer_ack_point_ 并采集受影响有序流的最高被跳过 SSN。
-  const uint32_t prev_adv = advanced_peer_ack_point_;
-  std::map<uint16_t, uint16_t> skipped_ordered_streams;
+  // 推进 advanced_peer_ack_point_unwrapped_ 并持久化被跳过有序流的最大 SSN（RFC 3758 第 3.5 节）。
+  const int64_t prev_adv = advanced_peer_ack_point_unwrapped_;
+  std::set<uint16_t> updated_sids;
   for (auto it = outbound_chunks_.begin(); it != outbound_chunks_.end();) {
-    if (IsTsnBeforeOrEqual(it->first, advanced_peer_ack_point_)) {
-      if (IsTsnBeforeOrEqual(it->first, last_acked_tx_tsn_) ||
+    if (it->first <= advanced_peer_ack_point_unwrapped_) {
+      if (it->first <= last_acked_tx_tsn_unwrapped_ ||
           it->second.abandoned || it->second.acked) {
+        const size_t p_sz = it->second.payload.size();
+        outbound_buffered_bytes_ = (outbound_buffered_bytes_ >= p_sz)
+                                       ? (outbound_buffered_bytes_ - p_sz)
+                                       : 0;
         it = outbound_chunks_.erase(it);
         continue;
       }
       ++it;
       continue;
     }
-    if (it->first != advanced_peer_ack_point_ + 1) {
+    if (it->first != advanced_peer_ack_point_unwrapped_ + 1) {
       break;
     }
     if (!it->second.acked && !it->second.abandoned) {
       break;
     }
-    advanced_peer_ack_point_ = it->first;
+    advanced_peer_ack_point_unwrapped_ = it->first;
     if (it->second.abandoned && it->second.ordered) {
-      auto st_it = skipped_ordered_streams.find(it->second.sid);
-      if (st_it == skipped_ordered_streams.end() ||
-          IsSsnBeforeOrEqual(st_it->second, it->second.ssn)) {
-        skipped_ordered_streams[it->second.sid] = it->second.ssn;
+      auto st_it = abandoned_ordered_streams_.find(it->second.sid);
+      if (st_it == abandoned_ordered_streams_.end() ||
+          IsSsnBeforeOrEqual(st_it->second.ssn, it->second.ssn)) {
+        abandoned_ordered_streams_[it->second.sid] =
+            AbandonedStreamRecord{it->second.ssn, it->first};
       }
+      updated_sids.insert(it->second.sid);
     }
+    const size_t p_sz = it->second.payload.size();
+    outbound_buffered_bytes_ = (outbound_buffered_bytes_ >= p_sz)
+                                   ? (outbound_buffered_bytes_ - p_sz)
+                                   : 0;
     it = outbound_chunks_.erase(it);
   }
 
-  if (IsTsnBefore(prev_adv, advanced_peer_ack_point_)) {
-    std::vector<uint8_t> ftsn;
-    const uint16_t chunk_len = static_cast<uint16_t>(
-        8 + skipped_ordered_streams.size() * 4);
-    AppendChunkHeader(kChunkForwardTsn, 0, chunk_len, &ftsn);
-    uint8_t cum_bytes[4];
-    WriteBigEndian32(cum_bytes, advanced_peer_ack_point_);
-    ftsn.insert(ftsn.end(), cum_bytes, cum_bytes + 4);
-    for (const auto& [sid, ssn] : skipped_ordered_streams) {
-      uint8_t entry[4];
-      WriteBigEndian16(entry, sid);
-      WriteBigEndian16(entry + 2, ssn);
-      ftsn.insert(ftsn.end(), entry, entry + 4);
+  if (prev_adv < advanced_peer_ack_point_unwrapped_) {
+    for (uint16_t sid : updated_sids) {
+      auto st_it = abandoned_ordered_streams_.find(sid);
+      if (st_it != abandoned_ordered_streams_.end()) {
+        st_it->second.adv_tsn_unwrapped = advanced_peer_ack_point_unwrapped_;
+      }
     }
-    SendChunksPacket(peer_vtag_, ftsn);
+    SendForwardTsnChunk(now);
   }
 }
 
@@ -808,11 +1460,16 @@ void SctpDataChannelManager::OnInboundSctpPacket(
   }
 
   const uint16_t src_port = ReadBigEndian16(packet.data());
+  const uint16_t dst_port = ReadBigEndian16(packet.data() + 2);
   const uint32_t rx_vtag = ReadBigEndian32(packet.data() + 4);
-  if (src_port != 0) {
+  if (src_port == 0 || dst_port != local_port_) {
+    return;
+  }
+  if (local_vtag_ != 0 && rx_vtag == local_vtag_) {
     remote_port_ = src_port;
   }
 
+  const bool had_rx_gaps_before = !rx_seen_tsns_.empty();
   size_t off = 12;
   bool immediate_sack = false;
   while (off + 4 <= packet.size()) {
@@ -822,11 +1479,23 @@ void SctpDataChannelManager::OnInboundSctpPacket(
     if (clen < 4 || off + clen > packet.size()) {
       break;
     }
+
     if (ctype == kChunkInit) {
-      if (rx_vtag != 0) {
+      if (rx_vtag != 0 || off != 12) {
         break;
       }
-    } else if (rx_vtag != local_vtag_) {
+    } else if (ctype == kChunkCookieEcho) {
+      if (rx_vtag == 0 ||
+          (rx_vtag != local_vtag_ && assoc_state_ != AssocState::kEstablished)) {
+        break;
+      }
+    } else if (ctype == kChunkAbort) {
+      const bool valid_t_vtag =
+          ((cflags & 0x01u) != 0u) && peer_vtag_ != 0 && rx_vtag == peer_vtag_;
+      if (rx_vtag != local_vtag_ && !valid_t_vtag) {
+        break;
+      }
+    } else if (local_vtag_ == 0 || rx_vtag != local_vtag_) {
       break;
     }
 
@@ -834,19 +1503,19 @@ void SctpDataChannelManager::OnInboundSctpPacket(
         packet.subview(off + 4, static_cast<size_t>(clen - 4));
     switch (ctype) {
       case kChunkInit:
-        HandleInitChunk(body, now);
-        break;
+        HandleInitChunk(src_port, body, now);
+        return;
       case kChunkInitAck:
         HandleInitAckChunk(body, now);
         break;
       case kChunkCookieEcho:
-        HandleCookieEchoChunk(body, now);
+        HandleCookieEchoChunk(rx_vtag, src_port, body, now);
         break;
       case kChunkCookieAck:
         HandleCookieAckChunk(now);
         break;
       case kChunkData:
-        if ((cflags & kDataFlagImmediateSack) != 0u) {
+        if (body.size() > 12 && (cflags & kDataFlagImmediateSack) != 0u) {
           immediate_sack = true;
         }
         HandleDataChunk(cflags, body, now);
@@ -858,21 +1527,36 @@ void SctpDataChannelManager::OnInboundSctpPacket(
         HandleHeartbeatChunk(body);
         break;
       case kChunkForwardTsn:
-        HandleForwardTsnChunk(body);
+        HandleForwardTsnChunk(body, now);
         immediate_sack = true;
         break;
       case kChunkReconfig:
-        HandleReconfigChunk(body);
+        HandleReconfigChunk(body, now);
         break;
       case kChunkShutdown: {
-        std::vector<uint8_t> sack;
-        AppendChunkHeader(kChunkShutdownAck, 0, 4, &sack);
-        SendChunksPacket(peer_vtag_, sack);
+        if (assoc_state_ == AssocState::kEstablished && peer_vtag_ != 0) {
+          std::vector<uint8_t> sack;
+          AppendChunkHeader(kChunkShutdownAck, 0, 4, &sack);
+          SendChunksPacket(peer_vtag_, sack);
+        }
         break;
       }
-      case kChunkAbort:
+      case kChunkAbort: {
+        std::vector<std::pair<int, std::string>> to_close;
+        for (const auto& [cid, ch] : channels_) {
+          if (ch.state != RTC_DATA_CHANNEL_CLOSED) {
+            to_close.emplace_back(cid, ch.config.label);
+          }
+        }
         Shutdown();
+        if (observer_ != nullptr) {
+          for (const auto& [cid, label] : to_close) {
+            observer_->OnSctpDataChannelState(cid, label,
+                                              RTC_DATA_CHANNEL_CLOSED);
+          }
+        }
         return;
+      }
       default:
         break;
     }
@@ -881,7 +1565,8 @@ void SctpDataChannelManager::OnInboundSctpPacket(
   }
 
   if (sack_needed_) {
-    if (immediate_sack || packets_since_sack_ >= 2 || !rx_seen_tsns_.empty()) {
+    if (immediate_sack || packets_since_sack_ >= 2 || had_rx_gaps_before ||
+        !rx_seen_tsns_.empty()) {
       SendSackChunk(now);
     } else if (!sack_deadline_.IsFinite()) {
       sack_deadline_ = now + TimeDelta::Millis(40);
@@ -891,6 +1576,9 @@ void SctpDataChannelManager::OnInboundSctpPacket(
 
 void SctpDataChannelManager::HandleHeartbeatChunk(
     ArrayView<const uint8_t> chunk_body) {
+  if (assoc_state_ != AssocState::kEstablished || chunk_body.size() > 1100) {
+    return;
+  }
   std::vector<uint8_t> ack;
   AppendChunkHeader(kChunkHeartbeatAck, 0,
                     static_cast<uint16_t>(4 + chunk_body.size()), &ack);
@@ -902,39 +1590,126 @@ void SctpDataChannelManager::HandleHeartbeatChunk(
 void SctpDataChannelManager::HandleDataChunk(
     uint8_t chunk_flags,
     ArrayView<const uint8_t> chunk_body,
-    Timestamp /*now*/) {
-  if (chunk_body.size() < 12) {
+    Timestamp now) {
+  // RFC 4960 第 6.2 节：严禁接收 0 字节负载 DATA 块（chunk_body.size() <= 12）。
+  if (assoc_state_ != AssocState::kEstablished || chunk_body.size() <= 12) {
     return;
   }
   const uint32_t tsn = ReadBigEndian32(chunk_body.data());
   const uint16_t sid = ReadBigEndian16(chunk_body.data() + 4);
   const uint16_t ssn = ReadBigEndian16(chunk_body.data() + 6);
   const uint32_t ppid = ReadBigEndian32(chunk_body.data() + 8);
+  if (sid >= negotiated_mis_) {
+    return;
+  }
+
   const ArrayView<const uint8_t> user_data =
       chunk_body.subview(12, chunk_body.size() - 12);
+  const int64_t base_cum_tsn = has_peer_initial_tsn_
+                                   ? peer_cum_tsn_ack_unwrapped_
+                                   : (static_cast<int64_t>(tsn) - 1);
+  const int32_t tsn_delta = static_cast<int32_t>(
+      tsn - static_cast<uint32_t>(base_cum_tsn & 0xFFFFFFFFULL));
+  const int64_t uw_tsn = base_cum_tsn + tsn_delta;
+
+  if (has_peer_initial_tsn_ &&
+      (tsn_delta <= 0 || rx_seen_tsns_.find(uw_tsn) != rx_seen_tsns_.end())) {
+    // 收到重复 TSN，立即通过 SACK 通知发送端更新确认点。
+    sack_needed_ = true;
+    packets_since_sack_ = 2;
+    return;
+  }
+
+  auto drop_before_sack = [&]() {
+    if (has_peer_initial_tsn_) {
+      sack_needed_ = true;
+      packets_since_sack_ = 2;
+    }
+  };
+
+  if (tsn_delta > 32768) {
+    drop_before_sack();
+    return;
+  }
+
+  // 在将 TSN 计入 SACK 确认集合之前执行所有接收缓冲区与队列容量准入检查，严禁先 SACK 后丢包！
+  const size_t cur_buffered = ComputeBufferedRxBytes();
+  const size_t new_chunk_cost = user_data.size() + kRxEntryOverheadBytes;
+  const bool zero_win_probe_ok =
+      (tsn_delta == 1 && cur_buffered == 0 &&
+       user_data.size() <= kDefaultAdvertisedRwnd);
+  if (!zero_win_probe_ok &&
+      (cur_buffered + new_chunk_cost > kDefaultAdvertisedRwnd ||
+       rx_seen_tsns_.size() >= kMaxSeenTsns ||
+       rx_fragments_.size() >= kMaxRxFragments)) {
+    drop_before_sack();
+    return;
+  }
+
+  const bool unordered = (chunk_flags & kDataFlagUnordered) != 0u;
+  int16_t ssn_delta = 0;
+  int64_t expected_ssn = 0;
+  if (!unordered) {
+    const auto exp_it = next_expected_ssn_.find(sid);
+    expected_ssn = (exp_it != next_expected_ssn_.end()) ? exp_it->second : 0;
+    ssn_delta = static_cast<int16_t>(
+        ssn - static_cast<uint16_t>(expected_ssn & 0xFFFFLL));
+    if (ssn_delta >= 16384) {
+      drop_before_sack();
+      return;
+    }
+    if (ssn_delta > 0) {
+      const int64_t uw_ssn = expected_ssn + ssn_delta;
+      const auto ord_it = ordered_ready_.find(sid);
+      const bool already_has_ssn =
+          (ord_it != ordered_ready_.end() &&
+           ord_it->second.find(uw_ssn) != ord_it->second.end());
+      if (!already_has_ssn) {
+        if (ordered_ready_count_ >= kMaxTotalOrderedBufferedMsgs ||
+            (ord_it != ordered_ready_.end() &&
+             ord_it->second.size() >= kMaxStreamOrderedBufferedMsgs)) {
+          drop_before_sack();
+          return;
+        }
+      }
+    }
+  }
+
+  if (ppid != kPpidDcep &&
+      sid_to_channel_id_.find(sid) == sid_to_channel_id_.end()) {
+    const auto early_it = early_rx_messages_.find(sid);
+    if (early_it == early_rx_messages_.end() &&
+        early_rx_messages_.size() >= kMaxEarlyRxStreams) {
+      drop_before_sack();
+      return;
+    }
+    const size_t cur_early =
+        (early_it != early_rx_messages_.end()) ? early_it->second.size() : 0;
+    const auto ord_it = ordered_ready_.find(sid);
+    const size_t cur_ord =
+        (ord_it != ordered_ready_.end()) ? ord_it->second.size() : 0;
+    if (cur_early + cur_ord >= kMaxEarlyRxMsgsPerStream) {
+      drop_before_sack();
+      return;
+    }
+  }
 
   if (!has_peer_initial_tsn_) {
-    peer_cum_tsn_ack_ = tsn - 1;
+    peer_initial_tsn_ = tsn;
+    peer_cum_tsn_ack_unwrapped_ = base_cum_tsn;
     has_peer_initial_tsn_ = true;
   }
 
   sack_needed_ = true;
   ++packets_since_sack_;
 
-  if (IsTsnBeforeOrEqual(tsn, peer_cum_tsn_ack_) ||
-      rx_seen_tsns_.find(tsn) != rx_seen_tsns_.end()) {
-    // 收到重复 TSN，立即通过 SACK 通知发送端更新确认点。
-    packets_since_sack_ = 2;
-    return;
-  }
-
-  rx_seen_tsns_.insert(tsn);
+  rx_seen_tsns_.insert(uw_tsn);
   while (true) {
-    const auto next_it = rx_seen_tsns_.find(peer_cum_tsn_ack_ + 1);
+    const auto next_it = rx_seen_tsns_.find(peer_cum_tsn_ack_unwrapped_ + 1);
     if (next_it == rx_seen_tsns_.end()) {
       break;
     }
-    peer_cum_tsn_ack_ = *next_it;
+    peer_cum_tsn_ack_unwrapped_ = *next_it;
     rx_seen_tsns_.erase(next_it);
   }
 
@@ -945,22 +1720,25 @@ void SctpDataChannelManager::HandleDataChunk(
   frag.ppid = ppid;
   frag.flags = chunk_flags;
   frag.payload.assign(user_data.begin(), user_data.end());
-  rx_fragments_.emplace(tsn, std::move(frag));
-  while (rx_fragments_.size() > 2048) {
-    rx_fragments_.erase(rx_fragments_.begin());
+  const size_t frag_sz = frag.payload.size();
+  auto [ins_it, inserted] = rx_fragments_.emplace(uw_tsn, std::move(frag));
+  (void)ins_it;
+  if (inserted) {
+    rx_frag_bytes_ += frag_sz;
   }
 
-  TryReassembleAround(tsn);
+  TryReassembleAround(uw_tsn);
+  ProcessPendingInboundResetIfReady(now);
 }
 
-void SctpDataChannelManager::TryReassembleAround(uint32_t pivot_tsn) {
+void SctpDataChannelManager::TryReassembleAround(int64_t pivot_tsn) {
   auto pivot_it = rx_fragments_.find(pivot_tsn);
   if (pivot_it == rx_fragments_.end()) {
     return;
   }
 
   // 向回查找连续 TSN 直至定位起始分片（B=1）。
-  uint32_t start_tsn = pivot_tsn;
+  int64_t start_tsn = pivot_tsn;
   while ((rx_fragments_[start_tsn].flags & kDataFlagBegin) == 0u) {
     const auto prev_it = rx_fragments_.find(start_tsn - 1);
     if (prev_it == rx_fragments_.end() ||
@@ -971,7 +1749,7 @@ void SctpDataChannelManager::TryReassembleAround(uint32_t pivot_tsn) {
   }
 
   // 向前查找连续 TSN 直至定位结束分片（E=1）。
-  uint32_t end_tsn = pivot_tsn;
+  int64_t end_tsn = pivot_tsn;
   while ((rx_fragments_[end_tsn].flags & kDataFlagEnd) == 0u) {
     const auto next_it = rx_fragments_.find(end_tsn + 1);
     if (next_it == rx_fragments_.end() ||
@@ -988,23 +1766,39 @@ void SctpDataChannelManager::TryReassembleAround(uint32_t pivot_tsn) {
   const bool unordered = (first_it->second.flags & kDataFlagUnordered) != 0u;
 
   size_t total_bytes = 0;
-  for (uint32_t cur = start_tsn;; ++cur) {
-    total_bytes += rx_fragments_[cur].payload.size();
-    if (cur == end_tsn) {
+  bool valid_chain = true;
+  for (int64_t cur = start_tsn; cur <= end_tsn; ++cur) {
+    const auto& f = rx_fragments_[cur];
+    const bool f_unordered = (f.flags & kDataFlagUnordered) != 0u;
+    if (f.sid != sid || f_unordered != unordered ||
+        (!unordered && f.ssn != ssn)) {
+      valid_chain = false;
+      break;
+    }
+    total_bytes += f.payload.size();
+    if (total_bytes > kDefaultAdvertisedRwnd) {
+      valid_chain = false;
       break;
     }
   }
 
   std::vector<uint8_t> full_payload;
-  full_payload.reserve(total_bytes);
-  for (uint32_t cur = start_tsn;; ++cur) {
+  if (valid_chain) {
+    full_payload.reserve(total_bytes);
+  }
+  for (int64_t cur = start_tsn; cur <= end_tsn; ++cur) {
     const auto it = rx_fragments_.find(cur);
-    full_payload.insert(full_payload.end(), it->second.payload.begin(),
-                        it->second.payload.end());
-    rx_fragments_.erase(it);
-    if (cur == end_tsn) {
-      break;
+    const size_t piece_sz = it->second.payload.size();
+    if (valid_chain) {
+      full_payload.insert(full_payload.end(), it->second.payload.begin(),
+                          it->second.payload.end());
     }
+    rx_frag_bytes_ =
+        (rx_frag_bytes_ >= piece_sz) ? (rx_frag_bytes_ - piece_sz) : 0;
+    rx_fragments_.erase(it);
+  }
+  if (!valid_chain) {
+    return;
   }
 
   DeliverReassembledMessage(sid, ssn, ppid, unordered, std::move(full_payload));
@@ -1025,34 +1819,74 @@ void SctpDataChannelManager::DeliverReassembledMessage(
     return;
   }
 
+  auto& expected = next_expected_ssn_[sid];
+  const int16_t ssn_delta =
+      static_cast<int16_t>(ssn - static_cast<uint16_t>(expected & 0xFFFFLL));
+  if (ssn_delta < 0 || ssn_delta >= 16384) {
+    return;
+  }
+  const int64_t uw_ssn = expected + ssn_delta;
   auto& stream_map = ordered_ready_[sid];
-  stream_map.emplace(ssn, ReassembledMessage{ppid, std::move(payload)});
+  const size_t msg_sz = payload.size();
+  auto [it, inserted] =
+      stream_map.emplace(uw_ssn, ReassembledMessage{ppid, std::move(payload)});
+  (void)it;
+  if (inserted) {
+    ordered_ready_bytes_ += msg_sz;
+    ++ordered_ready_count_;
+  }
   DrainOrderedStream(sid);
 }
 
 void SctpDataChannelManager::DrainOrderedStream(uint16_t sid) {
-  auto& expected = next_expected_ssn_[sid];
-  auto& stream_map = ordered_ready_[sid];
-  while (!stream_map.empty()) {
-    auto it = stream_map.begin();
-    if (static_cast<int16_t>(it->first - expected) < 0) {
-      stream_map.erase(it);
+  auto exp_it = next_expected_ssn_.find(sid);
+  if (exp_it == next_expected_ssn_.end()) {
+    exp_it = next_expected_ssn_.emplace(sid, 0).first;
+  }
+  auto ord_it = ordered_ready_.find(sid);
+  if (ord_it == ordered_ready_.end()) {
+    return;
+  }
+
+  while (!ord_it->second.empty()) {
+    auto msg_it = ord_it->second.begin();
+    if (msg_it->first < exp_it->second) {
+      const size_t drop_sz = msg_it->second.payload.size();
+      ordered_ready_bytes_ = (ordered_ready_bytes_ >= drop_sz)
+                                 ? (ordered_ready_bytes_ - drop_sz)
+                                 : 0;
+      ordered_ready_count_ =
+          (ordered_ready_count_ > 0) ? (ordered_ready_count_ - 1) : 0;
+      ord_it->second.erase(msg_it);
       continue;
     }
-    if (it->first != expected) {
+    if (msg_it->first != exp_it->second) {
       break;
     }
-    expected = static_cast<uint16_t>(expected + 1);
-    ReassembledMessage msg = std::move(it->second);
-    stream_map.erase(it);
+    ++exp_it->second;
+    const size_t msg_sz = msg_it->second.payload.size();
+    ordered_ready_bytes_ =
+        (ordered_ready_bytes_ >= msg_sz) ? (ordered_ready_bytes_ - msg_sz) : 0;
+    ordered_ready_count_ =
+        (ordered_ready_count_ > 0) ? (ordered_ready_count_ - 1) : 0;
+    ReassembledMessage msg = std::move(msg_it->second);
+    ord_it->second.erase(msg_it);
+
     if (msg.ppid == kPpidDcep) {
       HandleDcepMessage(sid, msg.payload);
     } else {
       DeliverUserPayloadOnStream(sid, msg.ppid, std::move(msg.payload));
     }
+
+    // 回调期间通道可能被关闭或流被重置，重新校验迭代器有效性。
+    exp_it = next_expected_ssn_.find(sid);
+    ord_it = ordered_ready_.find(sid);
+    if (exp_it == next_expected_ssn_.end() || ord_it == ordered_ready_.end()) {
+      return;
+    }
   }
-  if (stream_map.empty()) {
-    ordered_ready_.erase(sid);
+  if (ord_it->second.empty()) {
+    ordered_ready_.erase(ord_it);
   }
 }
 
@@ -1070,6 +1904,16 @@ void SctpDataChannelManager::HandleDcepMessage(
     return;
   }
 
+  // RFC 8832 第 5.1 节：拒绝在已打开本地流上的 DCEP OPEN 冲突（Glare），禁止静默合并。
+  if (sid_to_channel_id_.find(sid) != sid_to_channel_id_.end()) {
+    RTC_LOG(kWarning) << "Rejected DCEP OPEN glare on already-open stream sid="
+                      << sid;
+    return;
+  }
+  if (channels_.size() >= 2048) {
+    return;
+  }
+
   const uint8_t chan_type = payload[1];
   const uint32_t rel_param = ReadBigEndian32(payload.data() + 4);
   const uint16_t label_len = ReadBigEndian16(payload.data() + 8);
@@ -1078,52 +1922,62 @@ void SctpDataChannelManager::HandleDcepMessage(
     return;
   }
 
+  const uint8_t rel_kind = static_cast<uint8_t>(chan_type & 0x7Fu);
+  if (rel_kind > 0x02u) {
+    RTC_LOG(kWarning) << "Rejected DCEP OPEN with unsupported channel_type="
+                      << static_cast<int>(chan_type);
+    return;
+  }
+  const int32_t clamped_rel = static_cast<int32_t>(
+      std::min<uint32_t>(rel_param, static_cast<uint32_t>(INT32_MAX)));
+
   std::string label(reinterpret_cast<const char*>(payload.data() + 12),
                     label_len);
   std::string proto(
       reinterpret_cast<const char*>(payload.data() + 12 + label_len),
       proto_len);
 
-  int channel_id = -1;
-  const auto existing_it = sid_to_channel_id_.find(sid);
-  if (existing_it != sid_to_channel_id_.end()) {
-    channel_id = existing_it->second;
-  } else {
-    channel_id = next_channel_id_++;
-    ChannelEntry entry;
-    entry.channel_id = channel_id;
-    entry.config.label = label;
-    entry.config.protocol = proto;
-    entry.config.ordered = (chan_type & 0x80u) == 0u;
-    if ((chan_type & 0x7Fu) == 0x01u) {
-      entry.config.max_retransmits = static_cast<int32_t>(rel_param);
-    } else if ((chan_type & 0x7Fu) == 0x02u) {
-      entry.config.max_packet_lifetime_ms = static_cast<int32_t>(rel_param);
-    }
-    entry.sctp_sid = sid;
-    entry.state = RTC_DATA_CHANNEL_OPEN;
-    entry.open_sent = true;
-    entry.open_notified = true;
-    channels_.emplace(channel_id, std::move(entry));
-    sid_to_channel_id_[sid] = channel_id;
+  const int channel_id = next_channel_id_++;
+  ChannelEntry entry;
+  entry.channel_id = channel_id;
+  entry.config.label = label;
+  entry.config.protocol = proto;
+  entry.config.ordered = (chan_type & 0x80u) == 0u;
+  if (rel_kind == 0x01u) {
+    entry.config.max_retransmits = clamped_rel;
+  } else if (rel_kind == 0x02u) {
+    entry.config.max_packet_lifetime_ms = clamped_rel;
+  }
+  entry.sctp_sid = sid;
+  entry.state = RTC_DATA_CHANNEL_OPEN;
+  entry.open_sent = true;
+  entry.open_notified = true;
+  channels_.emplace(channel_id, std::move(entry));
+  sid_to_channel_id_[sid] = channel_id;
 
-    if (observer_ != nullptr) {
-      observer_->OnSctpDataChannelState(channel_id, label,
-                                        RTC_DATA_CHANNEL_OPEN);
-    }
+  if (observer_ != nullptr) {
+    observer_->OnSctpDataChannelState(channel_id, label, RTC_DATA_CHANNEL_OPEN);
   }
 
   SendDcepAck(sid, clock_->CurrentTime());
 
-  // 冲刷可能在无序模式下先于 DATA_CHANNEL_OPEN 到达的应用消息。
+  // 冲刷可能在无序模式下先于 DATA_CHANNEL_OPEN 到达的应用消息并归还接收缓冲计数。
   const auto early_it = early_rx_messages_.find(sid);
   if (early_it != early_rx_messages_.end()) {
     auto queue = std::move(early_it->second);
     early_rx_messages_.erase(early_it);
-    for (auto& [is_bin, data] : queue) {
+    for (const auto& [is_bin, msg_data] : queue) {
+      (void)is_bin;
+      early_rx_bytes_ = (early_rx_bytes_ >= msg_data.size())
+                            ? (early_rx_bytes_ - msg_data.size())
+                            : 0;
+    }
+    early_rx_count_ =
+        (early_rx_count_ >= queue.size()) ? (early_rx_count_ - queue.size()) : 0;
+    for (auto& [is_bin, msg_data] : queue) {
       if (observer_ != nullptr) {
         observer_->OnSctpDataChannelMessage(channel_id, is_bin,
-                                            std::move(data));
+                                            std::move(msg_data));
       }
     }
   }
@@ -1133,8 +1987,32 @@ void SctpDataChannelManager::DeliverUserPayloadOnStream(
     uint16_t sid,
     uint32_t ppid,
     std::vector<uint8_t> payload) {
+  // RFC 8831 第 6.6 节：PPID 52/54 为旧式非 EOR 分块消息，须按流累积至收到终止 PPID 53/51 后再合并投递。
+  if (ppid == kPpidWebRtcBinaryPartial || ppid == kPpidWebRtcStringPartial) {
+    const bool partial_is_bin = (ppid == kPpidWebRtcBinaryPartial);
+    auto& part = partial_rx_messages_[sid];
+    if (!part.data.empty() && part.is_binary != partial_is_bin) {
+      partial_rx_bytes_ = (partial_rx_bytes_ >= part.data.size())
+                              ? (partial_rx_bytes_ - part.data.size())
+                              : 0;
+      part.data.clear();
+    }
+    part.is_binary = partial_is_bin;
+    if (part.data.size() + payload.size() + kRxEntryOverheadBytes >
+        kDefaultAdvertisedRwnd) {
+      partial_rx_bytes_ = (partial_rx_bytes_ >= part.data.size())
+                              ? (partial_rx_bytes_ - part.data.size())
+                              : 0;
+      partial_rx_messages_.erase(sid);
+      return;
+    }
+    part.data.insert(part.data.end(), payload.begin(), payload.end());
+    partial_rx_bytes_ += payload.size();
+    return;
+  }
+
   bool is_binary = true;
-  if (ppid == kPpidWebRtcString || ppid == kPpidWebRtcStringPartial) {
+  if (ppid == kPpidWebRtcString) {
     is_binary = false;
   } else if (ppid == kPpidWebRtcStringEmpty) {
     is_binary = false;
@@ -1142,19 +2020,44 @@ void SctpDataChannelManager::DeliverUserPayloadOnStream(
   } else if (ppid == kPpidWebRtcBinaryEmpty) {
     is_binary = true;
     payload.clear();
-  } else if (ppid == kPpidWebRtcBinary || ppid == kPpidWebRtcBinaryPartial) {
+  } else if (ppid == kPpidWebRtcBinary) {
     is_binary = true;
+  } else {
+    RTC_LOG(kWarning) << "Rejected SCTP user message with unknown PPID=" << ppid;
+    return;
+  }
+
+  const auto part_it = partial_rx_messages_.find(sid);
+  if (part_it != partial_rx_messages_.end()) {
+    const bool same_mode = (part_it->second.is_binary == is_binary);
+    partial_rx_bytes_ =
+        (partial_rx_bytes_ >= part_it->second.data.size())
+            ? (partial_rx_bytes_ - part_it->second.data.size())
+            : 0;
+    std::vector<uint8_t> merged = std::move(part_it->second.data);
+    partial_rx_messages_.erase(part_it);
+    if (!same_mode) {
+      RTC_LOG(kWarning) << "Dropped mismatched partial PPID prefix on sid="
+                        << sid;
+    } else {
+      merged.insert(merged.end(), payload.begin(), payload.end());
+      payload = std::move(merged);
+    }
   }
 
   const auto cid_it = sid_to_channel_id_.find(sid);
   if (cid_it == sid_to_channel_id_.end()) {
-    if (early_rx_messages_.size() >= 64 &&
-        early_rx_messages_.find(sid) == early_rx_messages_.end()) {
-      early_rx_messages_.erase(early_rx_messages_.begin());
+    if (early_rx_messages_.find(sid) == early_rx_messages_.end() &&
+        early_rx_messages_.size() >= kMaxEarlyRxStreams) {
+      return;
     }
     auto& q = early_rx_messages_[sid];
-    if (q.size() < 32) {
+    if (q.size() < kMaxEarlyRxMsgsPerStream) {
+      early_rx_bytes_ += payload.size();
+      ++early_rx_count_;
       q.emplace_back(is_binary, std::move(payload));
+    } else if (q.empty()) {
+      early_rx_messages_.erase(sid);
     }
     return;
   }
@@ -1165,33 +2068,41 @@ void SctpDataChannelManager::DeliverUserPayloadOnStream(
 }
 
 void SctpDataChannelManager::HandleForwardTsnChunk(
-    ArrayView<const uint8_t> chunk_body) {
-  if (chunk_body.size() < 4) {
+    ArrayView<const uint8_t> chunk_body,
+    Timestamp now) {
+  if (assoc_state_ != AssocState::kEstablished || chunk_body.size() < 4 ||
+       !has_peer_initial_tsn_) {
     return;
   }
   const uint32_t new_cum_tsn = ReadBigEndian32(chunk_body.data());
-  if (!has_peer_initial_tsn_ || IsTsnBefore(peer_cum_tsn_ack_, new_cum_tsn)) {
-    peer_cum_tsn_ack_ = new_cum_tsn;
-    has_peer_initial_tsn_ = true;
+  const int32_t fwd_delta = static_cast<int32_t>(
+      new_cum_tsn -
+      static_cast<uint32_t>(peer_cum_tsn_ack_unwrapped_ & 0xFFFFFFFFULL));
+  if (fwd_delta > 0 && fwd_delta <= 65536) {
+    peer_cum_tsn_ack_unwrapped_ += fwd_delta;
+  } else if (fwd_delta > 65536) {
+    return;
   }
 
   for (auto it = rx_seen_tsns_.begin(); it != rx_seen_tsns_.end();) {
-    if (IsTsnBeforeOrEqual(*it, peer_cum_tsn_ack_)) {
+    if (*it <= peer_cum_tsn_ack_unwrapped_) {
       it = rx_seen_tsns_.erase(it);
     } else {
       break;
     }
   }
   while (true) {
-    const auto next_it = rx_seen_tsns_.find(peer_cum_tsn_ack_ + 1);
+    const auto next_it = rx_seen_tsns_.find(peer_cum_tsn_ack_unwrapped_ + 1);
     if (next_it == rx_seen_tsns_.end()) {
       break;
     }
-    peer_cum_tsn_ack_ = *next_it;
+    peer_cum_tsn_ack_unwrapped_ = *next_it;
     rx_seen_tsns_.erase(next_it);
   }
   for (auto it = rx_fragments_.begin(); it != rx_fragments_.end();) {
-    if (IsTsnBeforeOrEqual(it->first, peer_cum_tsn_ack_)) {
+    if (it->first <= peer_cum_tsn_ack_unwrapped_) {
+      const size_t fsz = it->second.payload.size();
+      rx_frag_bytes_ = (rx_frag_bytes_ >= fsz) ? (rx_frag_bytes_ - fsz) : 0;
       it = rx_fragments_.erase(it);
     } else {
       break;
@@ -1201,18 +2112,91 @@ void SctpDataChannelManager::HandleForwardTsnChunk(
   // RFC 3758 第 3.6 节：推进被跳过的有序流 SSN 并立即投递后续已就绪消息。
   for (size_t off = 4; off + 4 <= chunk_body.size(); off += 4) {
     const uint16_t sid = ReadBigEndian16(chunk_body.data() + off);
+    if (sid >= negotiated_mis_) {
+      continue;
+    }
     const uint16_t skipped_ssn = ReadBigEndian16(chunk_body.data() + off + 2);
     auto& expected = next_expected_ssn_[sid];
-    if (IsSsnBeforeOrEqual(expected, skipped_ssn)) {
-      expected = static_cast<uint16_t>(skipped_ssn + 1);
+    const int16_t skip_delta = static_cast<int16_t>(
+        skipped_ssn - static_cast<uint16_t>(expected & 0xFFFFLL));
+    if (skip_delta >= 0 && skip_delta < 16384) {
+      expected += static_cast<int64_t>(skip_delta) + 1;
     }
     DrainOrderedStream(sid);
   }
+  ProcessPendingInboundResetIfReady(now);
   sack_needed_ = true;
 }
 
+void SctpDataChannelManager::ExecuteInboundStreamReset(
+    const std::vector<uint16_t>& sids,
+    Timestamp now) {
+  for (uint16_t sid : sids) {
+    if (sid >= negotiated_mis_) {
+      continue;
+    }
+    ClearStreamRxState(sid, /*clear_early_rx=*/true);
+
+    const auto cid_it = sid_to_channel_id_.find(sid);
+    if (cid_it == sid_to_channel_id_.end()) {
+      continue;
+    }
+    const int cid = cid_it->second;
+    sid_to_channel_id_.erase(cid_it);
+
+    const auto ch_it = channels_.find(cid);
+    if (ch_it == channels_.end()) {
+      continue;
+    }
+    ch_it->second.inbound_reset_done = true;
+
+    // RFC 8831 第 6.7 节：收到对端 Outgoing SSN Reset Request 后自动回发本端流重置请求以完成双向关闭。
+    if (!ch_it->second.outbound_reset_queued &&
+        !ch_it->second.outbound_reset_done) {
+      const bool notify_closing =
+          (ch_it->second.state != RTC_DATA_CHANNEL_CLOSING &&
+           ch_it->second.state != RTC_DATA_CHANNEL_CLOSED);
+      ch_it->second.state = RTC_DATA_CHANNEL_CLOSING;
+      ch_it->second.pending_messages.clear();
+      ch_it->second.pending_bytes = 0;
+      const std::string label = ch_it->second.config.label;
+      if (notify_closing && observer_ != nullptr) {
+        observer_->OnSctpDataChannelState(cid, label, RTC_DATA_CHANNEL_CLOSING);
+      }
+      const auto recheck_it = channels_.find(cid);
+      if (recheck_it != channels_.end() &&
+          !recheck_it->second.outbound_reset_queued &&
+          !recheck_it->second.outbound_reset_done) {
+        recheck_it->second.outbound_reset_queued = true;
+        EnqueueOutgoingStreamReset(sid, now);
+      }
+    }
+    FinalizeChannelCloseIfReady(cid);
+  }
+}
+
+void SctpDataChannelManager::ProcessPendingInboundResetIfReady(Timestamp now) {
+  if (!pending_inbound_reset_.has_value() || !has_peer_initial_tsn_) {
+    return;
+  }
+  if (peer_cum_tsn_ack_unwrapped_ <
+      pending_inbound_reset_->req_last_tsn_unwrapped) {
+    return;
+  }
+
+  DeferredInboundReset ready = std::move(*pending_inbound_reset_);
+  pending_inbound_reset_.reset();
+  last_peer_reconfig_seq_ = ready.req_seq;
+  SendReconfigResponse(ready.req_seq, kReconfigResultSuccessPerformed);
+  ExecuteInboundStreamReset(ready.sids, now);
+}
+
 void SctpDataChannelManager::HandleReconfigChunk(
-    ArrayView<const uint8_t> chunk_body) {
+    ArrayView<const uint8_t> chunk_body,
+    Timestamp now) {
+  if (assoc_state_ != AssocState::kEstablished || !has_peer_initial_tsn_) {
+    return;
+  }
   size_t off = 0;
   while (off + 4 <= chunk_body.size()) {
     const uint16_t ptype = ReadBigEndian16(chunk_body.data() + off);
@@ -1222,38 +2206,80 @@ void SctpDataChannelManager::HandleReconfigChunk(
     }
     if (ptype == kParamOutgoingSsnResetReq && plen >= 16) {
       const uint32_t req_seq = ReadBigEndian32(chunk_body.data() + off + 4);
+      const uint32_t req_last_tsn =
+          ReadBigEndian32(chunk_body.data() + off + 12);
+
+      std::vector<uint16_t> sids;
       for (size_t s_off = off + 16; s_off + 2 <= off + plen; s_off += 2) {
         const uint16_t sid = ReadBigEndian16(chunk_body.data() + s_off);
-        ordered_ready_.erase(sid);
-        next_expected_ssn_.erase(sid);
-        early_rx_messages_.erase(sid);
-        const auto cid_it = sid_to_channel_id_.find(sid);
-        if (cid_it != sid_to_channel_id_.end()) {
-          const int cid = cid_it->second;
-          const auto ch_it = channels_.find(cid);
-          std::string label;
-          if (ch_it != channels_.end()) {
-            label = ch_it->second.config.label;
-            channels_.erase(ch_it);
-          }
-          sid_to_channel_id_.erase(cid_it);
-          if (observer_ != nullptr) {
-            observer_->OnSctpDataChannelState(cid, label,
-                                              RTC_DATA_CHANNEL_CLOSED);
-          }
+        if (sid < negotiated_mis_) {
+          sids.push_back(sid);
         }
       }
 
-      // 回复 RFC 6525 Re-configuration Response (0x0010, Result = 1 Success)。
-      std::vector<uint8_t> resp;
-      AppendChunkHeader(kChunkReconfig, 0, 16, &resp);
-      uint8_t body[12]{};
-      WriteBigEndian16(body, kParamReconfigResponse);
-      WriteBigEndian16(body + 2, 12);
-      WriteBigEndian32(body + 4, req_seq);
-      WriteBigEndian32(body + 8, 1);
-      resp.insert(resp.end(), body, body + sizeof(body));
-      SendChunksPacket(peer_vtag_, resp);
+      if (pending_inbound_reset_.has_value() &&
+          req_seq == pending_inbound_reset_->req_seq) {
+        if (peer_cum_tsn_ack_unwrapped_ >=
+            pending_inbound_reset_->req_last_tsn_unwrapped) {
+          ProcessPendingInboundResetIfReady(now);
+        } else {
+          SendReconfigResponse(req_seq, kReconfigResultInProgress);
+        }
+      } else if (last_peer_reconfig_seq_.has_value() &&
+                 req_seq == *last_peer_reconfig_seq_) {
+        SendReconfigResponse(req_seq, kReconfigResultSuccessPerformed);
+      } else if (!last_peer_reconfig_seq_.has_value() ||
+                 static_cast<int32_t>(req_seq - *last_peer_reconfig_seq_) > 0) {
+        const int32_t last_tsn_delta = static_cast<int32_t>(
+            req_last_tsn - static_cast<uint32_t>(peer_cum_tsn_ack_unwrapped_ &
+                                                 0xFFFFFFFFULL));
+        if (last_tsn_delta <= 1048576) {
+          const int64_t req_last_tsn_uw =
+              peer_cum_tsn_ack_unwrapped_ + last_tsn_delta;
+          if (peer_cum_tsn_ack_unwrapped_ < req_last_tsn_uw) {
+            pending_inbound_reset_ =
+                DeferredInboundReset{req_seq, req_last_tsn_uw, std::move(sids)};
+            SendReconfigResponse(req_seq, kReconfigResultInProgress);
+          } else {
+            pending_inbound_reset_.reset();
+            last_peer_reconfig_seq_ = req_seq;
+            SendReconfigResponse(req_seq, kReconfigResultSuccessPerformed);
+            ExecuteInboundStreamReset(sids, now);
+          }
+        }
+      }
+    } else if (ptype == kParamReconfigResponse && plen >= 12) {
+      const uint32_t resp_seq = ReadBigEndian32(chunk_body.data() + off + 4);
+      const uint32_t result = ReadBigEndian32(chunk_body.data() + off + 8);
+      if (inflight_outbound_reset_.has_value() &&
+          resp_seq == inflight_outbound_reset_->req_seq) {
+        if (result == kReconfigResultInProgress) {
+          inflight_outbound_reset_->last_sent_at = now;
+          inflight_outbound_reset_->rtx_count = 1;
+        } else {
+          const std::vector<uint16_t> reset_sids =
+              std::move(inflight_outbound_reset_->sids);
+          inflight_outbound_reset_.reset();
+
+          std::vector<int> affected_cids;
+          for (uint16_t sid : reset_sids) {
+            outbound_reset_pending_sids_.erase(sid);
+            abandoned_ordered_streams_.erase(sid);
+            for (auto& [cid, ch] : channels_) {
+              if (ch.sctp_sid.has_value() && *ch.sctp_sid == sid &&
+                  !ch.outbound_reset_done) {
+                ch.outbound_reset_done = true;
+                ch.next_tx_ssn = 0;
+                affected_cids.push_back(cid);
+              }
+            }
+          }
+          for (int cid : affected_cids) {
+            FinalizeChannelCloseIfReady(cid);
+          }
+          PumpOutboundStreamResetQueue(now);
+        }
+      }
     }
     off += (static_cast<size_t>(plen) + 3u) & ~size_t{3};
   }
@@ -1266,16 +2292,17 @@ void SctpDataChannelManager::SendSackChunk(Timestamp /*now*/) {
 
   std::vector<std::pair<uint16_t, uint16_t>> gaps;
   if (!rx_seen_tsns_.empty()) {
-    uint32_t range_start = *rx_seen_tsns_.begin();
-    uint32_t range_end = range_start;
+    int64_t range_start = *rx_seen_tsns_.begin();
+    int64_t range_end = range_start;
     for (auto it = std::next(rx_seen_tsns_.begin()); it != rx_seen_tsns_.end();
          ++it) {
       if (*it == range_end + 1) {
         range_end = *it;
       } else {
-        const uint32_t s_off = range_start - peer_cum_tsn_ack_;
-        const uint32_t e_off = range_end - peer_cum_tsn_ack_;
-        if (s_off <= 65535u && e_off <= 65535u && gaps.size() < 32) {
+        const int64_t s_off = range_start - peer_cum_tsn_ack_unwrapped_;
+        const int64_t e_off = range_end - peer_cum_tsn_ack_unwrapped_;
+        if (s_off > 0 && s_off <= 65535 && e_off >= s_off && e_off <= 65535 &&
+            gaps.size() < 32) {
           gaps.emplace_back(static_cast<uint16_t>(s_off),
                             static_cast<uint16_t>(e_off));
         }
@@ -1283,9 +2310,10 @@ void SctpDataChannelManager::SendSackChunk(Timestamp /*now*/) {
         range_end = *it;
       }
     }
-    const uint32_t s_off = range_start - peer_cum_tsn_ack_;
-    const uint32_t e_off = range_end - peer_cum_tsn_ack_;
-    if (s_off <= 65535u && e_off <= 65535u && gaps.size() < 32) {
+    const int64_t s_off = range_start - peer_cum_tsn_ack_unwrapped_;
+    const int64_t e_off = range_end - peer_cum_tsn_ack_unwrapped_;
+    if (s_off > 0 && s_off <= 65535 && e_off >= s_off && e_off <= 65535 &&
+        gaps.size() < 32) {
       gaps.emplace_back(static_cast<uint16_t>(s_off),
                         static_cast<uint16_t>(e_off));
     }
@@ -1295,8 +2323,10 @@ void SctpDataChannelManager::SendSackChunk(Timestamp /*now*/) {
   const uint16_t len = static_cast<uint16_t>(16 + gaps.size() * 4);
   AppendChunkHeader(kChunkSack, 0, len, &sack);
   uint8_t fixed[12]{};
-  WriteBigEndian32(fixed, peer_cum_tsn_ack_);
-  WriteBigEndian32(fixed + 4, kDefaultAdvertisedRwnd);
+  WriteBigEndian32(fixed,
+                   static_cast<uint32_t>(peer_cum_tsn_ack_unwrapped_ &
+                                         0xFFFFFFFFULL));
+  WriteBigEndian32(fixed + 4, CurrentAdvertisedRwnd());
   WriteBigEndian16(fixed + 8, static_cast<uint16_t>(gaps.size()));
   WriteBigEndian16(fixed + 10, 0);
   sack.insert(sack.end(), fixed, fixed + sizeof(fixed));
@@ -1315,52 +2345,98 @@ void SctpDataChannelManager::SendSackChunk(Timestamp /*now*/) {
 
 void SctpDataChannelManager::HandleSackChunk(ArrayView<const uint8_t> chunk_body,
                                              Timestamp now) {
-  if (chunk_body.size() < 12) {
+  if (assoc_state_ != AssocState::kEstablished || chunk_body.size() < 12) {
     return;
   }
   const uint32_t cum_ack = ReadBigEndian32(chunk_body.data());
+  const uint32_t sack_arwnd = ReadBigEndian32(chunk_body.data() + 4);
   const uint16_t num_gaps = ReadBigEndian16(chunk_body.data() + 8);
   if (12u + static_cast<size_t>(num_gaps) * 4u > chunk_body.size()) {
     return;
   }
 
-  size_t newly_acked_bytes = 0;
-  if (IsTsnBefore(last_acked_tx_tsn_, cum_ack)) {
-    last_acked_tx_tsn_ = cum_ack;
-    if (IsTsnBefore(advanced_peer_ack_point_, cum_ack)) {
-      advanced_peer_ack_point_ = cum_ack;
-    }
+  // RFC 4960 第 6.2.1 节：丢弃乱序旧 SACK（cum_delta < 0）及越界伪造 SACK（cum_ack > max_sent_tsn）。
+  const int32_t cum_delta = static_cast<int32_t>(
+      cum_ack -
+      static_cast<uint32_t>(last_acked_tx_tsn_unwrapped_ & 0xFFFFFFFFULL));
+  if (cum_delta < 0) {
+    return;
+  }
+  const int64_t cum_ack_uw = last_acked_tx_tsn_unwrapped_ + cum_delta;
+  const int64_t max_sent_tsn_uw = next_tx_tsn_unwrapped_ - 1;
+  if (cum_ack_uw > max_sent_tsn_uw) {
+    RTC_LOG(kWarning) << "Dropped SCTP SACK acknowledging unsent cum_ack="
+                      << cum_ack << " > max_sent_tsn="
+                      << static_cast<uint32_t>(max_sent_tsn_uw & 0xFFFFFFFFULL);
+    return;
   }
 
-  std::vector<std::pair<uint32_t, uint32_t>> gap_ranges;
+  std::vector<std::pair<int64_t, int64_t>> gap_ranges;
   gap_ranges.reserve(num_gaps);
   for (uint16_t i = 0; i < num_gaps; ++i) {
     const uint16_t s_off = ReadBigEndian16(chunk_body.data() + 12 + i * 4);
     const uint16_t e_off = ReadBigEndian16(chunk_body.data() + 14 + i * 4);
     if (s_off > 0 && e_off >= s_off) {
-      gap_ranges.emplace_back(cum_ack + s_off, cum_ack + e_off);
+      const int64_t gs = cum_ack_uw + s_off;
+      const int64_t ge = cum_ack_uw + e_off;
+      if (ge > max_sent_tsn_uw) {
+        RTC_LOG(kWarning) << "Dropped SCTP SACK with unsent gap_end=" << ge;
+        return;
+      }
+      gap_ranges.emplace_back(gs, ge);
     }
   }
 
-  uint32_t highest_sacked_tsn = cum_ack;
-  if (!gap_ranges.empty()) {
-    highest_sacked_tsn = gap_ranges.back().second;
+  peer_rwnd_ = sack_arwnd;
+
+  const int64_t prev_last_acked = last_acked_tx_tsn_unwrapped_;
+  const int64_t prev_adv_ack = advanced_peer_ack_point_unwrapped_;
+  const bool cum_ack_advanced = (cum_ack_uw > last_acked_tx_tsn_unwrapped_);
+  if (cum_ack_advanced) {
+    last_acked_tx_tsn_unwrapped_ = cum_ack_uw;
+    if (cum_ack_uw > advanced_peer_ack_point_unwrapped_) {
+      advanced_peer_ack_point_unwrapped_ = cum_ack_uw;
+    }
+    if (in_fast_recovery_ && cum_ack_uw >= fast_recovery_exit_point_) {
+      in_fast_recovery_ = false;
+      fast_recovery_exit_point_ = -1;
+    }
+    if (last_acked_tx_tsn_unwrapped_ >= advanced_peer_ack_point_unwrapped_) {
+      abandoned_ordered_streams_.clear();
+      dup_sack_below_adv_count_ = 0;
+    } else {
+      for (auto st_it = abandoned_ordered_streams_.begin();
+           st_it != abandoned_ordered_streams_.end();) {
+        if (st_it->second.adv_tsn_unwrapped <= last_acked_tx_tsn_unwrapped_) {
+          st_it = abandoned_ordered_streams_.erase(st_it);
+        } else {
+          ++st_it;
+        }
+      }
+    }
   }
 
-  auto in_any_gap = [&gap_ranges](uint32_t tsn) {
+  int64_t highest_sacked_tsn_uw = cum_ack_uw;
+  if (!gap_ranges.empty()) {
+    highest_sacked_tsn_uw =
+        std::max(highest_sacked_tsn_uw, gap_ranges.back().second);
+  }
+
+  auto in_any_gap = [&gap_ranges](int64_t tsn_uw) {
     for (const auto& [gs, ge] : gap_ranges) {
-      if (IsTsnBeforeOrEqual(gs, tsn) && IsTsnBeforeOrEqual(tsn, ge)) {
+      if (gs <= tsn_uw && tsn_uw <= ge) {
         return true;
       }
     }
     return false;
   };
 
+  size_t newly_acked_bytes = 0;
   bool fast_rtx_triggered = false;
   for (auto it = outbound_chunks_.begin(); it != outbound_chunks_.end();) {
-    const uint32_t tsn = it->first;
+    const int64_t tsn_uw = it->first;
     OutboundDataChunk& ch = it->second;
-    const bool acked_now = IsTsnBeforeOrEqual(tsn, cum_ack) || in_any_gap(tsn);
+    const bool acked_now = (tsn_uw <= cum_ack_uw) || in_any_gap(tsn_uw);
     if (acked_now && !ch.acked) {
       ch.acked = true;
       ch.needs_retransmit = false;
@@ -1370,8 +2446,9 @@ void SctpDataChannelManager::HandleSackChunk(ArrayView<const uint8_t> chunk_body
         flight_bytes_ = (flight_bytes_ >= sz) ? (flight_bytes_ - sz) : 0;
         ch.in_flight = false;
       }
-      if (ch.tx_count == 1 && ch.last_sent_at.IsFinite()) {
-        const int64_t rtt = std::max<int64_t>(1000, (now - ch.last_sent_at).us());
+      if (ch.tx_count == 1 && ch.last_sent_at.IsFinite() && now.IsFinite()) {
+        const int64_t rtt =
+            std::max<int64_t>(1000, (now - ch.last_sent_at).us());
         if (!has_rtt_sample_) {
           srtt_us_ = rtt;
           rttvar_us_ = rtt / 2;
@@ -1385,35 +2462,50 @@ void SctpDataChannelManager::HandleSackChunk(ArrayView<const uint8_t> chunk_body
                                       2'000'000);
       }
     } else if (!ch.acked && !ch.abandoned && ch.tx_count > 0 &&
-               IsTsnBefore(tsn, highest_sacked_tsn)) {
-      // RFC 4960 第 7.2.4 节：累计 3 次 Gap Ack 缺失报告触发快速重传。
+               !ch.fast_retransmitted && !ch.needs_retransmit &&
+               tsn_uw < highest_sacked_tsn_uw) {
+      // RFC 4960 第 7.2.4 节：累计 3 次 Gap Ack 缺失报告触发单次快速重传。
       ++ch.gap_reports;
-      if (ch.gap_reports >= 3 && !ch.needs_retransmit) {
+      if (ch.gap_reports >= 3) {
         ch.needs_retransmit = true;
+        ch.fast_retransmitted = true;
         ch.gap_reports = 0;
         if (ch.in_flight) {
           const size_t sz = 16 + ch.payload.size();
           flight_bytes_ = (flight_bytes_ >= sz) ? (flight_bytes_ - sz) : 0;
           ch.in_flight = false;
         }
-        fast_rtx_triggered = true;
+        if (ch.max_retransmits < 0 ||
+            ch.tx_count <= static_cast<uint32_t>(ch.max_retransmits)) {
+          fast_rtx_triggered = true;
+        }
       }
     }
 
-    if (IsTsnBeforeOrEqual(tsn, last_acked_tx_tsn_)) {
-      if (tsn == advanced_peer_ack_point_ + 1) {
-        advanced_peer_ack_point_ = tsn;
+    if (tsn_uw <= last_acked_tx_tsn_unwrapped_) {
+      if (tsn_uw == advanced_peer_ack_point_unwrapped_ + 1) {
+        advanced_peer_ack_point_unwrapped_ = tsn_uw;
       }
+      const size_t p_sz = ch.payload.size();
+      outbound_buffered_bytes_ = (outbound_buffered_bytes_ >= p_sz)
+                                     ? (outbound_buffered_bytes_ - p_sz)
+                                     : 0;
       it = outbound_chunks_.erase(it);
     } else {
       ++it;
     }
   }
 
+  // RFC 4960 第 7.2.4 节：Fast Recovery 期间每个 RTT 最多减半一次 cwnd。
   if (fast_rtx_triggered) {
-    ssthresh_bytes_ = std::max<size_t>(cwnd_bytes_ / 2, 4 * 1200);
-    cwnd_bytes_ = ssthresh_bytes_;
-  } else if (newly_acked_bytes > 0) {
+    if (!in_fast_recovery_) {
+      ssthresh_bytes_ = std::max<size_t>(cwnd_bytes_ / 2, 4 * 1200);
+      cwnd_bytes_ = ssthresh_bytes_;
+      partial_bytes_acked_ = 0;
+      in_fast_recovery_ = true;
+      fast_recovery_exit_point_ = max_sent_tsn_uw;
+    }
+  } else if (cum_ack_advanced && newly_acked_bytes > 0 && !in_fast_recovery_) {
     if (cwnd_bytes_ <= ssthresh_bytes_) {
       cwnd_bytes_ = std::min<size_t>(
           cwnd_bytes_ + std::min<size_t>(newly_acked_bytes, 1200), 1024 * 1024);
@@ -1426,13 +2518,36 @@ void SctpDataChannelManager::HandleSackChunk(ArrayView<const uint8_t> chunk_body
     }
   }
 
-  if (flight_bytes_ == 0) {
-    t3_rtx_deadline_ = Timestamp::PlusInfinity();
-  } else if (newly_acked_bytes > 0) {
-    t3_rtx_deadline_ = now + TimeDelta::Micros(rto_us_);
+  // RFC 3758 第 3.5 节：当 SACK 指示 cum_ack 仍落后于已发送的 advanced_peer_ack_point 时驱动重发。
+  bool need_reemit_ftsn = false;
+  if (peer_supports_prsctp_ && last_acked_tx_tsn_unwrapped_ < prev_adv_ack &&
+      (!gap_ranges.empty() || cum_ack_uw == prev_last_acked)) {
+    ++dup_sack_below_adv_count_;
+    const bool cooldown_ok =
+        !last_forward_tsn_tx_.IsFinite() || !now.IsFinite() ||
+        (now - last_forward_tsn_tx_) >= TimeDelta::Millis(20);
+    if (dup_sack_below_adv_count_ >= 2 || cooldown_ok) {
+      need_reemit_ftsn = true;
+    }
   }
 
-  FlushTransmitQueue(now);
+  const int64_t adv_before_flush = advanced_peer_ack_point_unwrapped_;
+  FlushTransmitQueue(now, fast_rtx_triggered);
+  if (need_reemit_ftsn &&
+      advanced_peer_ack_point_unwrapped_ == adv_before_flush &&
+      last_acked_tx_tsn_unwrapped_ < advanced_peer_ack_point_unwrapped_) {
+    SendForwardTsnChunk(now);
+  }
+
+  const bool has_unacked_ftsn =
+      peer_supports_prsctp_ &&
+      (last_acked_tx_tsn_unwrapped_ < advanced_peer_ack_point_unwrapped_);
+  if (flight_bytes_ == 0 && !has_unacked_ftsn) {
+    t3_rtx_deadline_ = Timestamp::PlusInfinity();
+  } else if (newly_acked_bytes > 0 || cum_ack_advanced ||
+             !t3_rtx_deadline_.IsFinite()) {
+    t3_rtx_deadline_ = now + TimeDelta::Micros(rto_us_);
+  }
 }
 
 void SctpDataChannelManager::OnPeriodicTick(Timestamp now) {
@@ -1444,13 +2559,13 @@ void SctpDataChannelManager::OnPeriodicTick(Timestamp now) {
   if (assoc_state_ != AssocState::kEstablished) {
     if (assoc_state_ == AssocState::kClosed &&
         handshake_started_at_.IsFinite() &&
-        (now - handshake_started_at_) >= TimeDelta::Millis(200)) {
+        (now - handshake_started_at_) >= TimeDelta::Millis(1000)) {
       assoc_state_ = AssocState::kCookieWait;
       SendInitChunk(now);
       return;
     }
-    const int64_t backoff_ms =
-        std::min<int64_t>(1000, 100LL << std::min<uint32_t>(handshake_rtx_count_, 4));
+    const int64_t backoff_ms = std::min<int64_t>(
+        1000, 100LL << std::min<uint32_t>(handshake_rtx_count_, 4));
     if (last_handshake_tx_.IsFinite() &&
         (now - last_handshake_tx_) >= TimeDelta::Millis(backoff_ms)) {
       ++handshake_rtx_count_;
@@ -1480,7 +2595,24 @@ void SctpDataChannelManager::OnPeriodicTick(Timestamp now) {
   // 3. 检查 PR-SCTP 报文生存期超时并推进 FORWARD-TSN。
   CheckAbandonedAndSendForwardTsn(now);
 
-  // 4. 驱动 T3-rtx 超时重传定时器。
+  // 4. 驱动未确认 RE-CONFIG Outgoing SSN Reset Request 重传定时器（RFC 6525 第 5.1.1 节）。
+  if (inflight_outbound_reset_.has_value()) {
+    const uint32_t shift =
+        (inflight_outbound_reset_->rtx_count > 0)
+            ? std::min<uint32_t>(inflight_outbound_reset_->rtx_count - 1, 4)
+            : 0;
+    const int64_t reconfig_timeout_us =
+        std::min<int64_t>(2'000'000, rto_us_ << shift);
+    if (!inflight_outbound_reset_->last_sent_at.IsFinite() ||
+        (now - inflight_outbound_reset_->last_sent_at) >=
+            TimeDelta::Micros(reconfig_timeout_us)) {
+      SendInflightOutboundReset(now);
+    }
+  } else if (!queued_outbound_reset_sids_.empty()) {
+    PumpOutboundStreamResetQueue(now);
+  }
+
+  // 5. 驱动 T3-rtx 超时重传定时器（同时覆盖 DATA 重传与未确认 FORWARD-TSN 重传）。
   if (t3_rtx_deadline_.IsFinite() && now >= t3_rtx_deadline_) {
     bool marked_any = false;
     for (auto& [tsn, ch] : outbound_chunks_) {
@@ -1495,13 +2627,35 @@ void SctpDataChannelManager::OnPeriodicTick(Timestamp now) {
         marked_any = true;
       }
     }
-    if (marked_any) {
-      ssthresh_bytes_ = std::max<size_t>(cwnd_bytes_ / 2, 4 * 1200);
-      cwnd_bytes_ = 2 * 1200;
+    const bool has_unacked_ftsn =
+        peer_supports_prsctp_ &&
+        (last_acked_tx_tsn_unwrapped_ < advanced_peer_ack_point_unwrapped_);
+    if (marked_any || has_unacked_ftsn) {
+      in_fast_recovery_ = false;
+      fast_recovery_exit_point_ = -1;
+      partial_bytes_acked_ = 0;
+      if (marked_any) {
+        ssthresh_bytes_ = std::max<size_t>(cwnd_bytes_ / 2, 4 * 1200);
+        cwnd_bytes_ = 2 * 1200;
+      }
       rto_us_ = std::min<int64_t>(rto_us_ * 2, 2'000'000);
       t3_rtx_deadline_ = now + TimeDelta::Micros(rto_us_);
+
+      const int64_t adv_before = advanced_peer_ack_point_unwrapped_;
       CheckAbandonedAndSendForwardTsn(now);
+      if (peer_supports_prsctp_ &&
+          advanced_peer_ack_point_unwrapped_ == adv_before &&
+          last_acked_tx_tsn_unwrapped_ < advanced_peer_ack_point_unwrapped_) {
+        SendForwardTsnChunk(now);
+      }
       FlushTransmitQueue(now);
+
+      const bool still_unacked_ftsn =
+          peer_supports_prsctp_ &&
+          (last_acked_tx_tsn_unwrapped_ < advanced_peer_ack_point_unwrapped_);
+      if (flight_bytes_ == 0 && !still_unacked_ftsn) {
+        t3_rtx_deadline_ = Timestamp::PlusInfinity();
+      }
     } else {
       t3_rtx_deadline_ = Timestamp::PlusInfinity();
     }

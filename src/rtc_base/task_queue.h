@@ -6,13 +6,16 @@
 // io_context + strand + steady_timer 实现确定性的串行任务调度。
 
 #include <atomic>
-#include <future>
+#include <condition_variable>
 #include <memory>
+#include <mutex>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <thread>
 #include <type_traits>
 #include <utility>
+#include <vector>
 
 #include <boost/asio/executor_work_guard.hpp>
 #include <boost/asio/io_context.hpp>
@@ -65,6 +68,10 @@ class TaskQueueBase {
 
   bool IsCurrent() const { return Current() == this; }
   virtual bool IsStopped() const = 0;
+  virtual bool IsShutdownComplete() const { return IsStopped(); }
+  virtual std::shared_ptr<const std::atomic<bool>> ShutdownToken() const {
+    return nullptr;
+  }
   virtual std::string_view name() const = 0;
 
   virtual void PostTaskImpl(std::unique_ptr<QueuedTask> task) = 0;
@@ -73,6 +80,7 @@ class TaskQueueBase {
   virtual void PostDelayedHighPrecisionTaskImpl(
       std::unique_ptr<QueuedTask> task,
       TimeDelta delay) = 0;
+  virtual void InvokeImpl(QueuedTask* task);
 
   template <typename Closure>
   void PostTask(Closure&& closure) {
@@ -90,19 +98,40 @@ class TaskQueueBase {
         ToQueuedTask(std::forward<Closure>(closure)), delay);
   }
 
+  // 在目标队列上同步阻塞执行 `fn` 并返回结果。
+  // 调用约束：必须严格遵循单向有向无环图顺序（外部线程 -> signaling -> worker -> network/pacer，
+  // 严禁两个 TaskQueue 互相跨队列 Invoke，否则会形成循环等待死锁；开启 DCHECK 时会自动断言检测环路）。
   template <typename Functor>
   auto Invoke(Functor&& fn) -> decltype(fn()) {
     using ReturnT = decltype(fn());
-    if (IsCurrent() || IsStopped()) {
+    if (IsCurrent()) {
       return fn();
     }
-    std::packaged_task<ReturnT()> pkg(std::forward<Functor>(fn));
-    std::future<ReturnT> fut = pkg.get_future();
-    PostTask([p = std::move(pkg)]() mutable { p(); });
-    return fut.get();
+    if constexpr (std::is_void_v<ReturnT>) {
+      ClosureTask<Functor> task(std::forward<Functor>(fn));
+      InvokeImpl(&task);
+    } else {
+      std::optional<ReturnT> ret;
+      auto wrapper = [&fn, &ret]() { ret.emplace(std::forward<Functor>(fn)()); };
+      ClosureTask<decltype(wrapper)> task(std::move(wrapper));
+      InvokeImpl(&task);
+      return std::move(*ret);
+    }
   }
 
  protected:
+  class InvokeWaitGuard {
+   public:
+    InvokeWaitGuard(TaskQueueBase* caller, const TaskQueueBase* target);
+    ~InvokeWaitGuard();
+
+    InvokeWaitGuard(const InvokeWaitGuard&) = delete;
+    InvokeWaitGuard& operator=(const InvokeWaitGuard&) = delete;
+
+   private:
+    TaskQueueBase* const caller_;
+  };
+
   class CurrentTaskQueueSetter {
    public:
     explicit CurrentTaskQueueSetter(TaskQueueBase* task_queue);
@@ -114,6 +143,9 @@ class TaskQueueBase {
    private:
     TaskQueueBase* const previous_;
   };
+
+ private:
+  std::atomic<const TaskQueueBase*> blocked_on_{nullptr};
 };
 
 class TaskQueueBoost final : public TaskQueueBase {
@@ -126,33 +158,68 @@ class TaskQueueBoost final : public TaskQueueBase {
   TaskQueueBoost& operator=(const TaskQueueBoost&) = delete;
 
   bool IsStopped() const override {
-    return stopped_.load(std::memory_order_acquire);
+    return state_->stopped.load(std::memory_order_acquire);
   }
-  std::string_view name() const override { return name_; }
+  bool IsShutdownComplete() const override {
+    return state_->shutdown_complete.load(std::memory_order_acquire);
+  }
+  std::shared_ptr<const std::atomic<bool>> ShutdownToken() const override {
+    return state_->checker_shutdown_flag;
+  }
+  std::string_view name() const override { return state_->name; }
 
   void PostTaskImpl(std::unique_ptr<QueuedTask> task) override;
   void PostDelayedTaskImpl(std::unique_ptr<QueuedTask> task,
                            TimeDelta delay) override;
   void PostDelayedHighPrecisionTaskImpl(std::unique_ptr<QueuedTask> task,
                                         TimeDelta delay) override;
+  void InvokeImpl(QueuedTask* task) override;
 
   void Shutdown();
 
-  boost::asio::io_context& io_context() { return io_ctx_; }
+  boost::asio::io_context& io_context() { return state_->io_ctx; }
 
  private:
   using WorkGuard =
       boost::asio::executor_work_guard<boost::asio::io_context::executor_type>;
 
+  struct InvokeWaitSlot {
+    explicit InvokeWaitSlot(QueuedTask* t) : task(t) {}
+    std::mutex mu;
+    std::condition_variable cv;
+    QueuedTask* task = nullptr;
+    bool finished = false;
+  };
+
+  struct CoreState {
+    explicit CoreState(std::string queue_name)
+        : name(std::move(queue_name)),
+          io_ctx(1),
+          work_guard(
+              std::make_unique<WorkGuard>(boost::asio::make_work_guard(io_ctx))),
+          strand(boost::asio::make_strand(io_ctx)),
+          checker_shutdown_flag(std::make_shared<std::atomic<bool>>(false)) {}
+
+    const std::string name;
+    boost::asio::io_context io_ctx;
+    std::unique_ptr<WorkGuard> work_guard;
+    boost::asio::strand<boost::asio::io_context::executor_type> strand;
+    std::atomic<bool> stopped{false};
+    std::atomic<bool> shutdown_complete{false};
+    std::shared_ptr<std::atomic<bool>> checker_shutdown_flag;
+    std::mutex lifecycle_mu;
+    std::condition_variable lifecycle_cv;
+    std::thread::id worker_tid{};
+    std::mutex post_shutdown_exec_mu;
+    std::vector<std::shared_ptr<InvokeWaitSlot>> pending_invokes;
+    std::vector<std::weak_ptr<boost::asio::steady_timer>> active_timers;
+  };
+
   void ScheduleTimerTask(std::unique_ptr<QueuedTask> task, TimeDelta delay);
 
-  const std::string name_;
   const TaskQueuePriority priority_;
-  boost::asio::io_context io_ctx_;
-  std::unique_ptr<WorkGuard> work_guard_;
-  boost::asio::strand<boost::asio::io_context::executor_type> strand_;
+  std::shared_ptr<CoreState> state_;
   std::thread thread_;
-  std::atomic<bool> stopped_{false};
 };
 
 // 持有并管理 SDK 的 5 个隔离执行域队列。

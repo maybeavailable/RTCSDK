@@ -90,9 +90,15 @@ class RtcpPli {
 
 class RtcpFir {
  public:
+  struct Request {
+    uint32_t ssrc = 0;
+    uint8_t command_seq_num = 0;
+  };
+
   uint32_t sender_ssrc = 0;
   uint32_t media_ssrc = 0;
   uint8_t command_seq_num = 0;
+  std::vector<Request> requests;
 
   std::vector<uint8_t> Build() const;
   static std::optional<RtcpFir> Parse(ArrayView<const uint8_t> payload);

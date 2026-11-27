@@ -14,6 +14,7 @@ option(RTC_BUILD_SHARED_SDK "Build pure C++17 shared library librtc_video_sdk.so
 option(RTC_BUILD_SERVERS    "Build companion P2P WS Signaling and MoQ Relay servers" ON)
 option(RTC_BUILD_EXAMPLES   "Build complete C++17 SDK usage examples" ON)
 option(RTC_BUILD_TESTS      "Build unit, weak-network E2E, and example verification tests" ON)
+option(RTC_ENABLE_DCHECK    "Enable RTC_DCHECK and RTC_DCHECK_RUN_ON assertions even when NDEBUG is defined" ON)
 set(RTC_SDK_OUTPUT_DIR "${CMAKE_BINARY_DIR}/sdk_out" CACHE PATH
     "Target directory to automatically export SDK headers and libraries after build (empty to disable)")
 
@@ -23,12 +24,15 @@ find_package(OpenSSL 1.1.1 REQUIRED)
 find_package(Boost 1.70 REQUIRED COMPONENTS system thread)
 
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/libsrtp/CMakeLists.txt")
+  set(_rtc_saved_build_shared_libs "${BUILD_SHARED_LIBS}")
   set(ENABLE_OPENSSL ON CACHE BOOL "" FORCE)
   set(LIBSRTP_TEST_APPS OFF CACHE BOOL "" FORCE)
   set(ENABLE_WARNINGS OFF CACHE BOOL "" FORCE)
   set(ENABLE_WARNINGS_AS_ERRORS OFF CACHE BOOL "" FORCE)
-  set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+  set(BUILD_SHARED_LIBS OFF)
   add_subdirectory(third_party/libsrtp EXCLUDE_FROM_ALL)
+  set(BUILD_SHARED_LIBS "${_rtc_saved_build_shared_libs}")
+  unset(_rtc_saved_build_shared_libs)
   set(RTC_SRTP_TARGET srtp2)
 else()
   find_package(PkgConfig REQUIRED)
@@ -72,6 +76,9 @@ target_include_directories(rtc_video_objs
     ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
 target_compile_options(rtc_video_objs PRIVATE ${RTC_STRICT_CXX_FLAGS})
+if(RTC_ENABLE_DCHECK)
+  target_compile_definitions(rtc_video_objs PUBLIC RTC_DCHECK_IS_ON=1)
+endif()
 target_link_libraries(rtc_video_objs
   PUBLIC
     Boost::system
@@ -92,9 +99,13 @@ if(TARGET srtp2)
 endif()
 target_include_directories(rtc_video_core
   PUBLIC
-    ${CMAKE_CURRENT_SOURCE_DIR}/include
-    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src>
+    $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
 )
+if(RTC_ENABLE_DCHECK)
+  target_compile_definitions(rtc_video_core PUBLIC RTC_DCHECK_IS_ON=1)
+endif()
 target_link_libraries(rtc_video_core
   PUBLIC
     Boost::system
@@ -107,7 +118,20 @@ target_link_libraries(rtc_video_core
 
 # 3. 纯现代 C++17 动态库 SDK（仅导出标注 RTC_SDK_API 的 C++17 公共类与工厂函数，隐藏全部内部依赖符号）
 if(RTC_BUILD_SHARED_SDK)
-  add_library(rtc_video_sdk SHARED $<TARGET_OBJECTS:rtc_video_objs>)
+  if(WIN32)
+    add_library(rtc_video_sdk SHARED ${RTC_CORE_SOURCES})
+    target_compile_options(rtc_video_sdk PRIVATE ${RTC_STRICT_CXX_FLAGS})
+    if(RTC_ENABLE_DCHECK)
+      target_compile_definitions(rtc_video_sdk PRIVATE RTC_DCHECK_IS_ON=1)
+    endif()
+    target_include_directories(rtc_video_sdk PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  else()
+    add_library(rtc_video_sdk SHARED $<TARGET_OBJECTS:rtc_video_objs>)
+  endif()
+  target_compile_definitions(rtc_video_sdk
+    PRIVATE RTC_SDK_SHARED_BUILD=1
+    INTERFACE RTC_SDK_SHARED_CONSUME=1
+  )
   target_include_directories(rtc_video_sdk
     PUBLIC
       $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
@@ -352,6 +376,7 @@ if(NOT "${RTC_SDK_OUTPUT_DIR}" STREQUAL "")
   endif()
   add_custom_target(rtc_export_sdk ALL
     COMMAND ${CMAKE_COMMAND} --install "${CMAKE_BINARY_DIR}"
+            --config $<CONFIG>
             --prefix "${RTC_SDK_OUTPUT_DIR}"
             --component sdk
     DEPENDS ${RTC_EXPORT_DEPENDS}

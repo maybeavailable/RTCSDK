@@ -8,8 +8,11 @@
 //   - GoogCcNetworkController 拥塞控制 + TaskQueuePacedSender 平滑发送 + RTX 重传 + RFC 8627 FlexFEC 前向纠错
 //   - PacketBuffer -> NackModule2 -> ReferenceFinder -> FrameBuffer3 接收重组流水线
 
+#include <array>
 #include <atomic>
 #include <cstdint>
+#include <deque>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -83,6 +86,7 @@ class WebRtcP2pBackend final : public ISessionBackend,
   // DtlsSrtpObserver 接口重写（在 `network` 队列上回调执行）：
   void OnDtlsSrtpHandshakeComplete() override;
   void OnDtlsSrtpError(std::string_view reason) override;
+  void OnIceTransportState(IceTransportState state) override;
   void OnDecryptedRtpPacket(const RtpPacket& packet,
                             Timestamp receive_time) override;
   void OnDecryptedRtcpPacket(ArrayView<const uint8_t> compound_rtcp,
@@ -114,14 +118,17 @@ class WebRtcP2pBackend final : public ISessionBackend,
     uint32_t rtx_ssrc = 0;
     uint32_t flexfec_ssrc = 0;
     uint16_t next_rtp_seq = 1000;
-    uint16_t next_rtx_seq = 20000;
+    std::atomic<uint16_t> next_rtx_seq{20000};
     H264Packetizer h264_packetizer{1150};
     H265Packetizer h265_packetizer{1150};
     RtpPacketHistory history{2048};
     std::unique_ptr<FlexfecSender> flexfec;
+    std::string flexfec_mid = "0";
   };
 
   struct InboundStreamState {
+    static constexpr size_t kPaddingSeqRingSize = 512;
+
     std::string remote_peer_id = "remote_peer";
     std::string remote_track_id = "remote_video0";
     VideoCodec codec = VideoCodec::kH264;
@@ -137,8 +144,24 @@ class WebRtcP2pBackend final : public ISessionBackend,
     VCMTiming vcm_timing;
     std::unique_ptr<FlexfecReceiver> flexfec_rx;
 
+    std::array<std::pair<bool, uint16_t>, kPaddingSeqRingSize>
+        padding_seq_ring{};
+    std::optional<uint16_t> last_continuous_seq_end;
+    std::deque<AssembledRtpFrame> pending_assembled_frames;
+
+    RtpTimestampUnwrapper rtp_ts_unwrapper;
+    std::optional<int64_t> base_unwrapped_rtp_ts;
+    Timestamp base_capture_time = Timestamp::MinusInfinity();
+    int64_t last_emitted_capture_us = 0;
+
     uint32_t highest_seq_received = 0;
     uint64_t packets_received = 0;
+    uint64_t wire_media_packets_received = 0;
+    RtpSeqUnwrapper wire_seq_unwrapper;
+    std::optional<int64_t> max_wire_unwrapped_seq;
+    int64_t prev_rr_max_seq = -1;
+    uint64_t prev_rr_pkts = 0;
+    float latest_downlink_loss = 0.0f;
     std::optional<Timestamp> prev_frame_arrival;
     std::optional<DataSize> prev_frame_size;
     Timestamp last_pli_sent = Timestamp::MinusInfinity();
@@ -147,6 +170,22 @@ class WebRtcP2pBackend final : public ISessionBackend,
         : codec(codec_in),
           packet_buffer(codec_in, 512),
           vcm_timing(now, zero_playout) {}
+
+    bool IsPaddingSeq(uint16_t seq) const {
+      const auto& slot = padding_seq_ring[seq % kPaddingSeqRingSize];
+      return slot.first && slot.second == seq;
+    }
+
+    void MarkPaddingSeq(uint16_t seq) {
+      padding_seq_ring[seq % kPaddingSeqRingSize] = {true, seq};
+    }
+
+    void ClearPaddingSeq(uint16_t seq) {
+      auto& slot = padding_seq_ring[seq % kPaddingSeqRingSize];
+      if (slot.first && slot.second == seq) {
+        slot = {false, 0};
+      }
+    }
   };
 
   static std::string GenerateRandomToken(size_t length);
@@ -163,11 +202,18 @@ class WebRtcP2pBackend final : public ISessionBackend,
                                 bool remote_is_offer,
                                 std::string* out_answer_sdp);
 
+  void ConnectSignalingOnSigQueue();
   void OnSignalingConnected();
   void OnSignalingMessage(const std::string& json_text);
   void OnSignalingClosed(int code, const std::string& reason);
 
   void ApplyNetworkControlUpdate(const NetworkControlUpdate& update);
+  void HandleMediaPaddingPacketOnWorker(uint16_t seq_num,
+                                        uint32_t ssrc,
+                                        Timestamp receive_time,
+                                        bool is_recovered);
+  void DrainPendingAssembledFramesOnWorker();
+  void DrainDecodableFramesOnWorker();
   void HandleMediaRtpPacketOnWorker(const RtpPacket& media_pkt,
                                     Timestamp receive_time,
                                     bool is_recovered = false);
@@ -186,17 +232,24 @@ class WebRtcP2pBackend final : public ISessionBackend,
   std::string room_id_ = "p2p";
   std::string local_peer_id_ = "local_peer";
   std::string remote_peer_id_ = "remote_peer";
+  std::string negotiated_remote_track_id_;
+  bool has_paired_remote_peer_ = false;
+  bool session_active_ = false;
   bool transport_initialized_ = false;
   bool signaling_joined_ = false;
   bool offer_sent_ = false;
+  uint32_t sig_reconnect_attempts_ = 0;
+  uint64_t sig_conn_gen_ = 0;
+  Timestamp sig_connected_at_ = Timestamp::MinusInfinity();
   std::atomic<bool> media_ready_{false};
+  std::atomic<bool> video_muted_{false};
 
   std::shared_ptr<DtlsCertificate> local_cert_;
   std::unique_ptr<IceTransportChannel> ice_;
   std::unique_ptr<DtlsSrtpTransport> dtls_srtp_;
   std::unique_ptr<BoostBeastSignalingClient> signaling_;
 
-  // 已协商的 SDP 参数（通过 PostTask 从 signaling 队列同步至 worker 队列）。
+  // 已协商的 SDP 参数（signaling 队列归属，通过 PostTask/原子变量同步至 worker 与 pacer 队列）。
   std::string negotiated_mid_ = "0";
   std::string negotiated_data_mid_ = "1";
   bool negotiated_has_video_ = true;
@@ -204,9 +257,15 @@ class WebRtcP2pBackend final : public ISessionBackend,
   uint16_t local_sctp_port_ = 5000;
   uint16_t remote_sctp_port_ = 5000;
   std::vector<SdpMediaKind> negotiated_m_order_;
+  std::vector<RejectedMediaDesc> negotiated_rejected_m_;
   VideoCodec negotiated_codec_ = VideoCodec::kH264;
-  uint8_t negotiated_video_pt_ = 96;
-  uint8_t negotiated_rtx_pt_ = 97;
+  std::string negotiated_h264_profile_level_id_ = "42e01f";
+  DtlsRole negotiated_dtls_role_ = DtlsRole::kClient;
+  std::string negotiated_remote_fp_;
+  std::atomic<uint8_t> negotiated_video_pt_{96};
+  std::atomic<uint8_t> negotiated_rtx_pt_{97};
+  std::atomic<bool> pacer_has_rtx_{true};
+  std::atomic<int64_t> cached_ice_rtt_us_{30'000};
   uint8_t negotiated_flexfec_pt_ = 118;
   bool negotiated_has_rtx_ = true;
   bool negotiated_has_flexfec_ = true;
@@ -214,6 +273,22 @@ class WebRtcP2pBackend final : public ISessionBackend,
   uint32_t negotiated_flexfec_rw_us_ = 10'000'000;
   RtpHeaderExtensionMap negotiated_ext_map_ =
       RtpHeaderExtensionMap::BrowserDefault();
+  mutable std::mutex pacer_ext_mu_;
+  RtpHeaderExtensionMap pacer_ext_map_ =
+      RtpHeaderExtensionMap::BrowserDefault();
+
+  // worker 队列专属协商状态副本（消除与 signaling 队列的跨线程读写竞争）。
+  VideoCodec worker_codec_ = VideoCodec::kH264;
+  bool worker_codec_negotiated_ = false;
+  bool worker_has_video_ = true;
+  std::string worker_mid_ = "0";
+  RtpHeaderExtensionMap worker_ext_map_ =
+      RtpHeaderExtensionMap::BrowserDefault();
+  bool worker_has_rtx_ = true;
+  bool worker_has_flexfec_ = true;
+  uint8_t worker_flexfec_pt_ = 118;
+  uint32_t worker_flexfec_rw_us_ = 10'000'000;
+  std::string worker_remote_peer_id_ = "remote_peer";
 
   DtlsRole worker_dtls_role_ = DtlsRole::kClient;
   bool worker_has_datachannel_ = false;
@@ -222,7 +297,7 @@ class WebRtcP2pBackend final : public ISessionBackend,
   mutable std::mutex dc_handles_mu_;
   std::set<int> valid_dc_ids_;
 
-  GoogCcNetworkController goog_cc_;
+  std::unique_ptr<GoogCcNetworkController> goog_cc_;
   TransportFeedbackAdapter twcc_adapter_;
   FecControllerDefault fec_controller_;
   std::unique_ptr<TaskQueuePacedSender> paced_sender_;
@@ -234,7 +309,12 @@ class WebRtcP2pBackend final : public ISessionBackend,
 
   std::vector<std::pair<uint16_t, Timestamp>> rx_twcc_records_;
   std::optional<uint16_t> next_expected_twcc_seq_;
+  std::vector<uint8_t> pending_rr_wire_;
+  std::deque<std::pair<Timestamp, TimeDelta>> twcc_rtt_samples_;
+  std::map<uint32_t, uint8_t> last_fir_seq_by_ssrc_;
+  Timestamp last_idr_forced_at_ = Timestamp::MinusInfinity();
   uint8_t twcc_fb_pkt_count_ = 0;
+  bool has_received_twcc_ = false;
   Timestamp last_twcc_sent_ = Timestamp::MinusInfinity();
   Timestamp last_sr_rr_sent_ = Timestamp::MinusInfinity();
 

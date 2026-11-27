@@ -55,6 +55,7 @@ struct QuicCcMigrationState {
   int64_t min_rtt_us = 0;
   int64_t smoothed_rtt_us = 0;
   size_t bytes_in_flight = 0;
+  uint64_t delivered_bytes = 0;
 };
 
 class RTC_SDK_API IQuicCongestionController {
